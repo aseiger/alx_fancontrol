@@ -57,7 +57,12 @@ The install model: this directory is the **source tree**; `install.sh`
 `/opt/alx_fancontrol/venv` — a frozen snapshot the service runs. The
 source tree is never touched at runtime and can be deleted without
 affecting the running system. Upgrading = edit source, re-run
-`install.sh` (refreshes the snapshot, restarts the service).
+`install.sh` (refreshes the snapshot, restarts the service). It also
+installs a launcher to `/usr/local/bin/alx-fancontrol`, so
+**`sudo alx-fancontrol tui|daemon|check`** works from anywhere (it
+prefers the `/opt` snapshot and falls back to the dev venv, so it
+stays usable in interim mode too — see
+[Running without installing](#running-without-installing-interim-mode)).
 
 The manual/dev path (no service): everything lives inside this project
 directory; nothing is installed system-wide (no apt, no `/usr/local`).
@@ -90,8 +95,8 @@ a fresh install controls nothing until you assign fans in the TUI.
 
 ```bash
 # installed system (what install.sh runs):
-sudo /opt/alx_fancontrol/venv/bin/alx-fancontrol check        # validate /etc config
-sudo /opt/alx_fancontrol/venv/bin/alx-fancontrol tui          # the real thing (edits /etc config)
+sudo alx-fancontrol check        # validate /etc config
+sudo alx-fancontrol tui          # the real thing (edits /etc config)
 
 # dev, from the source tree (uses ~/.config, can't take over fans):
 cd /home/alex/alx_fancontrol
@@ -114,8 +119,8 @@ Then run the daemon for real (it takes over only the fans you assigned,
 restores firmware control on exit) — or better, install it as a service:
 
 ```bash
-sudo .venv/bin/alx-fancontrol daemon       # foreground (Ctrl-C exits cleanly)
-sudo bash install.sh                       # or: survive reboots, auto-restart
+sudo alx-fancontrol daemon       # foreground (Ctrl-C exits cleanly)
+sudo bash install.sh             # or: survive reboots, auto-restart
 ```
 
 ## Config
@@ -133,8 +138,8 @@ JSON, hand-editable. `config.json.bak` (previous content) sits next to
 the config; `daemon.log` rotates at 256 KB × 3; the service's stdout also
 goes to the journal (`journalctl -u alx-fancontrol`).
 
-The TUI edits the config, so run it as root (`sudo .venv/bin/alx-fancontrol
-tui`) to edit the system config.
+The TUI edits the config, so run it as root (`sudo alx-fancontrol tui`)
+to edit the system config.
 
 Duty is **percent 0–100** in the config; raw 0–255 only at the sysfs
 boundary.
@@ -322,8 +327,9 @@ top item), so: **keys navigate, clicks focus** fields/tables.
 
 ## Running without installing (interim mode)
 
-For the current phase the box runs **non-installed** — from the source
-tree, no `/opt` snapshot, no systemd unit:
+The box is installed via `install.sh` (unit active, config in `/etc`).
+This interim mode — running straight from the source tree, no `/opt`
+snapshot, no systemd unit — remains for dev work:
 
 ```bash
 cd /home/alex/alx_fancontrol
@@ -364,19 +370,23 @@ ownership if the TUI ran as root.
    validates.
 3. **Stops any manually-started daemon** so two controllers can't fight
    over the same pwm channel.
-4. **Installs the unit as a root service** — it must be root because it
+4. **Installs the launcher** at `/usr/local/bin/alx-fancontrol`
+   (prefer the `/opt` snapshot, else the dev venv) — this is what makes
+   plain `sudo alx-fancontrol …` work.
+5. **Installs the unit as a root service** — it must be root because it
    writes `/sys/class/hwmon/*/pwmN` (mode 644, root-writable). The unit's
    `RuntimeDirectory=`/`LogsDirectory=` create `/run/alx_fancontrol`
    (status.json) and `/var/log/alx_fancontrol` (daemon.log); as root the
    daemon finds its config in `/etc` on its own (no path pinning).
-5. **Verifies**: unit active, `gpu-fanctl` still active, and the protected
+6. **Verifies**: unit active, `gpu-fanctl` still active, and the protected
    GPU-blower channels still at `enable=1` (reserved for gpu-fanctl).
 
 `Restart=always` covers the hwmon-reshuffle case (see troubleshooting).
 
 `uninstall.sh` reverses it: `systemctl disable --now` (SIGTERM → the
-daemon returns every fan it drove to firmware control), removes the unit
-and `/opt/alx_fancontrol`; `--purge` also removes `/etc/alx_fancontrol`
+daemon returns every fan it drove to firmware control), removes the unit,
+the launcher and `/opt/alx_fancontrol`; `--purge` also removes
+`/etc/alx_fancontrol`
 (your assignments/curves) and the log dir. The source tree is never
 touched.
 
@@ -479,6 +489,7 @@ Additional rules honored everywhere:
 alx_fancontrol/
 ├── pyproject.toml               # packaging; alx-fancontrol entry point; [tui]/[test] extras
 ├── alx-fancontrol.service       # installed by install.sh (ExecStart -> /opt snapshot)
+├── alx-fancontrol               # launcher -> /usr/local/bin (sudo alx-fancontrol …)
 ├── install.sh                   # build /opt snapshot + install/start service (+ --dry-run)
 ├── uninstall.sh                 # stop+remove service & /opt (+ --purge for /etc, --dry-run)
 ├── run-local.sh                 # interim mode: daemon/tui from the source tree, pinned config
@@ -509,6 +520,7 @@ Installed by `install.sh` (runtime, root-owned):
 
 ```
 /opt/alx_fancontrol/venv/        # frozen snapshot: non-editable pip install of the source
+/usr/local/bin/alx-fancontrol    # launcher (sudo alx-fancontrol …; /opt first, dev venv fallback)
 /etc/alx_fancontrol/config.json  # system config (+ config.json.bak)
 /run/alx_fancontrol/status.json  # daemon liveness (RuntimeDirectory=)
 /var/log/alx_fancontrol/         # daemon.log (LogsDirectory=)

@@ -25,6 +25,8 @@ OPT="/opt/$SVC"
 VENV="$OPT/venv"
 UNIT_SRC="$SRC/alx-fancontrol.service"
 UNIT_DST="/etc/systemd/system/$SVC.service"
+LAUNCHER_SRC="$SRC/alx-fancontrol"
+LAUNCHER_DST="/usr/local/bin/alx-fancontrol"
 CONFIG_DIR="/etc/$SVC"
 CONFIG="$CONFIG_DIR/config.json"
 # legacy config location from earlier development (underscore dir!)
@@ -120,7 +122,15 @@ else
     echo "none"
 fi
 
-# ------------------------------------------------------- 4. install unit ---
+# -------------------------------------------------- 4. launcher + unit ----
+say "launcher: $LAUNCHER_DST (so: sudo alx-fancontrol tui|daemon|check)"
+if [ "$DRY" -eq 1 ]; then
+    echo "  [dry-run] install -m 755 $LAUNCHER_SRC $LAUNCHER_DST"
+else
+    [ -e "$LAUNCHER_DST" ] && cp -f "$LAUNCHER_DST" "$LAUNCHER_DST.bak"
+    install -m 755 "$LAUNCHER_SRC" "$LAUNCHER_DST"
+fi
+
 say "installing unit -> $UNIT_DST"
 if [ "$DRY" -eq 1 ]; then
     sed 's/^/    /' "$UNIT_SRC"
@@ -166,7 +176,7 @@ cat <<EOF
 Daemon:    systemctl status $SVC
 Logs:      journalctl -u $SVC -f      (file: /var/log/$SVC/daemon.log)
 Config:    $CONFIG   (edit via the TUI, or by hand)
-TUI:       sudo $VENV/bin/alx-fancontrol tui
+TUI:       sudo alx-fancontrol tui   (launcher: $LAUNCHER_DST)
 Upgrade:   edit $SRC, then:  sudo bash $SRC/install.sh
 Uninstall: sudo bash $SRC/uninstall.sh   [--purge to also remove $CONFIG_DIR]
 EOF

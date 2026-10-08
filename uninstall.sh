@@ -19,6 +19,7 @@ UNIT_DST="/etc/systemd/system/$SVC.service"
 OPT="/opt/$SVC"
 CONFIG_DIR="/etc/$SVC"
 LOG_DIR="/var/log/$SVC"
+LAUNCHER="/usr/local/bin/alx-fancontrol"
 RUN_DIR="/run/$SVC"
 DRY=0
 PURGE=0
@@ -59,6 +60,11 @@ if [ -d "$OPT" ]; then
     run rm -rf "$OPT"
 else
     echo "absent"
+fi
+if [ -e "$LAUNCHER" ]; then
+    run rm -f "$LAUNCHER" "$LAUNCHER.bak"
+else
+    echo "launcher absent: $LAUNCHER"
 fi
 
 # ------------------------------------------------------- 3. config + log ---

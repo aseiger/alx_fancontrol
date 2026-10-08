@@ -1,0 +1,22 @@
+#!/bin/bash
+# alx-fancontrol launcher — makes `sudo alx-fancontrol <daemon|tui|check>`
+# work without remembering venv paths.
+#
+# Installed by install.sh to /usr/local/bin/alx-fancontrol (removed by
+# uninstall.sh). Prefers the frozen /opt snapshot; falls back to the
+# dev-tree venv (interim mode, see README "Running without installing").
+set -euo pipefail
+
+for cand in \
+    /opt/alx_fancontrol/venv/bin/alx-fancontrol \
+    /home/alex/alx_fancontrol/.venv/bin/alx-fancontrol
+do
+    if [ -x "$cand" ]; then
+        exec "$cand" "$@"
+    fi
+done
+
+echo "alx-fancontrol: no runtime found." >&2
+echo "  installed:  sudo bash /home/alex/alx_fancontrol/install.sh" >&2
+echo "  or dev:     bash /home/alex/alx_fancontrol/scripts/bootstrap_venv.sh" >&2
+exit 1

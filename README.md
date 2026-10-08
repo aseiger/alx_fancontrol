@@ -96,7 +96,7 @@ a fresh install controls nothing until you assign fans in the TUI.
 ```bash
 # installed system (what install.sh runs):
 sudo alx-fancontrol check        # validate /etc config
-sudo alx-fancontrol tui          # the real thing (edits /etc config)
+sudo alx-fancontrol              # the TUI — bare command = tui (edits /etc config)
 
 # dev, from the source tree (uses ~/.config, can't take over fans):
 cd /home/alex/alx_fancontrol
@@ -282,9 +282,13 @@ source-missing | write-error | curve-missing | idle`.
 
 ## TUI
 
-`.venv/bin/alx-fancontrol tui` (needs the venv; under system python you
+`.venv/bin/alx-fancontrol tui` — or just **`alx-fancontrol`** with no
+subcommand, which opens the TUI (needs the venv; under system python you
 get a pointer to `scripts/bootstrap_venv.sh`). The TUI is **read-only on
-hwmon** — safe to run while the daemon is live. Keys `1–4` switch
+hwmon** — safe to run while the daemon is live. Run without root and a
+red **non-root** banner sits in the sidebar on every screen: fans can't
+be controlled (pwm writes are root-only) and the config edited is the
+home one, not `/etc`. Keys `1–4` switch
 screens (footer shows them; sidebar buttons work too). The current
 screen is highlighted in the sidebar — nav items are never *focused*
 (focus would swallow the nav keys and leave a stray highlight on the
@@ -495,7 +499,7 @@ alx_fancontrol/
 ├── run-local.sh                 # interim mode: daemon/tui from the source tree, pinned config
 ├── IMPLEMENTATION_NOTES.md      # design decisions + TUI bug log (see §12)
 ├── alx_fancontrol/
-│   ├── cli.py                   # daemon | tui | check
+│   ├── cli.py                   # daemon | tui | check (bare command = tui)
 │   ├── config.py                # Config model, load/save (atomic+.bak)/validate/seed
 │   ├── hwmon.py                 # chip discovery by name, temp/fan/pwm/enable R/W, nvidia-smi, sensors.d labels
 │   ├── sources.py               # runtime source discovery (hwmon + nvidia → canonical ids)

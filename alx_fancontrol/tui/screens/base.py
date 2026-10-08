@@ -101,6 +101,9 @@ class BaseScreen(Screen):
         yield Footer()
         with Horizontal(id="shell"):
             with Vertical(id="sidebar"):
+                if not self.app.is_root:
+                    yield Static("⚠ non-root: no fan control — "
+                                 "use sudo alx-fancontrol", id="root-warn")
                 yield NavButton("1 · Overview", id="nav-1")
                 yield NavButton("2 · Assign", id="nav-2")
                 yield NavButton("3 · Curves", id="nav-3")

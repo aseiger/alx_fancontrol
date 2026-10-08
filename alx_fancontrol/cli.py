@@ -1,4 +1,4 @@
-"""alx-fancontrol CLI: daemon | tui | check.
+"""alx-fancontrol CLI: daemon | tui | check (no command = tui).
 
 The daemon is pure stdlib and runs under system python3 (no venv needed);
 the TUI needs the project venv (scripts/bootstrap_venv.sh).
@@ -16,9 +16,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="alx-fancontrol",
         description="TUI-first fan control: hwmon + nvidia-smi sources, "
-                    "piecewise-linear curves, rate-limited PWM writes.")
+                    "piecewise-linear curves, rate-limited PWM writes. "
+                    "With no subcommand, launches the TUI.")
     p.add_argument("--version", action="version", version=__version__)
-    sub = p.add_subparsers(dest="command", required=True)
+    sub = p.add_subparsers(dest="command", required=False)
 
     d = sub.add_parser("daemon", help="run the fan control daemon")
     d.add_argument("--config", default=None,
@@ -124,6 +125,8 @@ def _tui(args) -> int:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command is None:
+        args.command = "tui"   # bare `alx-fancontrol` opens the TUI
     if args.command == "daemon":
         from alx_fancontrol.daemon import main as daemon_main
         return daemon_main(args)

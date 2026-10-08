@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
 import traceback
 
 import pytest
@@ -1494,5 +1495,41 @@ def test_add_point_requires_selected_row(temp_config, machine, notices):
             assert isinstance(pilot.app.screen, CurveEditorScreen)
             assert any("select a point" in m.lower()
                        for _s, m in notices), notices
+
+    asyncio.run(run())
+
+
+# ----------------------------------------------------------- root warning --
+
+def test_nonroot_tui_shows_warning_on_every_screen(temp_config, machine):
+    """Non-root cannot take over fans (pwm writes are root-only) and edits
+    the home config, not /etc — a red banner in the sidebar must say so on
+    EVERY screen, so nobody wonders why the fans don't move."""
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 40)) \
+                as pilot:
+            await pilot.pause()
+            assert pilot.app.is_root is False   # tests run as the dev user
+            for key in ("1", "2", "3", "4"):
+                await pilot.press(key)
+                await pilot.pause()
+                warn = pilot.app.screen.query_one("#root-warn", Static)
+                assert "non-root" in str(warn.render())
+
+    asyncio.run(run())
+
+
+def test_root_tui_has_no_warning(temp_config, machine, monkeypatch):
+    """Root is the normal case (the service, sudo) — no warning clutter."""
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 40)) \
+                as pilot:
+            await pilot.pause()
+            assert pilot.app.is_root is True
+            assert len(pilot.app.screen.query("#root-warn")) == 0
 
     asyncio.run(run())

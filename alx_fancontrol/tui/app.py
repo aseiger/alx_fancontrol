@@ -8,6 +8,7 @@ tmp copy and never touch the real user config.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from textual.app import App
@@ -111,6 +112,11 @@ class FanControlApp(App):
         color: $text-muted;
         margin-top: 2;
     }
+    #sidebar #root-warn {
+        color: $error;
+        text-style: bold;
+        margin-bottom: 1;
+    }
     #sidebar #prot-hint .prot {
         color: $text-disabled;
     }
@@ -137,6 +143,9 @@ class FanControlApp(App):
         self.cfg_path = (Path(config_path) if config_path
                          else config_mod.default_path())
         self.live_enabled = live
+        # Non-root cannot take over fans (pwm writes are root-only) and
+        # edits the home config instead of /etc — the user must be told.
+        self.is_root = os.geteuid() == 0
         self.cfg: config_mod.Config | None = None
         self._cfg_mtime: float | None = None
         self.labels = hwmon.load_sensorsd_labels()

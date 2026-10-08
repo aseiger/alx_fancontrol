@@ -1,0 +1,18 @@
+[Unit]
+Description=alx_fancontrol - TUI-first fan control daemon
+After=multi-user.target nvidia-persistenced.service
+
+[Service]
+Type=simple
+# Runs as root: it writes /sys/class/hwmon/*/pwmN (root-only). As root it
+# reads its config from /etc/alx_fancontrol/config.json (config.default_path).
+# The code runs from the /opt snapshot built by install.sh — NOT from the
+# source tree, which may be deleted.
+RuntimeDirectory=alx_fancontrol   # /run/alx_fancontrol -> status.json
+LogsDirectory=alx_fancontrol      # /var/log/alx_fancontrol -> daemon.log
+ExecStart=/opt/alx_fancontrol/venv/bin/python -m alx_fancontrol.daemon
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

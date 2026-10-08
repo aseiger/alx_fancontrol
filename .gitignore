@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.tmp
+.pytest_cache/
+*.egg-info/
+*.log
+*.log.*
+scripts/get-pip.py
+tests/fixtures/status.json
+tests/fixtures/daemon.log*
+build/

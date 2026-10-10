@@ -175,12 +175,6 @@ def test_assign_lists_all_pwm_channels(temp_config, machine):
                       for r in range(table.row_count)}
             assert labels["it8686:pwm3"] == machine.labels["it8686"]["pwm3"]
             assert labels["it8792:pwm3"] == machine.labels["it8792"]["pwm3"]
-            # protected rows are visibly reserved; others are not
-            notes = {table.get_cell_at((r, 1)): table.get_cell_at((r, 4))
-                     for r in range(table.row_count)}
-            assert notes["it8792:pwm1"] == "reserved (gpu-fanctl)"
-            assert notes["it8792:pwm3"] == "reserved (gpu-fanctl)"
-            assert notes["it8686:pwm1"] == ""
 
     asyncio.run(run())
 
@@ -224,7 +218,10 @@ def test_click_same_row_again_deselects(machine, temp_config):
     asyncio.run(run())
 
 
-def test_click_protected_row_warns_and_refuses(temp_config, machine, notices):
+def test_click_gpu_blower_row_selects_it(temp_config, machine):
+    """it8792:pwm1 used to be hard 'protected' in the config; after the
+    redesign it is an ordinary selectable row. (The daemon still refuses
+    takeover of any channel another process holds in manual mode.)"""
     async def run():
         async with FanControlApp(config_path=temp_config,
                                  live=False).run_test(size=(120, 40)) \
@@ -236,10 +233,8 @@ def test_click_protected_row_warns_and_refuses(temp_config, machine, notices):
             table = screen.query_one("#fan-pick", DataTable)
             row = machine.fan_ids().index("it8792:pwm1")
             await post_row_selected(pilot, table, row)
-            assert screen._picked == set()
-            assert table.get_cell_at((row, 0)) == ""
-            assert any(sev == "warning" and "reserved" in msg
-                       for sev, msg in notices), notices
+            assert screen._picked == {"it8792:pwm1"}
+            assert table.get_cell_at((row, 0)) == "✓"
 
     asyncio.run(run())
 

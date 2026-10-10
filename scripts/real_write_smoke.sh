@@ -54,7 +54,6 @@ cat > "$CFG" <<EOF
 {
   "version": 1,
   "config": {"poll_seconds": 1.0, "max_rate": 6, "floor_duty": 5, "dead_temp_c": -10},
-  "protected": ["it8792:pwm1", "it8792:pwm3"],
   "sources": {
     "sys1": {"kind": "hwmon", "chip": "it8686", "temp": 1, "label": "System 1", "enabled": true}
   },

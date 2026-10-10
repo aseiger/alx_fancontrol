@@ -94,20 +94,15 @@ class OverviewScreen(BaseScreen):
             if a.get("enabled", True):
                 for f in a.get("fans", []):
                     assign_of.setdefault(f, aid)
-        prot = set(app.cfg.protected)
-        for f in sorted(set(assign_of) | prot):
+        for f in sorted(assign_of):
             d = data.get("fans", {}).get(f, {})
             aid = assign_of.get(f)
-            if aid is not None:
-                a = app.cfg.assignments[aid]
-                sid = a.get("source")
-                t = (data.get("sources") or {}).get(sid, {}).get("temp_c")
-                src_cell = (f"{sid}: {t:.1f} °C" if t is not None
-                            else f"{sid}: no reading")
-                assign_cell = aid
-            else:
-                src_cell = "—"
-                assign_cell = "reserved"
+            a = app.cfg.assignments[aid]
+            sid = a.get("source")
+            t = (data.get("sources") or {}).get(sid, {}).get("temp_c")
+            src_cell = (f"{sid}: {t:.1f} °C" if t is not None
+                        else f"{sid}: no reading")
+            assign_cell = aid
             duty = d.get("duty_pct")
             rpm = d.get("rpm")
             fan.add_row(
@@ -121,8 +116,6 @@ class OverviewScreen(BaseScreen):
 
     def _fan_state(self, fan: str, aid: str | None, data: dict) -> str:
         app = self.app
-        if fan in set(app.cfg.protected):
-            return "protected (gpu-fanctl)"
         if aid is None:
             return "idle"
         st = (data.get("status") or {}).get("fans", {}).get(fan, {})

@@ -51,10 +51,10 @@ def test_roundtrip_load_save_load(tmp_path):
     cfg2 = C.load(p)
     assert cfg2.assignments == cfg.assignments
     assert cfg2.curves == cfg.curves
-    assert cfg2.protected == cfg.protected
     doc = json.loads(p.read_text())
     assert doc["version"] == C.CONFIG_VERSION
     assert "sources" not in doc  # v2: sources live at runtime, not here
+    assert "protected" not in doc  # removed from the design
 
 
 def test_bak_holds_previous_content(tmp_path):
@@ -98,7 +98,6 @@ def test_minimal_config_keeps_defaults(tmp_path):
     p = tmp_path / "c.json"
     p.write_text('{"version": 1}\n')
     cfg = C.load(p)
-    assert cfg.protected == ["it8792:pwm1", "it8792:pwm3"]
     assert cfg.config["poll_seconds"] == 1.0
     assert "default" in cfg.curves
     errors, warnings = C.validate(cfg)
@@ -113,7 +112,9 @@ def test_seed_produces_valid_config(tmp_path):
     assert errors == []
     assert warnings == []
     # v2: no sources section (runtime discovery), default curves present
-    assert "sources" not in C.to_dict(cfg)
+    doc = C.to_dict(cfg)
+    assert "sources" not in doc
+    assert "protected" not in doc  # removed from the design
     assert "default" in cfg.curves and "gpu_v100" in cfg.curves
     # guardrail: a fresh config controls nothing
     assert cfg.assignments == {}
@@ -180,12 +181,13 @@ def test_v1_migration_rewrites_source_ids(tmp_path):
     assert a["CPU"]["fans"] == ["it8686:pwm1"]
     assert cfg.curves["default"]["points"] == V1_DOC["curves"][
         "default"]["points"]
-    assert cfg.protected == V1_DOC["protected"]
-    # re-saving produces a clean v2 doc without the sources section
+    # re-saving produces a clean v2 doc without the sources section — and
+    # the legacy 'protected' key is dropped, not carried forward
     C.save(cfg, p)
     doc = json.loads(p.read_text())
     assert doc["version"] == C.CONFIG_VERSION
     assert "sources" not in doc
+    assert "protected" not in doc
     assert doc["assignments"]["CPU"]["source"] == "k10temp[0]:temp1"
 
 
@@ -213,12 +215,9 @@ def test_v1_migration_unknown_legacy_source_untouched(tmp_path):
 
 # ------------------------------------------------------------ validate ----
 
-def _cfg_with(assignments=None, curves=None, config=None,
-              protected=None):
+def _cfg_with(assignments=None, curves=None, config=None):
     return C.Config(
         config=config or dict(C.DEFAULTS["config"]),
-        protected=protected if protected is not None
-        else list(C.DEFAULTS["protected"]),
         curves=curves if curves is not None
         else dict(C.DEFAULTS["curves"]),
         assignments=assignments or {},

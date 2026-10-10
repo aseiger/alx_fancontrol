@@ -46,7 +46,6 @@ def make_config(tmp_path, assignments):
         "version": 2,
         "config": {"poll_seconds": 1.0, "max_rate": 6,
                    "floor_duty": 20, "dead_temp_c": -10},
-        "protected": ["it8792:pwm1", "it8792:pwm3"],
         "curves": {
             "default": {"label": "Default",
                         "points": [[40, 20], [55, 30], [65, 70], [75, 100]]},
@@ -110,13 +109,17 @@ def test_dry_run_once_changes_nothing_and_logs_guardrails(caplog, tmp_path):
     assert "would take over it8686:pwm3" in text
     # k10temp reads 40.0 C -> default curve -> exactly 20% (floor), raw 51
     assert "would write it8686:pwm3 =  20% (raw 51)" in text
-    assert text.count("refusing protected channel it8792") == 2
+    # it8792 pwm1/pwm3 are in manual mode in the fake tree (gpu-fanctl):
+    # the takeover guardrail refuses them as manual-conflicts (logged at
+    # initial takeover and re-checked, still refused, at every poll)
+    assert "channel it8792:pwm1 already in manual mode" in text
+    assert "channel it8792:pwm3 already in manual mode" in text
     assert "would return it8686:pwm3 to firmware" in text
 
     st = json.loads((cfg_path.parent / "status.json").read_text())
     assert st["dry_run"] is True
-    assert st["fans"]["it8792:pwm1"]["state"] == "protected"
-    assert st["fans"]["it8792:pwm3"]["state"] == "protected"
+    assert st["fans"]["it8792:pwm1"]["state"] == "manual-conflict"
+    assert st["fans"]["it8792:pwm3"]["state"] == "manual-conflict"
     assert st["fans"]["it8686:pwm3"]["state"] == "ok"
     assert st["fans"]["it8686:pwm3"]["rpm"] == 3229
     assert st["fans"]["it8686:pwm3"]["label"] == "SYS_FAN2" or \
@@ -155,7 +158,7 @@ def test_live_once_takeover_write_and_restore(caplog, tmp_path, monkeypatch):
     assert "took over it8686:pwm3" in text
     assert "write it8686:pwm3 =  20% (raw 51)" in text
     assert "returned it8686:pwm3 to firmware" in text
-    assert "refusing protected" not in text  # no protected fans assigned
+    assert "already in manual mode" not in text  # no manual-owned fans here
 
 
 def test_curve_interpolation_midpoint(tmp_path):
@@ -172,9 +175,11 @@ def test_curve_interpolation_midpoint(tmp_path):
     assert (root / "hwmon0" / "pwm3_enable").read_text().strip() == "2"
 
 
-def test_protected_only_changes_nothing(caplog, tmp_path):
-    """non-dry-run with only protected fans assigned: takes over nothing,
-    exits 0, changes nothing (the M1 proof)."""
+def test_manual_owned_fans_refused_changes_nothing(caplog, tmp_path):
+    """non-dry-run assigning only fans another process holds in manual
+    mode (enable=1, the fake tree's gpu-fanctl channels): takes over
+    nothing, exits 0, changes nothing — the runtime guardrail that
+    replaced the old 'protected' config list."""
     caplog.set_level(logging.INFO)
     root = make_tree(tmp_path)
     cfg_path = make_config(tmp_path, {
@@ -187,16 +192,18 @@ def test_protected_only_changes_nothing(caplog, tmp_path):
     rc = run_daemon(cfg_path, root, dry_run=False)
     after = snapshot_tree(root)
     assert rc == 0
-    assert before == after, "protected-only run must not change any file"
-    assert caplog.text.count("refusing protected channel it8792") == 2
+    assert before == after, "manual-owned run must not change any file"
+    assert "channel it8792:pwm1 already in manual mode" in caplog.text
+    assert "channel it8792:pwm3 already in manual mode" in caplog.text
     st = json.loads((cfg_path.parent / "status.json").read_text())
-    assert st["fans"]["it8792:pwm1"]["state"] == "protected"
+    assert st["fans"]["it8792:pwm1"]["state"] == "manual-conflict"
     assert st["fans"]["it8792:pwm1"]["enable"] == 1  # still manual/owned
 
 
 def test_manual_conflict_refused(caplog, tmp_path):
-    """a NON-protected channel already in manual mode (enable=1) is
-    refused at takeover — the runtime backstop."""
+    """a channel already in manual mode (enable=1 — owned by another
+    process) is refused at takeover — THE runtime guardrail against
+    stomping a fan another daemon (e.g. gpu-fanctl) is driving."""
     caplog.set_level(logging.INFO)
     root = make_tree(tmp_path)
     (root / "hwmon0" / "pwm4_enable").write_text("1\n")

@@ -30,12 +30,11 @@ curve editor / sources) as the primary UX.
 - Multiple sources (CPU package temps, motherboard thermistors, GPU
   temps) and multiple fans per source, with per-fan floor/ceiling/rate —
   `fancontrol` does one fan per temp with a single global min.
-- Safety is in code, not in your memory: `protected` channels
-  (the GPU blowers owned by the existing `gpu-fanctl` service) are
-  refused at takeover, channels already in manual mode by another
-  process are refused, and every exit path restores firmware control.
-  `--dry-run` demonstrates all of it without writing a single sysfs
-  file.
+- Safety is in code, not in your memory: channels already in manual
+  mode by another process (e.g. the GPU blowers owned by the existing
+  `gpu-fanctl` service) are refused at takeover, and every exit path
+  restores firmware control. `--dry-run` demonstrates all of it without
+  writing a single sysfs file.
 - Hot config reload: edit the JSON (by hand or in the TUI) and the
   daemon picks it up within ~1 s — no restart, no `pwmconfig` re-run.
 
@@ -110,10 +109,12 @@ it runs in dev mode against `~/.config/alx_fancontrol/` — fine for
 testing, but it can't take over fans.
 
 In the TUI: `2` → Assign → name it, pick a source (live °C), a curve,
-click fans (protected GPU blowers are greyed "reserved (gpu-fanctl)"),
-Save. `3` → Curves → shape the curve (drag points, `a`/`d`, `+`/`-`,
-shift+arrows), Save. `4` → Sources → the runtime-detected source list. `1` →
-Overview → watch duties/RPMs move.
+click fans, Save. `3` → Curves → shape the curve (drag points, `a`/`d`,
+`+`/`-`, shift+arrows), Save. `4` → Sources → the runtime-detected
+source list. `1` → Overview → watch duties/RPMs move. (You *can* pick
+the gpu-fanctl blower headers — but the daemon refuses to take over any
+channel another process holds in manual mode, so they stay with
+`gpu-fanctl` while that service runs.)
 
 Then run the daemon for real (it takes over only the fans you assigned,
 restores firmware control on exit) — or better, install it as a service:
@@ -145,8 +146,8 @@ Duty is **percent 0–100** in the config; raw 0–255 only at the sysfs
 boundary.
 
 **What is (and isn't) in the config:** only the *source→fan mappings*
-(`assignments`) and the *curves* live in the config, plus daemon tunables
-and the `protected` list. **Temperature sources are not configured** —
+(`assignments`) and the *curves* live in the config, plus daemon
+tunables. **Temperature sources are not configured** —
 they are *discovered at runtime* (every hwmon `tempN_input` + every
 nvidia-smi GPU) by both the daemon and the TUI, and referenced by
 canonical ids:
@@ -171,7 +172,6 @@ automatically on load — the TUI re-saves them as v2 on first open.
     "floor_duty": 5,
     "dead_temp_c": -10
   },
-  "protected": ["it8792:pwm1", "it8792:pwm3"],
   "curves": {
     "default":  { "label": "Default",     "points": [[40, 20], [55, 30], [65, 70], [75, 100]] },
     "gpu_v100": { "label": "V100 blower", "points": [[50, 26], [60, 40], [66, 75], [72, 100]] }
@@ -204,7 +204,6 @@ automatically on load — the TUI re-saves them as v2 on first open.
 | `config.max_rate` | fallback max duty change **per poll**, percent (6 ≈ gpu-fanctl's proven 16/0–255) — overridden per assignment |
 | `config.floor_duty` | fallback per-assignment floor, **default 5%** (quiet idle; stall protection) — overridden per assignment |
 | `config.dead_temp_c` | readings below this count as "no reading" (kills the −55 °C dead thermistors) |
-| `protected` | fan ids the daemon **refuses to take over or write, ever**. Defaults to the two gpu-fanctl channels and is in the built-in DEFAULTS, so even a hand-written minimal config stays safe. Shown read-only in the TUI. |
 | `sources.*.kind` | `hwmon` or `nvidia` |
 | `sources.*.chip` / `.temp` / `.chip_index` | hwmon source: chip **name prefix** (never `hwmonN` — indices reshuffle across reboots), temp index, and which instance of a duplicated prefix (two `k10temp` packages on this box → `chip_index` 0/1) |
 | `sources.*.pci_bus` | nvidia source: normalized PCI bus, e.g. `08:00.0` |
@@ -230,9 +229,9 @@ python3 -m alx_fancontrol.daemon  [same flags]     # system python, no venv need
 
 - `--dry-run` — **no writes at all** (no `pwmN_enable`, no `pwmN`), but
   the full read loop runs and every guardrail check executes and logs:
-  `would take over …`, `refusing protected channel …`, `would write …`,
-  `would return … to firmware`. Use it to see exactly what a config
-  would do.
+  `would take over …`, `channel … already in manual mode` (refused),
+  `would write …`, `would return … to firmware`. Use it to see exactly
+  what a config would do.
 - `--once` / `--duration N` — bounded runs for smoke tests; the
   firmware-restore `finally` still executes.
 - `-v` — DEBUG logging.
@@ -250,10 +249,10 @@ Behavior:
 - Fan write fails → keep last duty, log first + every 10th failure,
   `state=write-error` in status, retry every poll.
 - **Takeover rules** (per channel, every run):
-  - in `protected` → `refusing protected channel` (ERROR), never touched;
-  - `pwmN_enable=1` (already manual — someone else owns it; this is the
-    runtime backstop that protects the GPU blowers even if you remove
-    them from `protected`) → refused (ERROR);
+  - `pwmN_enable=1` (already manual — someone else owns it, e.g.
+    gpu-fanctl on the GPU blowers) → refused (ERROR). Re-checked every
+    poll: a fan becomes eligible the moment the other process releases
+    it;
   - `pwmN_enable=0` (disabled) → skipped (WARN);
   - `pwmN_enable=2` (firmware) → taken over (`enable→1`), original value
     recorded and **restored exactly** in `finally` (clean SIGTERM/SIGINT
@@ -277,7 +276,7 @@ Written by the daemon each poll; read by the TUI:
   "errors": {} }
 ```
 
-`state`: `ok | protected | manual-conflict | disabled | unresolved |
+`state`: `ok | manual-conflict | disabled | unresolved |
 source-missing | write-error | curve-missing | idle`.
 
 ## TUI
@@ -306,10 +305,10 @@ top item), so: **keys navigate, clicks focus** fields/tables.
    **Delete** button or `d` removes the selected row after a
    confirmation (the daemon then restores firmware control of its
    fans); **New** resets the form. Form: source `Select` (rows show
-   live °C), curve `Select`, fan picker (click a row to toggle ✓;
-   protected channels are listed but *reserved (gpu-fanctl)* and
-   untoggleable), optional floor % / ceiling % / rate %/poll, name,
-   **Save** (or `s`).
+   live °C), curve `Select`, fan picker (click a row to toggle ✓ —
+   every channel is pickable; channels another process holds in manual
+   mode are refused by the *daemon* at takeover, not by the UI),
+   optional floor % / ceiling % / rate %/poll, name, **Save** (or `s`).
 3. **Curves** — points table (cursor-selectable) + live text plot
    (curve as `█` columns, `◄` marker at the current temp of the
    selected preview source, every point marked `●` and the selected one
@@ -382,8 +381,9 @@ ownership if the TUI ran as root.
    `RuntimeDirectory=`/`LogsDirectory=` create `/run/alx_fancontrol`
    (status.json) and `/var/log/alx_fancontrol` (daemon.log); as root the
    daemon finds its config in `/etc` on its own (no path pinning).
-6. **Verifies**: unit active, `gpu-fanctl` still active, and the protected
-   GPU-blower channels still at `enable=1` (reserved for gpu-fanctl).
+6. **Verifies**: unit active, `gpu-fanctl` still active, and the
+   GPU-blower channels still at `enable=1` (i.e. still owned by
+   gpu-fanctl — the daemon only takes over channels in firmware mode).
 
 `Restart=always` covers the hwmon-reshuffle case (see troubleshooting).
 
@@ -398,17 +398,15 @@ touched.
 
 **The running `gpu-fanctl.service` owns it8792 pwm1/pwm3** (the V100
 GPU blower headers; `pwmN_enable=1`, actively duty-cycled). alx_fancontrol
-coexists with it under four independent guardrails:
+coexists with it under three independent guardrails:
 
-1. `protected: ["it8792:pwm1", "it8792:pwm3"]` is a **built-in default**
-   (survives hand-written minimal configs); the daemon refuses protected
-   channels at takeover, always.
-2. Any channel with `pwmN_enable=1` at takeover is refused — even one
-   you removed from `protected` (someone else is in manual mode; that's
-   exactly the state gpu-fanctl leaves its channels in).
-3. `--dry-run` writes nothing at all, and the acceptance path for new
+1. Any channel with `pwmN_enable=1` at takeover is refused (someone
+   else is in manual mode — that's exactly the state gpu-fanctl leaves
+   its channels in). It is re-checked every poll, so a channel becomes
+   eligible only while it actually sits in firmware mode.
+2. `--dry-run` writes nothing at all, and the acceptance path for new
    configs is a dry run.
-4. `scripts/protect.py` snapshots/checks it8792 pwm1/pwm3 duty+enable
+3. `scripts/protect.py` snapshots/checks it8792 pwm1/pwm3 duty+enable
    and the service state:
 
    ```bash
@@ -423,6 +421,16 @@ coexists with it under four independent guardrails:
    moves duty with GPU temperature between two checks. (The dry runs
    provably change nothing: the hermetic fake-tree tests assert byte-
    identical trees, and it8686 was verified unchanged after live runs.)
+
+**Design note:** an earlier revision had a `protected` config list
+(built-in default `["it8792:pwm1", "it8792:pwm3"]`) that refused those
+channels even in firmware mode. It was removed — it only ever existed
+to keep the dev daemon from stomping on the running gpu-fanctl, which
+guardrail 1 already covers. Consequence to know: if you *stop*
+gpu-fanctl and its channels return to firmware mode, the blower headers
+become assignable like any other fan (the daemon will take them over if
+assigned). Old configs with a `protected` key still load; the key is
+ignored and dropped on the next save.
 
 Additional rules honored everywhere:
 

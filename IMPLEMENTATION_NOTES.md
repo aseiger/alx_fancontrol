@@ -268,3 +268,33 @@ green.
 - reader.py: a non-root TUI now also probes /run/alx_fancontrol/status.json
   so the Overview shows the daemon as running even though the root daemon
   writes status there (not next to the home config).
+
+## 16. `protected` config list removed (2026-10-09)
+
+User decision: the `protected` fan list (built-in default
+`["it8792:pwm1", "it8792:pwm3"]`) is gone from the design. Rationale: it
+only ever existed to keep the *dev* daemon from stomping on the running
+gpu-fanctl, and the takeover guardrail that actually does that — refuse
+any channel found in manual mode (`pwmN_enable=1`) at takeover, re-checked
+every poll — already covers it. `protected` added nothing except
+refusing channels in *firmware* mode (e.g. gpu-fanctl stopped), which is
+now deliberately assignable.
+
+- config: field, DEFAULTS entry, validation, seed and v1-migration
+  carry-over all removed; legacy `protected` keys in old config files are
+  ignored on load and dropped on the next save (v1→v2 migration no
+  longer carries the key forward).
+- daemon: no `protected` state anymore; such fans surface as
+  `manual-conflict` (in manual mode) or are taken over normally
+  (firmware mode). `_takeover()` no longer needs the config.
+- TUI: the fan picker's `note` column, the "reserved (gpu-fanctl)"
+  grey-out/refusal and the sidebar `#prot-hint` block are gone — every
+  channel is pickable; the refusal (if applicable) happens in the daemon
+  and is visible in Overview state + logs.
+- install.sh: the it8792 pwm1/pwm3 `enable=1` post-install check stays
+  (it verifies gpu-fanctl still owns its channels), reworded.
+- tests: `test_protected_only_changes_nothing` →
+  `test_manual_owned_fans_refused_changes_nothing` (same fake tree,
+  refusal now via the manual-mode guardrail); `test_click_protected_row_*`
+  → clicking a former GPU-blower row selects it; orphan fixture files
+  (`tests/fixtures/*.json`, referenced by nothing) deleted.

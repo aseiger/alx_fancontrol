@@ -151,15 +151,17 @@ if [ "$DRY" -eq 0 ]; then
     say "verification"
     echo "service:      $(systemctl is-active $SVC)"
     echo "gpu-fanctl:   $(systemctl is-active gpu-fanctl 2>/dev/null || echo MISSING)"
-    # protected channels must still be manual (enable=1), owned by gpu-fanctl
+    # gpu-fanctl's channels must still be manual (enable=1) — the daemon
+    # refuses takeover of any channel it finds in manual mode, so this is
+    # what keeps the V100 blowers out of alx_fancontrol's hands
     IT8792="$(for h in /sys/class/hwmon/hwmon*; do
         case "$(cat "$h/name" 2>/dev/null)" in it8792*) echo "$h"; break;; esac
     done)"
     if [ -n "$IT8792" ]; then
         e1="$(cat "$IT8792/pwm1_enable" 2>/dev/null || echo '?')"
         e3="$(cat "$IT8792/pwm3_enable" 2>/dev/null || echo '?')"
-        echo "it8792 pwm1/3 enable: $e1/$e3 (expect 1/1 — reserved for gpu-fanctl)"
-        [ "$e1" = "1" ] && [ "$e3" = "1" ] || echo "WARNING: protected channels not at enable=1!"
+        echo "it8792 pwm1/3 enable: $e1/$e3 (expect 1/1 — gpu-fanctl owns them)"
+        [ "$e1" = "1" ] && [ "$e3" = "1" ] || echo "WARNING: it8792 pwm1/3 not in manual mode — gpu-fanctl no longer owns them; the daemon could take them over if assigned!"
     fi
     if [ "$(systemctl is-active gpu-fanctl 2>/dev/null)" != "active" ]; then
         echo "WARNING: gpu-fanctl is not running — the V100 blowers (it8792"

@@ -63,7 +63,6 @@ def _check(args) -> int:
     c = cfg.config
     print(f"  poll_seconds={c.get('poll_seconds')}  max_rate={c.get('max_rate')}% "
           f"floor_duty={c.get('floor_duty')}%  dead_temp_c={c.get('dead_temp_c')}")
-    print(f"protected: {', '.join(cfg.protected) or '(none!)'}")
 
     # sources are discovered at runtime (not stored in the config)
     from alx_fancontrol import sources as sources_mod

@@ -7,8 +7,10 @@ it8792=hwmon2) — discovery is always by `name` prefix, never by hwmonN.
 
 pwmN_enable semantics on this board:
     0 = disabled, 1 = manual (software control), 2 = firmware/BIOS SmartFan.
-The running gpu-fanctl service owns it8792 pwm1/pwm3 (enable=1); see
-scripts/protect.py and the `protected` config section.
+The running gpu-fanctl service holds it8792 pwm1/pwm3 in manual mode
+(enable=1); the daemon refuses takeover of any channel it finds in manual
+mode, so coexistence is safe (see scripts/protect.py for the snapshot
+check).
 """
 from __future__ import annotations
 

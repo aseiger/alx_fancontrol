@@ -108,7 +108,6 @@ class BaseScreen(Screen):
                 yield NavButton("2 · Assign", id="nav-2")
                 yield NavButton("3 · Curves", id="nav-3")
                 yield NavButton("4 · Sources", id="nav-4")
-                yield Static("", id="prot-hint")
             with Vertical(id="content"):
                 yield from self.content()
 
@@ -117,16 +116,8 @@ class BaseScreen(Screen):
         return iter(())
 
     def on_mount(self):
-        app = self.app
         if self.NAV_ID:
             self.query_one(f"#{self.NAV_ID}", NavButton).add_class("active")
-        prot = app.cfg.protected
-        if prot:
-            lines = "protected (never touched):\n" + "".join(
-                f"[prot]  {f} — reserved (gpu-fanctl)[/prot]\n" for f in prot)
-        else:
-            lines = "[prot]protected: (none!) — careful[/prot]"
-        self.query_one("#prot-hint", Static).update(lines)
 
     def on_button_pressed(self, event):
         actions = {"nav-1": "show_overview",

@@ -8,10 +8,9 @@ Firmware control is restored exactly in `finally` on clean exit
 (SIGTERM/SIGINT set the stop flag).
 
 Safety guardrails (enforced in code, see also scripts/protect.py):
-- `protected` fans (built-in default: it8792:pwm1/pwm3, owned by the
-  running gpu-fanctl service) are refused at takeover, always.
 - A channel with pwmN_enable=1 (already manual — owned by another
-  process) is refused at takeover; =0 is skipped.
+  process, e.g. the gpu-fanctl service) is refused at takeover; =0 is
+  skipped.
 - Takeover only from pwmN_enable=2 (firmware); the original value is
   recorded and restored EXACTLY on exit.
 - --dry-run performs NO writes at all (no enable, no duty); it still runs
@@ -243,11 +242,8 @@ class Daemon:
             tgt = curve.apply_bounds(curve.eval_curve(crv.get("points", []), t),
                                      floor, maxd)
             for fan in a.get("fans", []):
-                if fan in set(cfg.protected):
-                    self._fan_state[fan] = "protected"
-                    continue
                 if fan not in self._taken_over:
-                    self._takeover(cfg, fan)
+                    self._takeover(fan)
                     if fan not in self._taken_over:
                         continue
                 new = curve.rate_limit(self._duty.get(fan), tgt, max_rate)
@@ -273,15 +269,10 @@ class Daemon:
                               src_id)
                 continue
             for fan in a.get("fans", []):
-                self._takeover(cfg, fan)
+                self._takeover(fan)
 
-    def _takeover(self, cfg, fan: str):
+    def _takeover(self, fan: str):
         if fan in self._taken_over:
-            return
-        if fan in set(cfg.protected):
-            self.log.error("refusing protected channel %s (owned by "
-                           "gpu-fanctl)", fan)
-            self._fan_state[fan] = "protected"
             return
         res = hwmon.resolve_fan(fan, self._chips, self.root)
         if res is None:
@@ -471,15 +462,13 @@ class Daemon:
         fan_ids: set[str] = set()
         for a in cfg.assignments.values():
             fan_ids.update(a.get("fans", []))
-        fan_ids.update(cfg.protected)
         for fan in sorted(fan_ids):
             entry = {
                 "label": self._fan_label(fan),
                 "duty_pct": self._duty.get(fan),
                 "rpm": None,
                 "orig_enable": self._orig_enable.get(fan),
-                "state": self._fan_state.get(
-                    fan, "protected" if fan in set(cfg.protected) else "idle"),
+                "state": self._fan_state.get(fan, "idle"),
             }
             res = hwmon.resolve_fan(fan, self._chips, self.root)
             if res is not None:
@@ -504,8 +493,6 @@ class Daemon:
 
     def _log_resolved(self, cfg):
         self.log.info("config: %s", self.cfg_path)
-        self.log.info("protected channels (never touched): %s",
-                      ", ".join(cfg.protected) or "(none!)")
         temps = self._read_all_sources(cfg)
         self.log.info("sources (discovered at runtime — not in the config):")
         for s in self._sources:

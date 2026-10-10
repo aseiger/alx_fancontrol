@@ -108,17 +108,10 @@ class FanControlApp(App):
         background: $primary;
         color: $text;
     }
-    #sidebar #prot-hint {
-        color: $text-muted;
-        margin-top: 2;
-    }
     #sidebar #root-warn {
         color: $error;
         text-style: bold;
         margin-bottom: 1;
-    }
-    #sidebar #prot-hint .prot {
-        color: $text-disabled;
     }
     #content {
         height: 100%;

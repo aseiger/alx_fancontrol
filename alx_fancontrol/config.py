@@ -34,7 +34,6 @@ PCI_BUS_RE = re.compile(r"^\d{2}:\d{2}\.\d$")
 @dataclass
 class Config:
     config: dict
-    protected: list
     curves: dict
     assignments: dict
 
@@ -46,9 +45,6 @@ DEFAULTS = {
         "floor_duty": 5,        # global default per-assignment floor
         "dead_temp_c": -10,     # readings below this count as "no reading"
     },
-    # Owned by the running gpu-fanctl service — never take over, never write.
-    # Kept in DEFAULTS so even a hand-written minimal config stays safe.
-    "protected": ["it8792:pwm1", "it8792:pwm3"],
     "curves": {
         "default":  {"label": "Default",
                      "points": [[40, 20], [55, 30], [65, 70], [75, 100]]},
@@ -95,7 +91,6 @@ def to_dict(cfg: Config) -> dict:
     return {
         "version": CONFIG_VERSION,
         "config": cfg.config,
-        "protected": cfg.protected,
         "curves": cfg.curves,
         "assignments": cfg.assignments,
     }
@@ -131,11 +126,13 @@ def _migrate_v1(doc: dict) -> dict:
         for a in assignments.values():
             if isinstance(a, dict) and a.get("source") in remap:
                 a["source"] = remap[a["source"]]
-    # carry over ONLY the keys the v1 doc actually had — writing explicit
+    # carry over ONLY the keys the v2 model actually has — writing explicit
     # empties would clobber the DEFAULTS merge (e.g. a minimal
-    # {"version": 1} must still get the protected defaults)
+    # {"version": 1} must still get the defaults). The legacy v1
+    # "protected" key is dropped: channels owned by another process are
+    # refused at takeover via the manual-mode (enable=1) check instead.
     out = {"version": CONFIG_VERSION}
-    for k in ("config", "protected", "curves", "assignments"):
+    for k in ("config", "curves", "assignments"):
         if k in doc:
             out[k] = doc[k]
     return out
@@ -155,7 +152,6 @@ def load(path) -> Config:
     merged = _deep_merge(DEFAULTS, doc)
     return Config(
         config=merged.get("config", {}),
-        protected=list(merged.get("protected", [])),
         curves=merged.get("curves", {}),
         assignments=merged.get("assignments", {}),
     )
@@ -183,10 +179,6 @@ def validate(cfg: Config) -> tuple[list[str], list[str]]:
             errors.append(f"config.{key} must be >= {lo}")
         elif hi is not None and v > hi:
             errors.append(f"config.{key} must be <= {hi}")
-
-    for p in cfg.protected:
-        if not isinstance(p, str) or not FAN_ID_RE.match(p):
-            errors.append(f"protected entry {p!r} is not a 'chip:pwmN' id")
 
     # (sources are not in the config anymore — they are discovered at
     # runtime; an assignment whose source is not detected is skipped with
@@ -302,7 +294,6 @@ def seed_if_missing(path) -> Config:
         return load(path)
     cfg = Config(
         config=copy.deepcopy(DEFAULTS["config"]),
-        protected=list(DEFAULTS["protected"]),
         curves=copy.deepcopy(DEFAULTS["curves"]),
         assignments={},
     )

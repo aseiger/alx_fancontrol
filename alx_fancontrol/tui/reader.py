@@ -87,11 +87,11 @@ class LiveReader:
                 entry["gpu_name"] = name
             data["sources"][s.id] = entry
 
-        # Report EVERY pwm channel, not just protected/assigned ones — the
-        # Assign screen needs live RPMs for fans that are not assigned yet,
-        # or the picker's rpm column shows "—" and the user can't tell
-        # which header a physical fan is on.
-        fans: set[str] = set(cfg.protected)
+        # Report EVERY pwm channel, not just assigned ones — the Assign
+        # screen needs live RPMs for fans that are not assigned yet, or
+        # the picker's rpm column shows "—" and the user can't tell which
+        # header a physical fan is on.
+        fans: set[str] = set()
         for a in cfg.assignments.values():
             fans.update(a.get("fans", []))
         for fan, _d, _pwm in hwmon.list_pwm_channels(chips):

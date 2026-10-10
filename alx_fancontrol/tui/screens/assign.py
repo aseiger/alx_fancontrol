@@ -6,10 +6,13 @@ one (with confirmation; the daemon then restores firmware control of
 its fans).
 
 Form: source Select (live °C in the labels), curve Select, fan picker
-as a click-to-toggle DataTable (protected fans are visible but
-reserved), optional floor/max, an assignment name, and Save →
-app.save_config(). Saving with an existing name overwrites it (the
-existing `enabled` state is preserved).
+as a click-to-toggle DataTable, optional floor/max, an assignment name,
+and Save → app.save_config(). Saving with an existing name overwrites it
+(the existing `enabled` state is preserved).
+
+Note: channels already held in manual mode by another process (e.g. the
+gpu-fanctl service) are selectable here, but the daemon refuses to take
+them over at runtime — that check is in the daemon, not the UI.
 """
 from __future__ import annotations
 
@@ -123,8 +126,8 @@ class AssignScreen(BaseScreen):
             with Horizontal():
                 yield Select([], id="source", prompt="source")
                 yield Select([], id="curve", prompt="curve")
-            yield Static("fans — click a row to toggle (✓); protected "
-                         "channels are reserved:", classes="hint")
+            yield Static("fans — click a row to toggle (✓):",
+                         classes="hint")
             yield DataTable(id="fan-pick")
             with Horizontal():
                 yield Input(placeholder="floor % (default 5)",
@@ -149,8 +152,7 @@ class AssignScreen(BaseScreen):
         self._refresh_list()
         table = self.query_one("#fan-pick", DataTable)
         table.add_columns(("✓", "sel"), ("fan", "fid"),
-                          ("label", "flabel"), ("rpm", "frpm"),
-                          ("note", "fnote"))
+                          ("label", "flabel"), ("rpm", "frpm"))
         table.cursor_type = "row"  # row events need this
         self._refresh_fans()
 
@@ -330,7 +332,6 @@ class AssignScreen(BaseScreen):
         prev_key = table_cursor_key(table)
         prev_hover = table_hover_key(table)
         table.clear()
-        prot = set(app.cfg.protected)
         data = app.live
         for fan, _d, _pwm in hwmon.list_pwm_channels(app.chips):
             fd = data.get("fans", {}).get(fan, {})
@@ -340,7 +341,6 @@ class AssignScreen(BaseScreen):
                 fan,
                 app.fan_label(fan),
                 "—" if rpm is None else str(rpm),
-                "reserved (gpu-fanctl)" if fan in prot else "",
                 key=fan,
             )
         restore_table_cursor(table, prev_key, prev_hover)
@@ -363,10 +363,6 @@ class AssignScreen(BaseScreen):
             return
         # fan picker: toggle ✓
         fan = key
-        if fan in set(self.app.cfg.protected):
-            self.notify("reserved (gpu-fanctl) — cannot assign",
-                        severity="warning")
-            return
         if fan in self._picked:
             self._picked.discard(fan)
             table.update_cell(fan, "sel", "")
@@ -421,11 +417,6 @@ class AssignScreen(BaseScreen):
             return
         if not self._picked:
             self.notify("Pick at least one fan", severity="warning")
-            return
-        reserved = self._picked & set(app.cfg.protected)
-        if reserved:
-            self.notify(f"reserved (gpu-fanctl): "
-                        f"{', '.join(sorted(reserved))}", severity="warning")
             return
         floor_txt = self.query_one("#floor", Input).value.strip()
         max_txt = self.query_one("#maxduty", Input).value.strip()

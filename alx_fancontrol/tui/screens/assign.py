@@ -428,6 +428,15 @@ class AssignScreen(BaseScreen):
             self.notify("floor % must be <= ceiling %", severity="warning")
             return
         fans = sorted(self._picked)
+        # a fan may be controlled by several assignments: the daemon
+        # drives it to the HIGHEST requested duty — say so on save
+        shared: list[str] = []
+        for other, oa in app.cfg.assignments.items():
+            if other == name:
+                continue
+            common = sorted(set(fans) & set(oa.get("fans", [])))
+            if common:
+                shared.append(f"'{other}' ({', '.join(common)})")
         # overwriting an existing assignment keeps its enabled state
         existing = app.cfg.assignments.get(name, {})
         assignment: dict = {
@@ -452,5 +461,10 @@ class AssignScreen(BaseScreen):
         app.cfg.assignments[name] = assignment
         if app.save_config(f"Assignment '{name}' saved — daemon picks "
                                  f"it up within ~1 s"):
+            if shared:
+                self.notify(
+                    "Shared fan(s) are driven to the HIGHEST requested "
+                    f"duty (also controlled by: {', '.join(shared)})",
+                    severity="info")
             self._reset_form()
             self._refresh_list()

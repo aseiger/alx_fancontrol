@@ -211,7 +211,7 @@ def validate(cfg: Config) -> tuple[list[str], list[str]]:
                 break
             prev = t
 
-    seen_fans: dict[str, str] = {}
+    seen_fans: dict[str, list[str]] = {}
     for aid, a in cfg.assignments.items():
         if not isinstance(a, dict):
             errors.append(f"assignment {aid}: not an object")
@@ -231,11 +231,8 @@ def validate(cfg: Config) -> tuple[list[str], list[str]]:
             for f in fans:
                 if not isinstance(f, str) or not FAN_ID_RE.match(f):
                     errors.append(f"assignment {aid}: bad fan id {f!r}")
-                elif f in seen_fans:
-                    errors.append(
-                        f"fan {f} is assigned to both '{seen_fans[f]}' and '{aid}'")
                 else:
-                    seen_fans[f] = aid
+                    seen_fans.setdefault(f, []).append(aid)
         fl, mx = a.get("floor_duty"), a.get("max_duty")
         for name, v in (("floor_duty", fl), ("max_duty", mx)):
             if v is not None and (not isinstance(v, (int, float))
@@ -258,6 +255,15 @@ def validate(cfg: Config) -> tuple[list[str], list[str]]:
                     if not isinstance(t, str) or not hwmon.TACH_ID_RE.match(t):
                         errors.append(f"assignment {aid}: bad tach id {t!r} "
                                       f"for fan {f!r}")
+    # a fan shared by several assignments is LEGAL: the daemon drives it
+    # to the highest duty any of them requests (see daemon._poll) — warn
+    # so the user knows the rule when they save such a config
+    for f, owners in sorted(seen_fans.items()):
+        if len(owners) > 1:
+            warnings.append(
+                f"fan {f} is controlled by {len(owners)} assignments "
+                f"({', '.join(owners)}) — driven to the highest requested "
+                f"duty")
     return errors, warnings
 
 

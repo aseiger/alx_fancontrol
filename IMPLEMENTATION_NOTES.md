@@ -298,3 +298,39 @@ now deliberately assignable.
   refusal now via the manual-mode guardrail); `test_click_protected_row_*`
   → clicking a former GPU-blower row selects it; orphan fixture files
   (`tests/fixtures/*.json`, referenced by nothing) deleted.
+
+## 17. Shared fans: highest request wins (2026-11-06)
+
+User decision: a fan controlled by several sources (assignments) must
+always be driven to the **highest** duty any of them requests.
+
+Before, this combination did not exist in a sane form:
+
+- `validate()` made a fan in two assignments a **hard error**
+  (`fan X is assigned to both A and B`) — `check` failed and the daemon
+  refused to start, while the TUI fan picker happily allowed saving such
+  a config (save → daemon reload failure → stale-config error in
+  `status.json`).
+- Had a config gotten through anyway, `_poll` processed assignments in
+  sorted-id order and **each one** rate-limited + wrote the fan:
+  last-writer-wins, the limiter effectively ran twice per poll, and a
+  cold source could drag a shared fan **below** a hot one's request —
+  a thermal hazard, not a policy.
+
+Now:
+
+- config: a fan in several assignments is a **warning**, not an error
+  (lists all owners + the rule), so start/reload proceed.
+- daemon `_poll` is two passes: (1) each enabled assignment computes its
+  request (own curve, clamped by own floor/ceiling); (2) per fan, the
+  **highest** request wins (ties → lowest assignment id) and the rate
+  limiter runs **once** per poll, bounded by the winning assignment's
+  `max_rate`. A missing/dead source simply stops contributing — it no
+  longer "holds" a fan that other assignments still drive (the
+  missing-source log line was reworded accordingly).
+- TUI: saving an assignment that shares a fan with another notifies the
+  rule ("driven to the HIGHEST requested duty", naming the other owner).
+- Tests: `test_shared_fan_across_assignments_is_warning` (config);
+  `test_shared_fan_driven_to_highest_request` (order-independent max,
+  single rate step per poll, winner switching between polls) and
+  `test_shared_fan_dead_source_still_driven_by_live_one` (daemon).

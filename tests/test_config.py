@@ -232,15 +232,20 @@ def test_missing_source_id_is_error():
     assert any("'source'" in e for e in errors)
 
 
-def test_duplicate_fan_across_assignments_is_error():
+def test_shared_fan_across_assignments_is_warning():
+    """A fan in two assignments is LEGAL — the daemon drives it to the
+    highest requested duty (highest-request-wins). Validation warns so
+    the user sees the rule, but does not block start/reload."""
     cfg = _cfg_with(assignments={
         "a": {"source": "k10temp:temp1", "curve": "default",
               "fans": ["it8686:pwm3"]},
         "b": {"source": "k10temp:temp1", "curve": "default",
               "fans": ["it8686:pwm3"]},
     })
-    errors, _ = C.validate(cfg)
-    assert any("it8686:pwm3" in e and "both" in e for e in errors)
+    errors, warnings = C.validate(cfg)
+    assert errors == []
+    assert any("it8686:pwm3" in w and "highest" in w.lower()
+               and "(a, b)" in w for w in warnings)
 
 
 def test_unsorted_curve_points_is_error():

@@ -406,3 +406,57 @@ def test_assignment_floor_overrides_global(tmp_path):
     assert rc == 0
     assert (root / "hwmon0" / "pwm3").read_text().strip() \
         == str(round(0.45 * 255))  # 115
+
+
+# ------------------------------------------------------------ shared fan --
+
+def test_shared_fan_driven_to_highest_request(tmp_path):
+    """Two assignments on ONE fan: the fan follows the HIGHEST request,
+    independent of assignment-id order, and the rate limiter runs ONCE
+    per poll at the winning assignment's rate.
+    Poll 1: gpu 68 C -> 83% (gpu_v100) beats cpu 40 C -> 20% (default):
+    first poll jumps to 83% (raw 212). Under the old last-writer-wins
+    the sorted-last assignment 'c' (the 20% one) would have won.
+    Poll 2: gpu cools to 50 C -> 26%, cpu heats to 75 C -> 100%: the CPU
+    assignment now wins; one 6 %/poll step: 83 -> 89 (raw 227)."""
+    root = make_tree(tmp_path)
+    cfg_path = make_config(tmp_path, {
+        "g": {"source": "gpu:08:00.0", "curve": "gpu_v100",
+              "fans": ["it8686:pwm3"], "enabled": True},
+        "c": {"source": "k10temp:temp1", "curve": "default",
+              "fans": ["it8686:pwm3"], "enabled": True},
+    })
+    gpu = {"out": "00000000:08:00.0, 68\n00000000:44:00.0, 69\n"}
+    d = Daemon(cfg_path, dry_run=False, once=True, root=root,
+               gpu_runner=lambda *f: gpu["out"])
+    cfg = d._initial_load()
+    assert cfg is not None
+    d._initial_takeover(cfg)
+    d._poll(cfg)
+    assert (root / "hwmon0" / "pwm3").read_text().strip() == "212"
+    gpu["out"] = "00000000:08:00.0, 50\n00000000:44:00.0, 69\n"
+    (root / "hwmon2" / "temp1_input").write_text("75000\n")
+    d._poll(cfg)
+    assert (root / "hwmon0" / "pwm3").read_text().strip() == "227"
+
+
+def test_shared_fan_dead_source_still_driven_by_live_one(tmp_path, caplog):
+    """Shared fan, one source dead (-55 C, below dead_temp_c): the dead
+    assignment simply stops contributing — the LIVE assignment keeps
+    driving the fan (it does not hold last duty for the whole fan)."""
+    caplog.set_level(logging.INFO)
+    root = make_tree(tmp_path)
+    (root / "hwmon2" / "temp1_input").write_text("-55000\n")
+    cfg_path = make_config(tmp_path, {
+        "c": {"source": "k10temp:temp1", "curve": "default",
+              "fans": ["it8686:pwm3"], "enabled": True},
+        "g": {"source": "gpu:08:00.0", "curve": "gpu_v100",
+              "fans": ["it8686:pwm3"], "enabled": True},
+    })
+    rc = run_daemon(cfg_path, root, dry_run=False)
+    assert rc == 0
+    # gpu 68 C -> 83% drives the shared fan alone, raw 212
+    assert (root / "hwmon0" / "pwm3").read_text().strip() == "212"
+    st = json.loads((cfg_path.parent / "status.json").read_text())
+    assert st["fans"]["it8686:pwm3"]["state"] == "ok"
+    assert st["sources"]["k10temp:temp1"]["stale"] is True

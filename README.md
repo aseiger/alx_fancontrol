@@ -208,7 +208,7 @@ automatically on load — the TUI re-saves them as v2 on first open.
 | `sources.*.chip` / `.temp` / `.chip_index` | hwmon source: chip **name prefix** (never `hwmonN` — indices reshuffle across reboots), temp index, and which instance of a duplicated prefix (two `k10temp` packages on this box → `chip_index` 0/1) |
 | `sources.*.pci_bus` | nvidia source: normalized PCI bus, e.g. `08:00.0` |
 | `curves.*.points` | `[temp_c, duty_pct]` pairs, ≥1, temps strictly increasing, duty 0–100. Eval clamps flat beyond the ends. |
-| `assignments.*.fans` | list of `chip:pwmN` |
+| `assignments.*.fans` | list of `chip:pwmN` — a fan **may** appear in several assignments; the daemon then drives it to the **highest** requested duty (validation warns) |
 | `assignments.*.tach` | optional `chip:pwmN → chip:fanN` RPM display map (the TUI auto-guesses it from sensors.d labels) |
 | `assignments.*.floor_duty` / `.max_duty` / `.max_rate` | **per-fan** floor / ceiling / max duty change per poll — override the global fallbacks (floor ≤ max enforced) |
 
@@ -243,8 +243,10 @@ Behavior:
   CPU-side assignments keep running (unlike gpu-fanctl, which slept 5 s
   and skipped the whole loop).
 - Source disappears mid-run → that assignment's fans **hold last duty**
-  (warn in log + `status.json`). Source reappears → resume. Source never
-  appeared at startup → fans left to firmware, re-checked each poll
+  (warn in log + `status.json`); a fan **shared** with another live
+  assignment is simply no longer driven by the dead one — the live
+  assignment(s) keep controlling it. Source reappears → resume. Source
+  never appeared at startup → fans left to firmware, re-checked each poll
   (safe against "dead source pins a fan low").
 - Fan write fails → keep last duty, log first + every 10th failure,
   `state=write-error` in status, retry every poll.
@@ -263,6 +265,12 @@ Behavior:
   then the **rate limiter** (assignment `max_rate`, else global
   `config.max_rate`, default 6 %/poll) steps the duty toward the target
   — a fan can't jump 0→100 in one poll.
+- **Shared fans** (a fan listed in several assignments): each assignment
+  requests a duty (clamped by its **own** floor/ceiling) and the fan is
+  driven to the **highest** request — a cold source can never drag it
+  below a hot one's demand. The rate limiter runs **once** per poll,
+  bounded by the winning assignment's `max_rate`; ties go to the lowest
+  assignment id.
 
 ### status.json
 

@@ -7,6 +7,13 @@ every poll (atomic replace on the writer side guarantees no torn reads).
 Firmware control is restored exactly in `finally` on clean exit
 (SIGTERM/SIGINT set the stop flag).
 
+Shared fans (a fan listed in several assignments) are driven to the
+HIGHEST duty any of them requests — each assignment's request is clamped
+by its OWN floor/ceiling first; ties go to the lowest assignment id and
+the rate limiter runs ONCE per poll, bounded by the winning assignment's
+max_rate. A cold source can never drag a shared fan below a hot one's
+request; a missing source simply stops contributing.
+
 Safety guardrails (enforced in code, see also scripts/protect.py):
 - A channel with pwmN_enable=1 (already manual — owned by another
   process, e.g. the gpu-fanctl service) is refused at takeover; =0 is
@@ -204,6 +211,13 @@ class Daemon:
     def _poll(self, cfg):
         self._temps = self._read_all_sources(cfg)
         dead = cfg.config.get("dead_temp_c", -10)
+        # Pass 1: every enabled assignment computes the duty its source
+        # requests (its own curve, clamped by its own floor/ceiling).
+        # A fan may be requested by SEVERAL assignments — pass 2 drives
+        # it to the highest request, so a cold source never drags a
+        # shared fan below a hot one.
+        requests: dict[str, list[tuple[str, float, float, str, float]]] = {}
+        # fan -> [(assignment id, target %, max rate, source id, temp C)]
         for aid, a in sorted(cfg.assignments.items()):
             if not a.get("enabled", True):
                 continue
@@ -219,12 +233,12 @@ class Daemon:
                     n = self._missing_count.get(aid, 0) + 1
                     self._missing_count[aid] = n
                     if n == 1 or n % 30 == 0:
-                        self.log.warning("assignment %s: source %s missing — "
-                                         "holding last duty on %s", aid, src_id,
-                                         ", ".join(taken))
+                        self.log.warning(
+                            "assignment %s: source %s missing — not "
+                            "driving %s (duty held if no other assignment "
+                            "controls it)", aid, src_id, ", ".join(taken))
                 for f in a.get("fans", []):
-                    if f in self._taken_over:
-                        self._fan_state[f] = "source-missing"
+                    self._fan_state[f] = "source-missing"
                 # not taken over: fans stay with the firmware, re-checked
                 # every poll (safe against "dead source pins a fan low")
                 continue
@@ -241,16 +255,25 @@ class Daemon:
             max_rate = a.get("max_rate", cfg.config.get("max_rate", 6))
             tgt = curve.apply_bounds(curve.eval_curve(crv.get("points", []), t),
                                      floor, maxd)
-            for fan in a.get("fans", []):
+            for f in a.get("fans", []):
+                requests.setdefault(f, []).append(
+                    (aid, tgt, max_rate, src_id, t))
+        # Pass 2: one rate-limited step per fan, toward the highest
+        # request. Ties go to the lowest assignment id (deterministic);
+        # the winning assignment's max_rate bounds the step — the limiter
+        # runs ONCE per poll, even for a fan with several assignments.
+        for fan, reqs in sorted(requests.items()):
+            reqs.sort(key=lambda r: (-r[1], r[0]))
+            _aid, tgt, max_rate, src_id, t = reqs[0]
+            if fan not in self._taken_over:
+                self._takeover(fan)
                 if fan not in self._taken_over:
-                    self._takeover(fan)
-                    if fan not in self._taken_over:
-                        continue
-                new = curve.rate_limit(self._duty.get(fan), tgt, max_rate)
-                if new != self._duty.get(fan):
-                    self._write_fan(cfg, fan, new, t, src_id)
-                if self._fan_state.get(fan) != "write-error":
-                    self._fan_state[fan] = "ok"
+                    continue
+            new = curve.rate_limit(self._duty.get(fan), tgt, max_rate)
+            if new != self._duty.get(fan):
+                self._write_fan(cfg, fan, new, t, src_id)
+            if self._fan_state.get(fan) != "write-error":
+                self._fan_state[fan] = "ok"
 
     # -------------------------------------------------------- takeover --
 

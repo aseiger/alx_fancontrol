@@ -2,17 +2,26 @@
 # OPTIONAL real-write smoke test — it8686 pwm3 (SYS_FAN2) only.
 #
 # This is the ONE channel the plan marks safe for real writes: a spinning
-# chassis fan (~3200 RPM, tach fan3_input), NOT a GPU blower, NOT a
-# gpu-fanctl-owned channel. It is self-restoring: the daemon takes the
-# channel over (enable 2->1), drives it for --duration seconds, and the
-# clean-exit finally() returns it to firmware (enable -> 2).
+# chassis fan (~3200 RPM, tach fan3_input), NOT a GPU blower. It is
+# self-restoring: the daemon takes the channel over (enable 2->1), drives it
+# for --duration seconds, and the clean-exit finally() returns it to firmware
+# (enable -> 2).
 #
-# Pre-checks:
-#   - k10temp Tctl < 85 C (abort otherwise — CPU must stay cool)
-#   - protect.py snapshot (it8792 pwm1/pwm3 duty+enable, gpu-fanctl state)
-# Post-checks:
-#   - it8686 pwm3_enable back to 2, duty moved away from its pre-run value
-#   - protect.py check -> GUARDRAIL-OK (it8792 untouched, service active)
+# gpu-fanctl used to be part of the safety story here ("not a channel another
+# controller owns"). It has been removed — scripts/remove_gpu_fanctl.sh — so
+# alx_fancontrol is the only writer on this machine, and the guardrail is now
+# "did the experiment put everything back". That means the LIVE service must
+# be stopped first, or two daemons fight over the same headers:
+#
+#   sudo systemctl stop alx_fancontrol
+#   bash scripts/real_write_smoke.sh
+#   sudo systemctl start alx_fancontrol
+#
+# Pre-checks: k10temp Tctl < 85 C (abort otherwise — CPU must stay cool);
+#             live alx_fancontrol inactive; it8686 pwm3 in firmware mode.
+# Post-checks: it8686 pwm3_enable back to 2 and duty moved away from its
+#              pre-run value; EVERY other channel identical to the pre-run
+#              snapshot (nothing else was touched).
 #
 # Run it ONLY when you explicitly want to spin a fan for ~20 s:
 #   bash scripts/real_write_smoke.sh
@@ -38,6 +47,14 @@ IT8686="$(ls -d /sys/class/hwmon/hwmon* | while read -r p; do
   case "$(cat "$p/name" 2>/dev/null)" in it8686*) echo "$p"; break;; esac
 done | head -1)"
 [ -n "$IT8686" ] || { echo "ABORT: it8686 hwmon not found" >&2; exit 1; }
+LIVE="$(systemctl is-active alx_fancontrol 2>/dev/null || true)"
+if [ "$LIVE" = "active" ]; then
+  echo "ABORT: alx_fancontrol.service is active and owns these headers." >&2
+  echo "       Run 'sudo systemctl stop alx_fancontrol' first (and start it" >&2
+  echo "       again afterwards): two daemons writing the same pwmN is not a" >&2
+  echo "       test." >&2
+  exit 1
+fi
 PRE_DUTY="$(cat "$IT8686/pwm3")"
 PRE_EN="$(cat "$IT8686/pwm3_enable")"
 PRE_RPM="$(cat "$IT8686/fan3_input" 2>/dev/null || echo 0)"
@@ -87,12 +104,34 @@ fi
 if [ "$POST_DUTY" = "$PRE_DUTY" ] && ! grep -q "write it8686:pwm3" "$WORKDIR/daemon.log"; then
   echo "FAIL: duty never moved and no write was logged" >&2; FAIL=1
 fi
-python3 scripts/protect.py check "$WORKDIR/protect.snap" || FAIL=1
-SVC="$(systemctl is-active gpu-fanctl)"
-echo "  gpu-fanctl: ${SVC}"
-[ "$SVC" = "active" ] || FAIL=1
+# Every OTHER channel must be exactly as it was: the experiment is only
+# allowed to touch it8686:pwm3. (protect.py `check` asserts the daemon OWNS
+# its channels, which is false by design while the service is stopped for
+# this test, so compare the two snapshots directly instead.)
+python3 scripts/protect.py snapshot "$WORKDIR/after.snap"
+if python3 - "$WORKDIR/protect.snap" "$WORKDIR/after.snap" <<'PY'
+import json, sys
+before = json.load(open(sys.argv[1]))["state"]["guarded"]
+after = json.load(open(sys.argv[2]))["state"]["guarded"]
+bad = []
+for fan in sorted(set(before) | set(after)):
+    if fan == "it8686:pwm3":
+        continue
+    if before.get(fan) != after.get(fan):
+        bad.append((fan, before.get(fan), after.get(fan)))
+for fan, b, a in bad:
+    print(f"FAIL: {fan} changed: {b} -> {a}", file=sys.stderr)
+sys.exit(1 if bad else 0)
+PY
+then
+  echo "  untouched-channel check: OK (only it8686:pwm3 moved)"
+else
+  echo "FAIL: channels other than it8686:pwm3 were disturbed" >&2; FAIL=1
+fi
+echo
 if [ "$FAIL" -ne 0 ]; then
   echo "REAL-WRITE SMOKE: FAIL" >&2
   exit 1
 fi
-echo "REAL-WRITE SMOKE: OK (fan experiment self-restored, guardrails intact)"
+echo "REAL-WRITE SMOKE: OK (fan experiment self-restored, nothing else touched)"
+echo "remember: sudo systemctl start alx_fancontrol"

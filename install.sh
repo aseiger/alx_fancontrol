@@ -150,12 +150,13 @@ if [ "$DRY" -eq 0 ]; then
     sleep 2
     say "verification"
     echo "service:      $(systemctl is-active $SVC)"
-    echo "gpu-fanctl:   $(systemctl is-active gpu-fanctl 2>/dev/null || echo MISSING)"
-    # Who owns the GPU-blower headers? If THIS daemon's config assigns them,
-    # it must be the one holding them (manual, enable=1) — a dead alx_fancontrol
-    # used to mean those channels were refused by the next instance and pinned
-    # at their last duty. Otherwise gpu-fanctl owns them and the daemon must
-    # refuse them.
+    # The GPU-blower headers must be held by THIS daemon (manual, enable=1).
+    # gpu-fanctl, the controller that used to own them, has been removed
+    # (scripts/remove_gpu_fanctl.sh), so an assigned channel outside manual
+    # mode means nothing is controlling that fan — and a channel nobody
+    # assigns falls back to a BIOS curve that parks headers at 0% here.
+    # A dead alx_fancontrol used to leave its channels refused by the next
+    # instance and pinned at their last duty; the ownership marker fixed that.
     ASSIGNED="$(python3 - "$CONFIG" <<'PY' 2>/dev/null
 import json, sys
 try:
@@ -174,15 +175,14 @@ PY
     if [ -n "$IT8792" ]; then
         e1="$(cat "$IT8792/pwm1_enable" 2>/dev/null || echo '?')"
         e3="$(cat "$IT8792/pwm3_enable" 2>/dev/null || echo '?')"
+        # alx_fancontrol is the only fan controller on this machine now
+        # (gpu-fanctl was removed — scripts/remove_gpu_fanctl.sh), so any
+        # assigned channel left out of manual mode means nothing owns that fan.
+        echo "it8792 pwm1/3 enable: $e1/$e3 (GPU blowers — expect 1/1, held by the daemon)"
         case " $ASSIGNED " in
             *" it8792:pwm1 "*|*" it8792:pwm3 "*)
-                echo "it8792 pwm1/3 enable: $e1/$e3 (assigned to $SVC — expect 1/1, held by the daemon)"
                 [ "$e1" = "1" ] && [ "$e3" = "1" ] \
-                    || echo "WARNING: assigned GPU-blower channels are not in manual mode — the daemon does not own them; check 'journalctl -u $SVC' (manual-conflict means another process holds them)"
-                ;;
-            *)
-                echo "it8792 pwm1/3 enable: $e1/$e3 (not assigned here — expect 1/1 while gpu-fanctl owns them)"
-                [ "$e1" = "1" ] && [ "$e3" = "1" ] || echo "WARNING: it8792 pwm1/3 not in manual mode — gpu-fanctl no longer owns them; the daemon could take them over if assigned!"
+                    || echo "WARNING: assigned GPU-blower channels are not in manual mode — the daemon does not own them; check 'journalctl -u $SVC' (manual-conflict means a foreign process holds them)"
                 ;;
         esac
     fi
@@ -207,11 +207,14 @@ for p in ("/run/alx_fancontrol/status.json",
                   f"duty={f.get('duty_pct')}% rpm={f.get('rpm')}")
     break
 PY
-    if [ "$(systemctl is-active gpu-fanctl 2>/dev/null)" != "active" ] \
-            && ! case " $ASSIGNED " in *" it8792:pwm1 "*|*" it8792:pwm3 "*) true;; *) false;; esac; then
-        echo "WARNING: gpu-fanctl is not running and $SVC does not assign the"
-        echo "         V100 blowers (it8792 pwm1/pwm3) — they fall back to the BIOS curve."
-    fi
+    case " $ASSIGNED " in
+        *" it8792:pwm1 "*|*" it8792:pwm3 "*) ;;
+        *)
+            echo "WARNING: $SVC does not assign the GPU blowers (it8792 pwm1/pwm3)"
+            echo "         — they are left to the BIOS curve. Assign them in the TUI"
+            echo "         or keep a controller that does."
+            ;;
+    esac
     echo
     echo "--- daemon log (last 12 lines) ---"
     journalctl -u "$SVC" -n 12 --no-pager

@@ -31,7 +31,7 @@ def apply_bounds(val: float, floor_duty: float, max_duty: float) -> float:
 def rate_limit(cur, tgt: float, max_rate: float) -> int:
     """Step `cur` toward `tgt` by at most `max_rate` (percent per poll).
 
-    `cur` None → jump straight to tgt (first poll, like gpu-fanctl).
+    `cur` None → jump straight to tgt (no previous duty to ramp from).
     Returns an int percentage.
     """
     tgt = float(tgt)

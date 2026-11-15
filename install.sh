@@ -151,10 +151,9 @@ if [ "$DRY" -eq 0 ]; then
     say "verification"
     echo "service:      $(systemctl is-active $SVC)"
     # The GPU-blower headers must be held by THIS daemon (manual, enable=1).
-    # gpu-fanctl, the controller that used to own them, has been removed
-    # (scripts/remove_gpu_fanctl.sh), so an assigned channel outside manual
-    # mode means nothing is controlling that fan — and a channel nobody
-    # assigns falls back to a BIOS curve that parks headers at 0% here.
+    # A second controller used to own them and is gone, so an assigned channel
+    # outside manual mode means nothing is controlling that fan — and a channel
+    # nobody assigns falls back to a BIOS curve that parks headers at 0% here.
     # A dead alx_fancontrol used to leave its channels refused by the next
     # instance and pinned at their last duty; the ownership marker fixed that.
     ASSIGNED="$(python3 - "$CONFIG" <<'PY' 2>/dev/null
@@ -175,8 +174,7 @@ PY
     if [ -n "$IT8792" ]; then
         e1="$(cat "$IT8792/pwm1_enable" 2>/dev/null || echo '?')"
         e3="$(cat "$IT8792/pwm3_enable" 2>/dev/null || echo '?')"
-        # alx_fancontrol is the only fan controller on this machine now
-        # (gpu-fanctl was removed — scripts/remove_gpu_fanctl.sh), so any
+        # alx_fancontrol is the only fan controller on this machine, so any
         # assigned channel left out of manual mode means nothing owns that fan.
         echo "it8792 pwm1/3 enable: $e1/$e3 (GPU blowers — expect 1/1, held by the daemon)"
         case " $ASSIGNED " in

@@ -7,11 +7,9 @@
 # for --duration seconds, and the clean-exit finally() returns it to firmware
 # (enable -> 2).
 #
-# gpu-fanctl used to be part of the safety story here ("not a channel another
-# controller owns"). It has been removed — scripts/remove_gpu_fanctl.sh — so
-# alx_fancontrol is the only writer on this machine, and the guardrail is now
-# "did the experiment put everything back". That means the LIVE service must
-# be stopped first, or two daemons fight over the same headers:
+# There is only one writer on this machine — alx_fancontrol — so the guardrail
+# here is "did the experiment put everything back". That means the LIVE service
+# must be stopped first, or two daemons fight over the same headers:
 #
 #   sudo systemctl stop alx_fancontrol
 #   bash scripts/real_write_smoke.sh

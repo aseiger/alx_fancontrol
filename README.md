@@ -115,8 +115,7 @@ click fans, Save. `3` → Curves → shape the curve (drag points, `a`/`d`,
 `+`/`-`, shift+arrows), Save. `4` → Sources → the runtime-detected
 source list. `1` → Overview → watch duties/RPMs move. (The GPU blower
 headers on `it8792` are assigned here like any other fan — this daemon is
-the only fan controller on the machine, `gpu-fanctl` having been removed
-with `scripts/remove_gpu_fanctl.sh`.)
+the only fan controller on the machine.)
 
 Then run the daemon for real (it takes over only the fans you assigned,
 restores firmware control on exit) — or better, install it as a service:
@@ -474,20 +473,11 @@ touched.
 
 ## Safety notes
 
-**alx_fancontrol is the only fan controller on this machine.** The
-`gpu-fanctl.service` that used to drive it8792 pwm1/pwm3 (the V100 GPU
-blower headers) has been removed by `scripts/remove_gpu_fanctl.sh`, which
-
-- refuses to run unless this daemon demonstrably cools those two channels
-  first — assigned and enabled in `/etc/alx_fancontrol/config.json`,
-  actually held (`pwmN_enable=1`, tach spinning), service active — and
-- archives everything it deletes (unit, script, `fan-calibration.json`
-  with its duty→RPM→temperature sweep, the original source tree) to
-  `/var/backups/gpu-fanctl-<timestamp>.tar.gz`.
-
-Two controllers on one header is exactly how a fan gets stranded: whoever
-writes last wins, and neither can see the other. The three guardrails that
-keep a single controller honest:
+**alx_fancontrol is the only fan controller on this machine.** It holds
+every header its config assigns — including the GPU blowers on `it8792`
+— and nothing else writes them. Two controllers on one header is exactly
+how a fan gets stranded: whoever writes last wins, and neither can see
+the other. The three guardrails that keep a single controller honest:
 
 1. Any channel with `pwmN_enable=1` at takeover is refused (something else
    is in manual mode — a second daemon, `fancontrol`, or a tool that exited
@@ -522,8 +512,8 @@ keep a single controller honest:
 **Design note:** an earlier revision had a `protected` config list
 (built-in default `["it8792:pwm1", "it8792:pwm3"]`) that refused those
 channels even in firmware mode. It existed only to keep a dev-mode daemon
-from stomping on the gpu-fanctl that ran here, and went away with it —
-guardrail 1 covers foreign owners generically. Old configs with a
+from stomping on a second controller that ran here, and went away with it
+— guardrail 1 covers foreign owners generically. Old configs with a
 `protected` key still load; the key is ignored and dropped on the next
 save.
 
@@ -627,7 +617,6 @@ alx_fancontrol/
 │   ├── bootstrap_venv.sh        # venv without apt + get-pip + editable install
 │   ├── protect.py               # ownership guardrail snapshot/check (read-only)
 │   ├── real_write_smoke.sh      # OPTIONAL it8686-pwm3 real-write test (opt-in)
-│   ├── remove_gpu_fanctl.sh     # archive + remove the superseded gpu-fanctl controller
 │   └── verify_install.sh        # full install-path check in a throwaway venv (no sudo)
 ├── tests/                       # 165 tests, hermetic via the FakeMachine (see below)
 └── .venv/                       # dev venv, created by bootstrap (gitignored)

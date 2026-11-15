@@ -523,3 +523,14 @@ Observed while verifying (not part of this change): `it8686:pwm3`/`pwm4` report
 `fanN_input=0` while commanded to 7 % — below tach resolution for those
 chassis fans, and a reminder that `stall_min_duty` (default 20) must stay well
 above the idle floor or the stall detector would cry wolf on every cold boot.
+
+*(Addendum, same day: the removal ran clean — unit unknown to systemd, all
+seven targets gone, 41 KB archive at
+`/var/backups/gpu-fanctl-20261115-111102.tar.gz`, both GPU channels still
+`enable=1` with tach RPM afterwards. `scripts/remove_gpu_fanctl.sh` was then
+deleted: a one-shot migration tool that outlives its subject is just another
+stale reference, and the tarball is the undo. Code, README, install.sh and the
+ops scripts are now clean of the name; sections 1–18 above keep their mentions
+because they are dated records of what was true then, and this one records what
+is true now: single controller, and `protect.py` asserting that we hold what we
+assign.)*

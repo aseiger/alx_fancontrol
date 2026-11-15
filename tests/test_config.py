@@ -297,6 +297,53 @@ def test_bad_global_settings_are_errors():
     assert len(errors) == 4
 
 
+def test_bad_safety_settings_are_errors():
+    """The fail-safe / liveness knobs are validated like the rest: a typo
+    there must not silently disable the safety net."""
+    cfg = _cfg_with(config={"failsafe_duty": 120, "failsafe_after": -1,
+                            "failsafe_max_rate": "fast",
+                            "smi_timeout_s": -1, "watchdog_seconds": -5,
+                            "stall_min_duty": 200, "stall_after": 0})
+    errors, _ = C.validate(cfg)
+    for key in ("failsafe_duty", "failsafe_after", "failsafe_max_rate",
+                "smi_timeout_s", "watchdog_seconds", "stall_min_duty",
+                "stall_after"):
+        assert any(f"config.{key}" in e for e in errors), key
+    assert len(errors) == 7
+
+
+def test_safety_defaults_are_fail_safe():
+    """Out of the box an unreadable source means 100 % duty, not hold."""
+    from alx_fancontrol.config import DEFAULTS
+    assert DEFAULTS["config"]["failsafe_duty"] == 100
+    assert DEFAULTS["config"]["failsafe_after"] == 5
+    assert DEFAULTS["config"]["gpu_temp_min_valid_c"] == 15
+    assert DEFAULTS["config"]["smi_timeout_s"] > 0
+    assert DEFAULTS["config"]["watchdog_seconds"] > 0
+
+
+def test_per_assignment_safety_overrides_validated():
+    cfg = _cfg_with(assignments={
+        "a": {"source": "k10temp:temp1", "curve": "default",
+              "fans": ["it8686:pwm3"], "failsafe_duty": 300,
+              "failsafe_after": -2, "failsafe": "yes",
+              "force_takeover": 1}})
+    errors, _ = C.validate(cfg)
+    assert any("failsafe_duty" in e for e in errors)
+    assert any("failsafe_after" in e for e in errors)
+    assert any("'failsafe' must be true/false" in e for e in errors)
+    assert any("force_takeover" in e for e in errors)
+
+
+def test_failsafe_disabled_is_a_warning_not_an_error():
+    cfg = _cfg_with(assignments={
+        "a": {"source": "k10temp:temp1", "curve": "default",
+              "fans": ["it8686:pwm3"], "failsafe": False}})
+    errors, warnings = C.validate(cfg)
+    assert errors == []
+    assert any("fail-safe disabled" in w for w in warnings)
+
+
 # ------------------------------------------- per-fan floor/ceiling/rate ----
 
 def test_default_floor_is_5(tmp_path):

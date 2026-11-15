@@ -334,3 +334,116 @@ Now:
   `test_shared_fan_driven_to_highest_request` (order-independent max,
   single rate step per poll, winner switching between polls) and
   `test_shared_fan_dead_source_still_driven_by_live_one` (daemon).
+
+## 18. The "GPU fan stuck at 0 %" safety net (2026-11-15)
+
+Reported symptom: a fan controlled against a GPU temperature fails and gets
+stuck at ~0 %, and the card overheats — on every card, not one in
+particular. `alx_fancontrol.service` read `active (running)` throughout.
+
+### What the logs showed
+
+```
+08:57:44 write it8792:pwm1 =  88%  [GPU 43:00.0 = 69.0 C]
+08:58:29 write it8792:pwm1 = 100%  [GPU 43:00.0 = 72.0 C]
+09:09:31 WARNING assignment GPU 43:00.0: source gpu:43:00.0 missing — holding last duty
+   ... every ~31 s (the n%30 rate limit) until shutdown at 09:52:02
+```
+
+GPU 43:00.0 disappeared from `nvidia-smi` output for **43 consecutive
+minutes** while the other two cards kept reporting; only a reboot cleared it.
+So the trigger is a per-GPU dropout, not an nvidia-smi outage — and the
+daemon's answer to that was "hold whatever duty we last wrote".
+
+Two facts about this board make holding (or falling back) fatal:
+
+- firmware control is **not** a safe fallback: an unowned header demonstrably
+  sits at `pwm=0` (live `it8686 pwm2 = 0, enable=2`), so "leave it to the
+  BIOS" means "stop the fan";
+- the only cooling path for those cards is a motherboard header — there is no
+  card-side fan (`nvidia-smi` reports `Fan N/A`) and no GPU hwmon chip.
+
+### The five ways a fan ended up stuck (all reproduced, all fixed)
+
+1. **Takeover only from `enable=2`.** A channel found at `1` was refused
+   forever as "owned by another process". After any unclean exit (SIGKILL,
+   OOM, power blip, `systemctl kill`) the channel stays manual with its last
+   raw duty and the daemon never touches it again — including a value of 0.
+   → Ownership marker `/var/lib/alx_fancontrol/owned.json` (`StateDirectory=`,
+   written on takeover/release with boot id + pid). Same boot + no live
+   sibling daemon ⇒ **reclaim**; otherwise still refused, so gpu-fanctl keeps
+   its channels. Per-assignment `force_takeover` for headers the BIOS parks
+   at `1`/`0`.
+2. **Sources discovered only at startup and on config reload.** A GPU absent
+   from nvidia-smi at that instant was never adopted — its assignment stayed
+   `source-missing` even after the card came back, so its header stayed with
+   the firmware (0 %) for the life of the process. `_initial_takeover` also
+   skipped fans whose source did not read, i.e. it refused to own the very
+   channel that needed rescuing. → Sources are re-discovered **every poll**
+   (`_read_all_sources` discovers first, then reads, so a returning GPU is
+   used in the same poll), and fans are taken over even when their source is
+   absent.
+3. **Fail-safe direction was inverted.** Dead source ⇒ *hold last duty* —
+   idle duty on this box is 26 % (and the global floor is 5 %). → A dead
+   source now *requests* `failsafe_duty` (default 100 %) after
+   `failsafe_after` polls, ramping at `failsafe_max_rate`; because requests
+   are highest-wins (§17), a dead GPU can no longer be dragged down by a live
+   cold source sharing the fan. `"failsafe": false` opts out (warned).
+   A GPU reading below `gpu_temp_min_valid_c` (default 15 °C) counts as dead:
+   a card off the bus reports 0 °C, which must never read as "ice cold".
+4. **`subprocess.run(nvidia-smi)` with no timeout.** When a card falls off the
+   bus, nvidia-smi blocks in D state; the poll loop wedged, every fan froze at
+   its last duty, and systemd still saw a live process. → `hwmon._run_argv`
+   runs with `smi_timeout_s` (default 3), SIGKILLs the child's group and does
+   **not** wait for it (waiting would block exactly the same way) — the corpse
+   is reaped opportunistically by `reap_children()` on a later poll; a short
+   backoff stops hung children piling up. Plus a self-watchdog thread: no poll
+   within `watchdog_seconds` (default 30) ⇒ log CRITICAL and `os._exit(70)`
+   *without* restoring firmware control (fans keep their duty), systemd
+   restarts, the marker reclaims.
+5. **A config error at startup meant zero fan control.** `_initial_load`
+   exited 2 before any takeover; with `Restart=always` that is a flap loop
+   with every header left to the firmware. → **Degraded mode**: recover the
+   fan ids from the (invalid) assignments, take them over, hold them at
+   `failsafe_duty`, retry the config every second and resume normally when it
+   validates. Only a config so broken that no channel can be attributed still
+   exits hard.
+
+Also: commanded duty is not proof of cooling — tach RPM was read for display
+and never used. Now a controlled fan reading ~0 RPM while commanded
+≥ `stall_min_duty` for `stall_after` polls becomes `state: "stalled"` with a
+log ERROR and an `errors` entry in status.json (page on that).
+
+### Deliberate choices
+
+- **Restore-exact is preserved.** The marker stores the pre-daemon `enable`
+  (not the `1` we wrote), so reclaiming + clean exit still hands back what we
+  found — including `0` for a `force_takeover` channel the BIOS had disabled.
+- **The watchdog does not restore on the way out.** Its whole job is to avoid
+  a frozen fan; returning channels to a firmware that parks them at 0 would be
+  worse than dying with them at their last duty.
+- **systemd `WatchdogSec=` is left commented in the unit.** Enabling it needs
+  `Type=notify`, and if our pings were ever dropped systemd would kill a
+  working cooling daemon. The in-process watchdog does the same job with no
+  such coupling; `READY=1`/`STATUS=`/`WATCHDOG=1` are sent best-effort
+  (`NotifyAccess=main`) so it can be switched on later.
+- **Fail-safe respects `max_duty`** (an explicit acoustic ceiling the user
+  set) and ignores nothing else.
+- TUI assignment save now starts from the existing assignment dict, so
+  hand-written safety keys (`failsafe`, `force_takeover`, …) survive an edit
+  made in the TUI.
+
+### Tests
+
+`tests/test_safety_net.py` (23 tests): absent-at-start GPU is still owned and
+ramps to 100 %; stale reading ramps **up** from idle; returning GPU is
+re-adopted without a restart; 0 °C is not a temperature; dead source outranks
+a live cold one on a shared fan; per-assignment opt-out (+ warning); reclaim
+own-crash / refuse foreign / distrust stale-boot marker / refuse a live
+sibling; marker tracks takeover and release; `force_takeover` claims a disabled
+channel and restores `0`; `_run_argv` timeout returns promptly and parks the
+child; one unanswerable GPU does not black out the others; watchdog exits on a
+stuck loop and stays quiet while it beats; degraded mode holds fail-safe then
+recovers; unrecoverable config still exits 2 without touching channels;
+stalled fan reported / turning fan not reported. Config validation for every
+new knob. Suite: **165 passed** (was 145).

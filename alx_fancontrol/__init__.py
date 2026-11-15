@@ -5,4 +5,4 @@ rate-limited PWM writes with firmware-restore-on-exit). The TUI (textual,
 project venv) is read-only against hwmon and is the primary UX.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

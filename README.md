@@ -159,8 +159,9 @@ canonical ids:
 | GPU | `gpu:08:00.0` (pci bus — stable) |
 
 If an assignment references an id discovery doesn't produce (hardware
-changed), the daemon skips it with a `source-missing` warning and the TUI
-lets you re-pick it. v1 configs (with a `sources` section) are migrated
+changed), the daemon still takes over its fans and puts them on the
+fail-safe (see *Daemon*), re-checking every poll — and the TUI lets you
+re-pick it. v1 configs (with a `sources` section) are migrated
 automatically on load — the TUI re-saves them as v2 on first open.
 
 ```json
@@ -170,7 +171,15 @@ automatically on load — the TUI re-saves them as v2 on first open.
     "poll_seconds": 1.0,
     "max_rate": 6,
     "floor_duty": 5,
-    "dead_temp_c": -10
+    "dead_temp_c": -10,
+    "failsafe_duty": 100,
+    "failsafe_after": 5,
+    "failsafe_max_rate": 25,
+    "gpu_temp_min_valid_c": 15,
+    "smi_timeout_s": 3.0,
+    "watchdog_seconds": 30,
+    "stall_min_duty": 20,
+    "stall_after": 10
   },
   "curves": {
     "default":  { "label": "Default",     "points": [[40, 20], [55, 30], [65, 70], [75, 100]] },
@@ -204,6 +213,13 @@ automatically on load — the TUI re-saves them as v2 on first open.
 | `config.max_rate` | fallback max duty change **per poll**, percent (6 ≈ gpu-fanctl's proven 16/0–255) — overridden per assignment |
 | `config.floor_duty` | fallback per-assignment floor, **default 5%** (quiet idle; stall protection) — overridden per assignment |
 | `config.dead_temp_c` | readings below this count as "no reading" (kills the −55 °C dead thermistors) |
+| `config.failsafe_duty` | **default 100** — duty a fan is driven to when its source goes unreadable. An unreadable temperature may only ever make a fan go FASTER |
+| `config.failsafe_after` | consecutive dead polls before the fail-safe engages (default 5 ≈ 5 s: rides out a one-poll nvidia-smi hiccup) |
+| `config.failsafe_max_rate` | %/poll used when ramping toward the fail-safe duty (default 25 — faster than normal control) |
+| `config.gpu_temp_min_valid_c` | **default 15** — a GPU reading below this is not a temperature (a card that dropped off the bus reports 0 °C), so it counts as "no reading" |
+| `config.smi_timeout_s` | nvidia-smi timeout in seconds (default 3, `0` = no timeout). A hung nvidia-smi is killed and NOT waited on; a short backoff keeps hung children from piling up |
+| `config.watchdog_seconds` | poll-loop watchdog (default 30, `0` = off). If no poll completes in time the daemon exits with status 70 so systemd restarts it — fans keep their last duty and are reclaimed on startup |
+| `config.stall_min_duty` / `config.stall_after` | stalled-fan alarm: tach reads ~0 RPM while we command ≥ this duty for this many polls (default 20 % / 10 polls) → `state: "stalled"` + log ERROR + `status.json` `errors` |
 | `sources.*.kind` | `hwmon` or `nvidia` |
 | `sources.*.chip` / `.temp` / `.chip_index` | hwmon source: chip **name prefix** (never `hwmonN` — indices reshuffle across reboots), temp index, and which instance of a duplicated prefix (two `k10temp` packages on this box → `chip_index` 0/1) |
 | `sources.*.pci_bus` | nvidia source: normalized PCI bus, e.g. `08:00.0` |
@@ -211,6 +227,9 @@ automatically on load — the TUI re-saves them as v2 on first open.
 | `assignments.*.fans` | list of `chip:pwmN` — a fan **may** appear in several assignments; the daemon then drives it to the **highest** requested duty (validation warns) |
 | `assignments.*.tach` | optional `chip:pwmN → chip:fanN` RPM display map (the TUI auto-guesses it from sensors.d labels) |
 | `assignments.*.floor_duty` / `.max_duty` / `.max_rate` | **per-fan** floor / ceiling / max duty change per poll — override the global fallbacks (floor ≤ max enforced) |
+| `assignments.*.failsafe` | `false` opts this assignment out of the fail-safe (it holds last duty instead of ramping). Validation warns — prefer disabling/deleting the assignment |
+| `assignments.*.failsafe_duty` / `.failsafe_after` | per-assignment fail-safe overrides |
+| `assignments.*.force_takeover` | `true` claims the channel even when `pwmN_enable` is 1 (manual, another owner) or 0 (disabled). Opt-in for headers the BIOS parks where they cannot cool anything; the value found there is still what gets restored on exit |
 
 **Writers:** only the TUI and humans (plain JSON by design). The daemon
 never writes the config; it hot-reloads on mtime change every poll
@@ -239,26 +258,61 @@ python3 -m alx_fancontrol.daemon  [same flags]     # system python, no venv need
 Behavior:
 
 - 1 s poll; **one** `nvidia-smi` call per poll serves all GPU sources.
-  A failing call marks GPU sources *stale* and **holds** their duties —
-  CPU-side assignments keep running (unlike gpu-fanctl, which slept 5 s
-  and skipped the whole loop).
-- Source disappears mid-run → that assignment's fans **hold last duty**
-  (warn in log + `status.json`); a fan **shared** with another live
-  assignment is simply no longer driven by the dead one — the live
-  assignment(s) keep controlling it. Source reappears → resume. Source
-  never appeared at startup → fans left to firmware, re-checked each poll
-  (safe against "dead source pins a fan low").
+  The call has a timeout (`smi_timeout_s`): a card that fell off the bus
+  makes nvidia-smi block forever, so it is killed (not waited on) and the
+  loop keeps running. A failing call marks GPU sources *stale* → fail-safe
+  below; CPU-side assignments keep running (unlike gpu-fanctl, which slept
+  5 s and skipped the whole loop).
+- **Fail-safe direction.** A source that is unreadable — GPU gone from
+  nvidia-smi, nvidia-smi hung/offline, dead thermistor, hwmon chip gone —
+  makes the assignment drive its fans to `failsafe_duty` (default **100 %**)
+  after `failsafe_after` consecutive dead polls, ramping at
+  `failsafe_max_rate` %/poll. It never "holds a low duty", and it never
+  hands the header back to a firmware that parks it at 0: an unreadable
+  temperature may only ever make a fan go **faster**. Opt out per
+  assignment with `"failsafe": false` (validation warns).
+- Sources are **re-discovered every poll**, so a GPU that leaves
+  nvidia-smi and comes back is re-adopted automatically — no restart, no
+  config edit — and its fan drops back off the fail-safe as soon as it
+  reads again. Fans are taken over even when their source is absent at
+  startup, because the fail-safe cannot act on a channel we do not own.
+- A GPU reading below `gpu_temp_min_valid_c` (default 15 °C) counts as "no
+  reading", never as "ice cold": a card that dropped off the bus reports 0 °C.
 - Fan write fails → keep last duty, log first + every 10th failure,
   `state=write-error` in status, retry every poll.
-- **Takeover rules** (per channel, every run):
-  - `pwmN_enable=1` (already manual — someone else owns it, e.g.
-    gpu-fanctl on the GPU blowers) → refused (ERROR). Re-checked every
-    poll: a fan becomes eligible the moment the other process releases
-    it;
-  - `pwmN_enable=0` (disabled) → skipped (WARN);
+- **Takeover rules** (per channel, re-checked every poll):
+  - `pwmN_enable=1` left by **our own previous run** (same boot, per the
+    ownership marker) → **reclaimed** (WARN `reclaiming …`) and driven
+    again. This is what stops a SIGKILLed/OOMed daemon from pinning a GPU
+    fan at its last raw duty — possibly 0 — forever;
+  - `pwmN_enable=1` owned by **another process** (e.g. gpu-fanctl) →
+    refused (ERROR, logged first + every 30th poll); eligible the moment
+    it is released;
+  - `pwmN_enable=0` (disabled) → skipped, unless the assignment sets
+    `force_takeover`;
   - `pwmN_enable=2` (firmware) → taken over (`enable→1`), original value
     recorded and **restored exactly** in `finally` (clean SIGTERM/SIGINT
     exit via signal handlers).
+  The set of channels we hold is written to the ownership marker
+  (`/var/lib/alx_fancontrol/owned.json`, unit's `StateDirectory=`) on every
+  takeover/release, together with the boot id and our pid: a marker from a
+  previous boot, or one held by a live sibling daemon, is never claimed.
+- **Nothing may freeze the loop.** If no poll completes within
+  `watchdog_seconds` (default 30) a watchdog thread exits with status 70,
+  systemd restarts the unit (`Restart=always`) and the new instance
+  reclaims its channels. A hung nvidia-smi can therefore no longer leave
+  every fan stuck while the service still reads `active`.
+- **Stalled-fan alarm.** Commanding duty is not cooling: if a controlled
+  fan's tach reads ~0 RPM while we ask for ≥ `stall_min_duty` for
+  `stall_after` polls, it is reported as `state: "stalled"` with a log
+  ERROR and an entry in `status.json` `errors`.
+- **A bad config does not mean no fan control.** If the config fails to
+  load or validate at startup, the daemon used to exit(2) before taking
+  anything over (and `Restart=always` turned that into a flap loop with
+  zero cooling). Now it enters **degraded mode**: take the channels the
+  assignments reference, hold them at `failsafe_duty`, and resume normal
+  control the second the file is valid again. Only a config so broken that
+  no fan channel can be recovered from it still exits hard.
 - Per-fan bounds and slew, in this order: curve temp → duty, then
   **floor** (assignment `floor_duty`, else global `config.floor_duty`,
   default **5%**), then **ceiling** (assignment `max_duty`, else 100),
@@ -278,14 +332,21 @@ Written by the daemon each poll; read by the TUI:
 
 ```json
 { "pid": 1234, "ts": 1719e9, "config_mtime": 1719e8, "dry_run": false,
+  "degraded": false,
   "sources": { "it8686:temp1": {"label": "System 1", "temp_c": 46.0, "stale": false} },
   "fans":    { "it8686:pwm3": {"label": "SYS_FAN2", "duty_pct": 27, "rpm": 3229,
                                 "orig_enable": 2, "state": "ok"} },
   "errors": {} }
 ```
 
-`state`: `ok | manual-conflict | disabled | unresolved |
+`state`: `ok | failsafe | stalled | manual-conflict | disabled | unresolved |
 source-missing | write-error | curve-missing | idle`.
+
+`errors` carries what a monitor should page on: `config` (failed reload),
+`startup_config` (degraded mode), `nvidia_smi` (consecutive
+failures/timeouts) and `stalled:<fan>`. A GPU source reads `stale: true`
+both when it is missing from nvidia-smi and when it reports an
+implausible value such as 0 °C.
 
 ## TUI
 
@@ -386,14 +447,20 @@ ownership if the TUI ran as root.
    plain `sudo alx-fancontrol …` work.
 5. **Installs the unit as a root service** — it must be root because it
    writes `/sys/class/hwmon/*/pwmN` (mode 644, root-writable). The unit's
-   `RuntimeDirectory=`/`LogsDirectory=` create `/run/alx_fancontrol`
-   (status.json) and `/var/log/alx_fancontrol` (daemon.log); as root the
-   daemon finds its config in `/etc` on its own (no path pinning).
+   `RuntimeDirectory=`/`LogsDirectory=`/`StateDirectory=` create
+   `/run/alx_fancontrol` (status.json), `/var/log/alx_fancontrol`
+   (daemon.log) and `/var/lib/alx_fancontrol` (**owned.json** — the
+   ownership marker that lets a restarted daemon reclaim channels its
+   predecessor was killed holding in manual mode); as root the daemon
+   finds its config in `/etc` on its own (no path pinning).
 6. **Verifies**: unit active, `gpu-fanctl` still active, and the
    GPU-blower channels still at `enable=1` (i.e. still owned by
    gpu-fanctl — the daemon only takes over channels in firmware mode).
 
-`Restart=always` covers the hwmon-reshuffle case (see troubleshooting).
+`Restart=always` covers the hwmon-reshuffle case (see troubleshooting)
+and the daemon's own self-watchdog: if no poll completes within
+`watchdog_seconds` the process exits with status 70 and systemd starts a
+fresh instance, which reclaims the channels from the ownership marker.
 
 `uninstall.sh` reverses it: `systemctl disable --now` (SIGTERM → the
 daemon returns every fan it drove to firmware control), removes the unit,
@@ -411,7 +478,13 @@ coexists with it under three independent guardrails:
 1. Any channel with `pwmN_enable=1` at takeover is refused (someone
    else is in manual mode — that's exactly the state gpu-fanctl leaves
    its channels in). It is re-checked every poll, so a channel becomes
-   eligible only while it actually sits in firmware mode.
+   eligible only while it actually sits in firmware mode. **Exception:**
+   a channel listed in *our own* ownership marker from *this boot*
+   (`/var/lib/alx_fancontrol/owned.json`) is reclaimed — that is the
+   leftover of an alx_fancontrol that was killed and could not restore
+   it, and refusing it forever would pin the fan at its last duty. A
+   marker from another boot, or one whose pid is a live alx_fancontrol,
+   is never claimed, so gpu-fanctl keeps its channels.
 2. `--dry-run` writes nothing at all, and the acceptance path for new
    configs is a dry run.
 3. `scripts/protect.py` snapshots/checks it8792 pwm1/pwm3 duty+enable
@@ -452,14 +525,20 @@ Additional rules honored everywhere:
   pre-checks `Tctl < 85 °C`, and self-restores (`enable→2`) on clean
   exit. Run it only when you're happy to spin that fan for ~20 s.
 - On this board `pwmN_enable`: `1` = manual (software), `2` = firmware/
-  BIOS SmartFan, `0` = disabled. The daemon only takes over from `2`
-  and restores exactly the value it found.
+  BIOS SmartFan, `0` = disabled. The daemon takes over from `2`, reclaims
+  channels its own previous run left at `1`, and restores exactly the
+  value recorded before it first took the channel (`force_takeover` per
+  assignment opts into claiming a channel held by someone else, or one the
+  BIOS disabled). Note that firmware control here is **not** a safe
+  fallback: unowned headers demonstrably sit at `pwm=0` (e.g. it8686 pwm2),
+  which is why an unreadable source ramps a fan up instead of handing the
+  channel back.
 - `pwmN` duty is 0–255 in sysfs; the config uses 0–100 %.
 
 ### Definition of done (verified 2026-10-01)
 
 1. `bash scripts/bootstrap_venv.sh` prints `textual 8.2.8`. ✅
-2. `.venv/bin/pytest -q` — 97 passed (73 hermetic unit/daemon/smoke + 24 UX tests) as of 2026-10-01; the suite has since grown to 134 (see [Tests](#tests)). ✅
+2. `.venv/bin/pytest -q` — 97 passed (73 hermetic unit/daemon/smoke + 24 UX tests) as of 2026-10-01; the suite has since grown to 165 (see [Tests](#tests)). ✅
    The UX suite (`tests/test_tui_ux.py`) drives the TUI like a user
    (row clicks, key bindings, modals, saves) and fails any test in which
    the app swallows an exception — see IMPLEMENTATION_NOTES §12 for the
@@ -532,7 +611,7 @@ alx_fancontrol/
 │   ├── protect.py               # gpu-fanctl guardrail snapshot/check (read-only)
 │   ├── real_write_smoke.sh      # OPTIONAL it8686-pwm3 real-write test (opt-in)
 │   └── verify_install.sh        # full install-path check in a throwaway venv (no sudo)
-├── tests/                       # 134 tests, hermetic via the FakeMachine (see below)
+├── tests/                       # 165 tests, hermetic via the FakeMachine (see below)
 └── .venv/                       # dev venv, created by bootstrap (gitignored)
 ```
 
@@ -548,7 +627,7 @@ Installed by `install.sh` (runtime, root-owned):
 
 ## Tests
 
-134 tests, all hermetic. The app's hwmon layer is monkeypatched to a
+165 tests, all hermetic. The app's hwmon layer is monkeypatched to a
 **synthetic machine** — the `machine` fixture (`tests/conftest.py` +
 `tests/fake_machine.py`): a fake /sys tree, fake sensors.d labels and a
 fake GPU, whose values the tests INJECT explicitly:

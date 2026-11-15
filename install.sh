@@ -151,21 +151,66 @@ if [ "$DRY" -eq 0 ]; then
     say "verification"
     echo "service:      $(systemctl is-active $SVC)"
     echo "gpu-fanctl:   $(systemctl is-active gpu-fanctl 2>/dev/null || echo MISSING)"
-    # gpu-fanctl's channels must still be manual (enable=1) — the daemon
-    # refuses takeover of any channel it finds in manual mode, so this is
-    # what keeps the V100 blowers out of alx_fancontrol's hands
+    # Who owns the GPU-blower headers? If THIS daemon's config assigns them,
+    # it must be the one holding them (manual, enable=1) — a dead alx_fancontrol
+    # used to mean those channels were refused by the next instance and pinned
+    # at their last duty. Otherwise gpu-fanctl owns them and the daemon must
+    # refuse them.
+    ASSIGNED="$(python3 - "$CONFIG" <<'PY' 2>/dev/null
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit("")
+fans = {f for a in (doc.get("assignments") or {}).values()
+        if isinstance(a, dict) and a.get("enabled", True)
+        for f in a.get("fans", [])}
+print(" ".join(sorted(fans)))
+PY
+)"
     IT8792="$(for h in /sys/class/hwmon/hwmon*; do
         case "$(cat "$h/name" 2>/dev/null)" in it8792*) echo "$h"; break;; esac
     done)"
     if [ -n "$IT8792" ]; then
         e1="$(cat "$IT8792/pwm1_enable" 2>/dev/null || echo '?')"
         e3="$(cat "$IT8792/pwm3_enable" 2>/dev/null || echo '?')"
-        echo "it8792 pwm1/3 enable: $e1/$e3 (expect 1/1 — gpu-fanctl owns them)"
-        [ "$e1" = "1" ] && [ "$e3" = "1" ] || echo "WARNING: it8792 pwm1/3 not in manual mode — gpu-fanctl no longer owns them; the daemon could take them over if assigned!"
+        case " $ASSIGNED " in
+            *" it8792:pwm1 "*|*" it8792:pwm3 "*)
+                echo "it8792 pwm1/3 enable: $e1/$e3 (assigned to $SVC — expect 1/1, held by the daemon)"
+                [ "$e1" = "1" ] && [ "$e3" = "1" ] \
+                    || echo "WARNING: assigned GPU-blower channels are not in manual mode — the daemon does not own them; check 'journalctl -u $SVC' (manual-conflict means another process holds them)"
+                ;;
+            *)
+                echo "it8792 pwm1/3 enable: $e1/$e3 (not assigned here — expect 1/1 while gpu-fanctl owns them)"
+                [ "$e1" = "1" ] && [ "$e3" = "1" ] || echo "WARNING: it8792 pwm1/3 not in manual mode — gpu-fanctl no longer owns them; the daemon could take them over if assigned!"
+                ;;
+        esac
     fi
-    if [ "$(systemctl is-active gpu-fanctl 2>/dev/null)" != "active" ]; then
-        echo "WARNING: gpu-fanctl is not running — the V100 blowers (it8792"
-        echo "         pwm1/pwm3) fall back to the BIOS curve while it's down."
+    # The ownership marker is what makes a restart reclaim its channels
+    echo "marker:       $(cat /var/lib/alx_fancontrol/owned.json 2>/dev/null || echo '(none yet — written on the first takeover)')"
+    # Anything the daemon considers an error is worth seeing right after install
+    python3 - <<'PY' 2>/dev/null
+import json, os
+for p in ("/run/alx_fancontrol/status.json",
+          os.path.expanduser("~/.config/alx_fancontrol/status.json")):
+    try:
+        st = json.load(open(p))
+    except Exception:
+        continue
+    print(f"status:       pid={st.get('pid')} degraded={st.get('degraded')}")
+    errs = st.get("errors") or {}
+    print("errors:       " + ("; ".join(f"{k}: {v}" for k, v in errs.items())
+                              if errs else "none"))
+    for fan, f in sorted((st.get("fans") or {}).items()):
+        if f.get("state") not in (None, "ok"):
+            print(f"              {fan}: state={f.get('state')} "
+                  f"duty={f.get('duty_pct')}% rpm={f.get('rpm')}")
+    break
+PY
+    if [ "$(systemctl is-active gpu-fanctl 2>/dev/null)" != "active" ] \
+            && ! case " $ASSIGNED " in *" it8792:pwm1 "*|*" it8792:pwm3 "*) true;; *) false;; esac; then
+        echo "WARNING: gpu-fanctl is not running and $SVC does not assign the"
+        echo "         V100 blowers (it8792 pwm1/pwm3) — they fall back to the BIOS curve."
     fi
     echo
     echo "--- daemon log (last 12 lines) ---"

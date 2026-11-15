@@ -14,6 +14,7 @@ DEFAULT_STALE_AFTER = 3.0
 
 
 SYSTEM_STATUS_DIR = Path("/run/alx_fancontrol")
+SYSTEM_STATE_DIR = Path("/var/lib/alx_fancontrol")
 
 
 def status_path_for(cfg_path) -> Path:
@@ -23,6 +24,19 @@ def status_path_for(cfg_path) -> Path:
     if os.geteuid() == 0:
         return SYSTEM_STATUS_DIR / "status.json"
     return Path(cfg_path).parent / "status.json"
+
+
+def owned_path_for(cfg_path) -> Path:
+    """The ownership marker: which pwm channels THIS daemon took over, and
+    the enable value to restore. It must survive a crash and a restart,
+    so it lives in the state dir (persistent), not in /run — that is what
+    lets a restarted daemon reclaim a channel its predecessor was killed
+    while holding in manual mode (instead of refusing it forever).
+    Root: /var/lib/alx_fancontrol/owned.json (unit's StateDirectory=).
+    Non-root (dev): next to the config file."""
+    if os.geteuid() == 0:
+        return SYSTEM_STATE_DIR / "owned.json"
+    return Path(cfg_path).parent / "owned.json"
 
 
 def write_status(path, data: dict) -> None:

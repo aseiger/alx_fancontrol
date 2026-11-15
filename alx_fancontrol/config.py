@@ -44,6 +44,26 @@ DEFAULTS = {
         "max_rate": 6,          # max duty change, percent per poll
         "floor_duty": 5,        # global default per-assignment floor
         "dead_temp_c": -10,     # readings below this count as "no reading"
+        # ---- fail-safe: what a fan does when its source goes unreadable --
+        # An unreadable source must never mean "fan keeps idling": after
+        # `failsafe_after` consecutive dead polls the assignment drives its
+        # fans to `failsafe_duty` (ramping at failsafe_max_rate %/poll).
+        # Set `"failsafe": false` on an assignment to opt out (keeps the
+        # old hold-last-duty behaviour), e.g. for a sensor that is gone for
+        # good — but prefer deleting/disabling such an assignment.
+        "failsafe_duty": 100,
+        "failsafe_after": 5,
+        "failsafe_max_rate": 25,
+        # A GPU reading below this is not a real temperature (a card that
+        # dropped off the bus reports 0), so it counts as "no reading".
+        "gpu_temp_min_valid_c": 15,
+        # ---- liveness: nothing may block the poll loop -----------------
+        "smi_timeout_s": 3.0,   # nvidia-smi call timeout (0 = no timeout)
+        "watchdog_seconds": 30,  # poll-loop watchdog, 0 = off; exits so
+                                 # systemd restarts us (fans keep their duty)
+        # ---- stalled-fan alarm: duty high but tach reads ~0 RPM --------
+        "stall_min_duty": 20,
+        "stall_after": 10,
     },
     "curves": {
         "default":  {"label": "Default",
@@ -171,7 +191,17 @@ def validate(cfg: Config) -> tuple[list[str], list[str]]:
     for key, lo, hi in (("poll_seconds", 0.001, None),
                         ("max_rate", 0, None),
                         ("floor_duty", 0, 100),
-                        ("dead_temp_c", None, None)):
+                        ("dead_temp_c", None, None),
+                        ("failsafe_duty", 0, 100),
+                        ("failsafe_after", 0, None),
+                        ("failsafe_max_rate", 0, None),
+                        ("gpu_temp_min_valid_c", None, None),
+                        ("smi_timeout_s", 0, None),
+                        ("watchdog_seconds", 0, None),
+                        ("stall_min_duty", 0, 100),
+                        ("stall_after", 1, None)):
+        if key not in c:
+            continue          # absent = the DEFAULTS value applies (load merges)
         v = c.get(key)
         if not isinstance(v, (int, float)) or isinstance(v, bool):
             errors.append(f"config.{key} must be a number, got {v!r}")
@@ -255,6 +285,29 @@ def validate(cfg: Config) -> tuple[list[str], list[str]]:
                     if not isinstance(t, str) or not hwmon.TACH_ID_RE.match(t):
                         errors.append(f"assignment {aid}: bad tach id {t!r} "
                                       f"for fan {f!r}")
+        # ---- per-assignment fail-safe / takeover overrides --------------
+        fs = a.get("failsafe")
+        if fs is not None and not isinstance(fs, bool):
+            errors.append(f"assignment {aid}: 'failsafe' must be true/false")
+        for name, lo, hi in (("failsafe_duty", 0, 100),
+                             ("failsafe_after", 0, None)):
+            v = a.get(name)
+            if v is not None and (not isinstance(v, (int, float))
+                                  or isinstance(v, bool)):
+                errors.append(f"assignment {aid}: {name} must be a number")
+            elif v is not None and lo is not None and v < lo:
+                errors.append(f"assignment {aid}: {name} must be >= {lo}")
+            elif v is not None and hi is not None and v > hi:
+                errors.append(f"assignment {aid}: {name} must be <= {hi}")
+        ft = a.get("force_takeover")
+        if ft is not None and not isinstance(ft, bool):
+            errors.append(f"assignment {aid}: 'force_takeover' must be "
+                          f"true/false")
+        if fs is False:
+            warnings.append(
+                f"assignment {aid}: fail-safe disabled — its fans keep "
+                f"their last duty (they do NOT ramp up) if "
+                f"{a.get('source')!r} becomes unreadable")
     # a fan shared by several assignments is LEGAL: the daemon drives it
     # to the highest duty any of them requests (see daemon._poll) — warn
     # so the user knows the rule when they save such a config

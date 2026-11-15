@@ -437,14 +437,18 @@ class AssignScreen(BaseScreen):
             common = sorted(set(fans) & set(oa.get("fans", [])))
             if common:
                 shared.append(f"'{other}' ({', '.join(common)})")
-        # overwriting an existing assignment keeps its enabled state
+        # overwriting an existing assignment keeps its enabled state — and
+        # any key this form does not manage (failsafe, failsafe_duty,
+        # force_takeover, ...): hand-edited safety settings must survive an
+        # edit made in the TUI
         existing = app.cfg.assignments.get(name, {})
-        assignment: dict = {
+        assignment: dict = dict(existing)
+        assignment.update({
             "source": src_id,
             "curve": curve_id,
             "fans": fans,
             "enabled": existing.get("enabled", True),
-        }
+        })
         if floor is not None:
             assignment["floor_duty"] = floor
         if maxd is not None:

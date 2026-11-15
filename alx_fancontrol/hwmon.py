@@ -17,6 +17,7 @@ from __future__ import annotations
 import glob
 import os
 import re
+import signal
 import subprocess
 from pathlib import Path
 
@@ -181,38 +182,109 @@ def norm_bus(busid: str) -> str:
     return ":".join(parts[-2:])
 
 
-def _nvidia_smi_csv(*fields: str) -> str:
-    out = subprocess.run(
-        ["nvidia-smi", "--query-gpu=" + ",".join(fields),
-         "--format=csv,noheader,nounits"],
-        capture_output=True, text=True, check=True).stdout
+# ------------------------------------------------- nvidia-smi subprocess --
+# A GPU that falls off the PCIe bus makes nvidia-smi block in
+# uninterruptible sleep (D state). The poll loop must never wait for that:
+# every call gets a timeout, and a timed-out child is killed WITHOUT being
+# reaped (reaping waits), then reaped opportunistically on a later poll.
+SMI_TIMEOUT_S = 3.0
+
+_pending: list[subprocess.Popen] = []   # killed after timeout, not yet reaped
+
+
+def reap_children() -> None:
+    """Non-blocking reap of the nvidia-smi children killed on timeout."""
+    still: list[subprocess.Popen] = []
+    for p in _pending:
+        try:
+            if p.poll() is None:
+                still.append(p)
+        except Exception:      # pragma: no cover - defensive
+            pass
+    _pending[:] = still
+
+
+def pending_children() -> int:
+    """How many killed-but-unreaped children we are carrying (for tests)."""
+    reap_children()
+    return len(_pending)
+
+
+def _run_argv(argv: list[str], timeout: float | None) -> str:
+    """Run argv, return stdout as text.
+
+    Raises subprocess.TimeoutExpired (child SIGKILLed, NOT waited on) or
+    subprocess.CalledProcessError on a non-zero exit.
+    """
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:                    # kill the whole group: nvidia-smi may fork
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        _pending.append(proc)   # reaped by reap_children(), never waited on
+        raise
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, argv,
+                                            output=out, stderr=err)
     return out
 
 
-def gpu_temps(runner=None) -> dict[str, int]:
+def _nvidia_smi_csv(*fields: str, timeout: float | None = SMI_TIMEOUT_S) -> str:
+    return _run_argv(
+        ["nvidia-smi", "--query-gpu=" + ",".join(fields),
+         "--format=csv,noheader,nounits"], timeout)
+
+
+def _parse_temp(raw: str) -> int | None:
+    """GPU temp field -> int, or None for '[Not Supported]'/'N/A'. Tolerant
+    per GPU: one card that cannot answer must not black out the others."""
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return None
+
+
+def gpu_temps(runner=None, timeout: float | None = SMI_TIMEOUT_S) -> dict[str, int]:
     """{normalized pci bus: temp_c}, e.g. {"08:00.0": 68, "44:00.0": 69}.
 
     Port of gpu-fanctl's gpu_temps(); `runner` (a stand-in for the
     nvidia-smi subprocess returning the CSV string) is injectable for
-    tests. Raises (subprocess.CalledProcessError) if nvidia-smi fails —
-    callers mark GPU sources stale and hold duties.
+    tests. Raises (subprocess.CalledProcessError / TimeoutExpired) if
+    nvidia-smi fails or hangs — callers mark GPU sources stale, which now
+    drives the fail-safe instead of just holding duty.
+
+    A GPU whose temperature field is unparseable is simply absent from the
+    result (that source goes stale on its own) instead of failing the call.
     """
-    out = _nvidia_smi_csv("pci.bus_id", "temperature.gpu") if runner is None \
+    out = _nvidia_smi_csv("pci.bus_id", "temperature.gpu",
+                          timeout=timeout) if runner is None \
         else runner("pci.bus_id", "temperature.gpu")
     temps: dict[str, int] = {}
     for line in out.strip().splitlines():
         line = line.strip()
         if not line:
             continue
-        bus, t = line.split(",")
-        temps[norm_bus(bus)] = int(t.strip())
+        bus, _, t = line.rpartition(",")
+        temp = _parse_temp(t)
+        if temp is None or not bus.strip():
+            continue
+        temps[norm_bus(bus)] = temp
     return temps
 
 
-def gpu_info(runner=None) -> dict[str, dict]:
+def gpu_info(runner=None, timeout: float | None = SMI_TIMEOUT_S) -> dict[str, dict]:
     """{normalized pci bus: {"temp": int, "name": str}} — TUI only (shows
     e.g. 'Tesla V100' on GPU source rows)."""
-    out = _nvidia_smi_csv("pci.bus_id", "temperature.gpu", "name") if runner is None \
+    out = _nvidia_smi_csv("pci.bus_id", "temperature.gpu", "name",
+                          timeout=timeout) if runner is None \
         else runner("pci.bus_id", "temperature.gpu", "name")
     info: dict[str, dict] = {}
     for line in out.strip().splitlines():
@@ -222,10 +294,10 @@ def gpu_info(runner=None) -> dict[str, dict]:
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 3:
             continue
-        info[norm_bus(parts[0])] = {
-            "temp": int(parts[1]),
-            "name": ",".join(parts[2:]),
-        }
+        temp = _parse_temp(parts[1])
+        if temp is None:
+            continue
+        info[norm_bus(parts[0])] = {"temp": temp, "name": ",".join(parts[2:])}
     return info
 
 

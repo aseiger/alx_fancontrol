@@ -8,11 +8,33 @@ Type=simple
 # reads its config from /etc/alx_fancontrol/config.json (config.default_path).
 # The code runs from the /opt snapshot built by install.sh — NOT from the
 # source tree, which may be deleted.
-RuntimeDirectory=alx_fancontrol   # /run/alx_fancontrol -> status.json
-LogsDirectory=alx_fancontrol      # /var/log/alx_fancontrol -> daemon.log
+
+# /run/alx_fancontrol/status.json
+RuntimeDirectory=alx_fancontrol
+# /var/log/alx_fancontrol/daemon.log
+LogsDirectory=alx_fancontrol
+# /var/lib/alx_fancontrol/owned.json — which pwm channels this daemon holds,
+# with the enable value to restore and the boot id. It has to survive a crash:
+# that is what lets a restarted daemon reclaim a channel its predecessor was
+# killed holding in manual mode, instead of refusing it forever with the fan
+# pinned at its last duty (possibly 0%).
+StateDirectory=alx_fancontrol
+
 ExecStart=/opt/alx_fancontrol/venv/bin/python -m alx_fancontrol.daemon
 Restart=always
 RestartSec=2
+
+# The daemon watches itself: if no poll completes within config.watchdog_seconds
+# (default 30) it exits with status 70 and Restart=above starts a fresh
+# instance, which reclaims its channels from the marker. A hung nvidia-smi can
+# therefore no longer freeze every fan while the unit still reads "active".
+#
+# The daemon also sends READY=1 / STATUS=… / WATCHDOG=1 (best effort), so
+# systemd can police the loop too — but only switch this on together with
+# Type=notify, and keep Restart=always: a missed ping must not take the
+# cooling down with it.
+NotifyAccess=main
+# WatchdogSec=60
 
 [Install]
 WantedBy=multi-user.target

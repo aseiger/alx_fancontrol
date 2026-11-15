@@ -30,10 +30,12 @@ curve editor / sources) as the primary UX.
 - Multiple sources (CPU package temps, motherboard thermistors, GPU
   temps) and multiple fans per source, with per-fan floor/ceiling/rate —
   `fancontrol` does one fan per temp with a single global min.
-- Safety is in code, not in your memory: channels already in manual
-  mode by another process (e.g. the GPU blowers owned by the existing
-  `gpu-fanctl` service) are refused at takeover, and every exit path
-  restores firmware control. `--dry-run` demonstrates all of it without
+- Safety is in code, not in your memory: channels already in manual mode
+  by another process are refused at takeover unless our own ownership
+  marker claims them (a restart after a crash), and every exit path
+  restores firmware control. An unreadable temperature source ramps the
+  fans it drives to `failsafe_duty` instead of parking them where a BIOS
+  curve may leave them at 0 %. `--dry-run` demonstrates all of it without
   writing a single sysfs file.
 - Hot config reload: edit the JSON (by hand or in the TUI) and the
   daemon picks it up within ~1 s — no restart, no `pwmconfig` re-run.
@@ -111,10 +113,10 @@ testing, but it can't take over fans.
 In the TUI: `2` → Assign → name it, pick a source (live °C), a curve,
 click fans, Save. `3` → Curves → shape the curve (drag points, `a`/`d`,
 `+`/`-`, shift+arrows), Save. `4` → Sources → the runtime-detected
-source list. `1` → Overview → watch duties/RPMs move. (You *can* pick
-the gpu-fanctl blower headers — but the daemon refuses to take over any
-channel another process holds in manual mode, so they stay with
-`gpu-fanctl` while that service runs.)
+source list. `1` → Overview → watch duties/RPMs move. (The GPU blower
+headers on `it8792` are assigned here like any other fan — this daemon is
+the only fan controller on the machine, `gpu-fanctl` having been removed
+with `scripts/remove_gpu_fanctl.sh`.)
 
 Then run the daemon for real (it takes over only the fans you assigned,
 restores firmware control on exit) — or better, install it as a service:
@@ -210,7 +212,7 @@ automatically on load — the TUI re-saves them as v2 on first open.
 | field | meaning |
 |---|---|
 | `config.poll_seconds` | poll interval (s) |
-| `config.max_rate` | fallback max duty change **per poll**, percent (6 ≈ gpu-fanctl's proven 16/0–255) — overridden per assignment |
+| `config.max_rate` | fallback max duty change **per poll**, percent (6 %/poll ≈ 16 raw steps on the 0–255 scale — measured safe for these blowers to spin up from) — overridden per assignment |
 | `config.floor_duty` | fallback per-assignment floor, **default 5%** (quiet idle; stall protection) — overridden per assignment |
 | `config.dead_temp_c` | readings below this count as "no reading" (kills the −55 °C dead thermistors) |
 | `config.failsafe_duty` | **default 100** — duty a fan is driven to when its source goes unreadable. An unreadable temperature may only ever make a fan go FASTER |
@@ -261,8 +263,7 @@ Behavior:
   The call has a timeout (`smi_timeout_s`): a card that fell off the bus
   makes nvidia-smi block forever, so it is killed (not waited on) and the
   loop keeps running. A failing call marks GPU sources *stale* → fail-safe
-  below; CPU-side assignments keep running (unlike gpu-fanctl, which slept
-  5 s and skipped the whole loop).
+  below; CPU-side assignments keep running.
 - **Fail-safe direction.** A source that is unreadable — GPU gone from
   nvidia-smi, nvidia-smi hung/offline, dead thermistor, hwmon chip gone —
   makes the assignment drive its fans to `failsafe_duty` (default **100 %**)
@@ -285,7 +286,8 @@ Behavior:
     ownership marker) → **reclaimed** (WARN `reclaiming …`) and driven
     again. This is what stops a SIGKILLed/OOMed daemon from pinning a GPU
     fan at its last raw duty — possibly 0 — forever;
-  - `pwmN_enable=1` owned by **another process** (e.g. gpu-fanctl) →
+  - `pwmN_enable=1` owned by **another process** (a second controller, or
+    a tool that exited without restoring) →
     refused (ERROR, logged first + every 30th poll); eligible the moment
     it is released;
   - `pwmN_enable=0` (disabled) → skipped, unless the assignment sets
@@ -453,9 +455,10 @@ ownership if the TUI ran as root.
    ownership marker that lets a restarted daemon reclaim channels its
    predecessor was killed holding in manual mode); as root the daemon
    finds its config in `/etc` on its own (no path pinning).
-6. **Verifies**: unit active, `gpu-fanctl` still active, and the
-   GPU-blower channels still at `enable=1` (i.e. still owned by
-   gpu-fanctl — the daemon only takes over channels in firmware mode).
+6. **Verifies**: unit active, the assigned GPU-blower channels at
+   `enable=1` (owned by the daemon — anything else means nothing is
+   controlling that fan), the contents of the ownership marker, and every
+   `errors` entry plus non-`ok` fan state in `status.json`.
 
 `Restart=always` covers the hwmon-reshuffle case (see troubleshooting)
 and the daemon's own self-watchdog: if no poll completes within
@@ -471,24 +474,35 @@ touched.
 
 ## Safety notes
 
-**The running `gpu-fanctl.service` owns it8792 pwm1/pwm3** (the V100
-GPU blower headers; `pwmN_enable=1`, actively duty-cycled). alx_fancontrol
-coexists with it under three independent guardrails:
+**alx_fancontrol is the only fan controller on this machine.** The
+`gpu-fanctl.service` that used to drive it8792 pwm1/pwm3 (the V100 GPU
+blower headers) has been removed by `scripts/remove_gpu_fanctl.sh`, which
 
-1. Any channel with `pwmN_enable=1` at takeover is refused (someone
-   else is in manual mode — that's exactly the state gpu-fanctl leaves
-   its channels in). It is re-checked every poll, so a channel becomes
-   eligible only while it actually sits in firmware mode. **Exception:**
-   a channel listed in *our own* ownership marker from *this boot*
+- refuses to run unless this daemon demonstrably cools those two channels
+  first — assigned and enabled in `/etc/alx_fancontrol/config.json`,
+  actually held (`pwmN_enable=1`, tach spinning), service active — and
+- archives everything it deletes (unit, script, `fan-calibration.json`
+  with its duty→RPM→temperature sweep, the original source tree) to
+  `/var/backups/gpu-fanctl-<timestamp>.tar.gz`.
+
+Two controllers on one header is exactly how a fan gets stranded: whoever
+writes last wins, and neither can see the other. The three guardrails that
+keep a single controller honest:
+
+1. Any channel with `pwmN_enable=1` at takeover is refused (something else
+   is in manual mode — a second daemon, `fancontrol`, or a tool that exited
+   without restoring it). Re-checked every poll, so a channel becomes
+   eligible only while it actually sits in firmware mode. **Exception:** a
+   channel listed in *our own* ownership marker from *this boot*
    (`/var/lib/alx_fancontrol/owned.json`) is reclaimed — that is the
-   leftover of an alx_fancontrol that was killed and could not restore
-   it, and refusing it forever would pin the fan at its last duty. A
-   marker from another boot, or one whose pid is a live alx_fancontrol,
-   is never claimed, so gpu-fanctl keeps its channels.
+   leftover of an alx_fancontrol that was killed and could not restore it,
+   and refusing it forever would pin the fan at its last duty (possibly 0).
+   A marker from another boot, or one whose pid is a live alx_fancontrol,
+   is never claimed.
 2. `--dry-run` writes nothing at all, and the acceptance path for new
    configs is a dry run.
-3. `scripts/protect.py` snapshots/checks it8792 pwm1/pwm3 duty+enable
-   and the service state:
+3. `scripts/protect.py` snapshots/checks the channels *this daemon must
+   own* — the union of its enabled assignments and the ownership marker:
 
    ```bash
    python3 scripts/protect.py snapshot /tmp/fc.snap
@@ -496,22 +510,22 @@ coexists with it under three independent guardrails:
    python3 scripts/protect.py check /tmp/fc.snap   # → GUARDRAIL-OK
    ```
 
-   `check` treats an **enable** change or an inactive service as a
-   violation (exit 1); duty *drift* between checks is reported as a
-   NOTE, not a failure — gpu-fanctl is a live service and legitimately
-   moves duty with GPU temperature between two checks. (The dry runs
-   provably change nothing: the hermetic fake-tree tests assert byte-
-   identical trees, and it8686 was verified unchanged after live runs.)
+   `check` fails (exit 1) when a guarded channel is no longer `enable=1`
+   — the fail-safe cannot raise a fan we do not own — or when the service
+   is inactive; duty *drift* between checks is a NOTE, not a failure,
+   because the daemon legitimately moves duty with temperature. Per-fan
+   states from `status.json` are echoed, so a `failsafe` or `stalled` fan
+   shows up in the same output. (The dry runs provably change nothing: the
+   hermetic fake-tree tests assert byte-identical trees, and it8686 was
+   verified unchanged after live runs.)
 
 **Design note:** an earlier revision had a `protected` config list
 (built-in default `["it8792:pwm1", "it8792:pwm3"]`) that refused those
-channels even in firmware mode. It was removed — it only ever existed
-to keep the dev daemon from stomping on the running gpu-fanctl, which
-guardrail 1 already covers. Consequence to know: if you *stop*
-gpu-fanctl and its channels return to firmware mode, the blower headers
-become assignable like any other fan (the daemon will take them over if
-assigned). Old configs with a `protected` key still load; the key is
-ignored and dropped on the next save.
+channels even in firmware mode. It existed only to keep a dev-mode daemon
+from stomping on the gpu-fanctl that ran here, and went away with it —
+guardrail 1 covers foreign owners generically. Old configs with a
+`protected` key still load; the key is ignored and dropped on the next
+save.
 
 Additional rules honored everywhere:
 
@@ -522,8 +536,10 @@ Additional rules honored everywhere:
   JSON) and run the daemon non-dry. The optional
   `scripts/real_write_smoke.sh` uses **it8686 pwm3 (SYS_FAN2)** only —
   a spinning chassis fan with a tach, never the it8792 GPU blowers —
-  pre-checks `Tctl < 85 °C`, and self-restores (`enable→2`) on clean
-  exit. Run it only when you're happy to spin that fan for ~20 s.
+  pre-checks `Tctl < 85 °C`, refuses to run while the live service is
+  active (stop it first, start it again after), fails if any channel other
+  than it8686:pwm3 moved, and self-restores (`enable→2`) on clean exit.
+  Run it only when you're happy to spin that fan for ~20 s.
 - On this board `pwmN_enable`: `1` = manual (software), `2` = firmware/
   BIOS SmartFan, `0` = disabled. The daemon takes over from `2`, reclaims
   channels its own previous run left at `1`, and restores exactly the
@@ -550,8 +566,8 @@ Additional rules honored everywhere:
    data; an assignment + curve edit persists to
    `~/.config/alx_fancontrol/config.json` with `.bak`; a running daemon
    reflects config changes within ~1 s (mtime hot-reload). ✅
-5. `scripts/protect.py check` passes and `gpu-fanctl` was never
-   stopped. ✅
+5. `scripts/protect.py check` passes — the daemon still owns every channel
+   its config assigns. ✅
 6. You take over: `.venv/bin/alx-fancontrol tui` +
    `.venv/bin/alx-fancontrol daemon` (or install the unit yourself).
 
@@ -577,8 +593,9 @@ Additional rules honored everywhere:
   the JSON since the TUI loaded it: Reload (discard in-TUI edits) or
   Overwrite. Don't run two TUIs at once.
 - **A fan won't move** — check Overview state: `manual-conflict` means
-  another process has the channel in manual mode (e.g. you have
-  gpu-fanctl running on a non-default channel); `disabled` means
+  another process has the channel in manual mode (`fancontrol`, a second
+  alx_fancontrol, or a tool that exited without restoring it);
+  `disabled` means
   `pwmN_enable=0` (BIOS disabled the header); `unresolved` means the
   chip is gone (reboot reshuffle).
 
@@ -608,8 +625,9 @@ alx_fancontrol/
 │       └── screens/             # base shell + overview / assign / curves / sources
 ├── scripts/
 │   ├── bootstrap_venv.sh        # venv without apt + get-pip + editable install
-│   ├── protect.py               # gpu-fanctl guardrail snapshot/check (read-only)
+│   ├── protect.py               # ownership guardrail snapshot/check (read-only)
 │   ├── real_write_smoke.sh      # OPTIONAL it8686-pwm3 real-write test (opt-in)
+│   ├── remove_gpu_fanctl.sh     # archive + remove the superseded gpu-fanctl controller
 │   └── verify_install.sh        # full install-path check in a throwaway venv (no sudo)
 ├── tests/                       # 165 tests, hermetic via the FakeMachine (see below)
 └── .venv/                       # dev venv, created by bootstrap (gitignored)

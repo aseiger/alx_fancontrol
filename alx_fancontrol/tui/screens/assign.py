@@ -10,9 +10,10 @@ as a click-to-toggle DataTable, optional floor/max, an assignment name,
 and Save → app.save_config(). Saving with an existing name overwrites it
 (the existing `enabled` state is preserved).
 
-Note: channels already held in manual mode by another process (e.g. the
-gpu-fanctl service) are selectable here, but the daemon refuses to take
-them over at runtime — that check is in the daemon, not the UI.
+Note: channels already held in manual mode by another process are
+selectable here, but the daemon refuses to take them over at runtime
+(unless the assignment sets force_takeover) — that check is in the
+daemon, not the UI.
 """
 from __future__ import annotations
 

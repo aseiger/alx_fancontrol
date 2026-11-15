@@ -19,7 +19,8 @@ from fake_machine import FakeMachine
 def default_machine(root) -> FakeMachine:
     """Shape mirrors the dev box: one k10temp package, an it8686 with five
     pwm channels (pwm3/4 firmware-disabled, as found in the wild), an
-    it8792 with three pwm channels (manual — gpu-fanctl-owned), one GPU.
+    it8792 with three pwm channels (manual — held by another process),
+    one GPU.
     No temp/RPM values are set: tests inject what they need."""
     m = FakeMachine(root)
     m.add_chip("k10temp", temp1=55.0)

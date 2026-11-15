@@ -447,3 +447,79 @@ stuck loop and stays quiet while it beats; degraded mode holds fail-safe then
 recovers; unrecoverable config still exits 2 without touching channels;
 stalled fan reported / turning fan not reported. Config validation for every
 new knob. Suite: **165 passed** (was 145).
+
+## 19. gpu-fanctl removed (2026-11-15)
+
+The second fan controller on this box is gone. `gpu-fanctl.service` had been
+inactive since alx_fancontrol took over its headers, but it still shaped the
+project: half the safety narrative in the README was "coexists with
+gpu-fanctl", `scripts/protect.py` existed only to prove we never stomped on
+it, and `install.sh` printed its service state after every install. Carrying
+that as live documentation while the service itself is dead is how a guardrail
+rots into a comment.
+
+**Why removal, not coexistence.** Two writers on one `pwmN` is exactly the
+failure mode §18 was about: last write wins, neither controller can see the
+other, and a header can be parked anywhere — including 0. gpu-fanctl also has
+none of the safety net (no fail-safe duty, no `nvidia-smi` timeout, no
+ownership marker, no watchdog), so leaving it installable is a way to
+re-introduce the bug.
+
+**Coverage first.** Verified before deleting anything: `it8792:pwm1`
+(GPU 43:00.0) and `it8792:pwm3` (GPU 08:00.0) are assigned and enabled in
+`/etc/alx_fancontrol/config.json`, held at `enable=1` with the blowers
+spinning, by an active service. Nothing loses cooling.
+
+### scripts/remove_gpu_fanctl.sh
+
+- **Refuses to run** unless that coverage is demonstrable: both channels
+  assigned+enabled in the config, `pwmN_enable=1` with a tach reading, and
+  `alx_fancontrol.service` active. Abort changes nothing.
+- **Archives before deleting**: tarball of every target at
+  `/var/backups/gpu-fanctl-<timestamp>.tar.gz`; if archiving fails it does not
+  delete. The archive matters — `fan-calibration.json` is the only copy of the
+  duty→RPM→temperature sweep, and alx_fancontrol never reads it.
+- Removes: unit (stop + disable + `daemon-reload` + `reset-failed`),
+  `/usr/local/bin/gpu-fanctl.py`, `/usr/local/bin/fan-calibration.json`, the
+  original `~/gpu-fanctl` source tree and the `fanctl-test.*` scratch files.
+- **Verifies afterwards**: unit unknown to systemd, files gone, service still
+  active, both GPU channels *still* owned with RPM. `--dry-run` prints the
+  plan (it is how the target list was confirmed).
+
+### Guardrail inverted: scripts/protect.py
+
+It used to assert "we never changed it8792 enable from 2". The guarantee that
+matters now is the mirror image: **the daemon must still hold every channel its
+config assigns** — a channel that fell out of manual mode can no longer be
+raised by the fail-safe, which is precisely how a blower ended up at 0. The
+guarded set is the union of the ownership marker and the config's enabled
+assignments, so a channel that should be owned but never was (takeover refused)
+is caught as well as one that was lost. Duty drift stays a NOTE; `enable != 1`,
+a vanished channel or an inactive service is a GUARDRAIL-VIOLATION. Fan states
+from `status.json` are echoed so `failsafe`/`stalled` show up in the same
+output. Verified live against the running daemon: six channels, `GUARDRAIL-OK`.
+
+`scripts/real_write_smoke.sh` can no longer use `protect.py check` as its
+post-check — it runs with the live service deliberately stopped, so "the daemon
+owns its channels" is false by design there. It now (a) refuses to start while
+`alx_fancontrol.service` is active, since two daemons writing the same header
+is not a test, and (b) compares pre/post snapshots and fails if **any** channel
+other than `it8686:pwm3` moved.
+
+### Elsewhere
+
+- `install.sh`: dropped the `gpu-fanctl:` status line; the it8792 check is now
+  unconditional ("assigned GPU blowers must be enable=1"), plus a warning when
+  nothing in the config assigns the blowers at all — they would be left to a
+  BIOS curve that parks headers at 0 on this board.
+- Prose in `README.md`, `hwmon.py`, `curve.py`, `assign.py` and the test
+  docstrings says "another process" instead of naming gpu-fanctl; the takeover
+  rule it illustrated is unchanged. Sections 1–18 of these notes keep their
+  mentions — they are a dated record, not current docs.
+- Not touched by this change: the running system. Removal happens when you run
+  the script with sudo.
+
+Observed while verifying (not part of this change): `it8686:pwm3`/`pwm4` report
+`fanN_input=0` while commanded to 7 % — below tach resolution for those
+chassis fans, and a reminder that `stall_min_duty` (default 20) must stay well
+above the idle floor or the stall detector would cry wolf on every cold boot.

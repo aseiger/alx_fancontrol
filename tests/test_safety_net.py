@@ -244,7 +244,7 @@ def test_channel_left_manual_by_our_own_crash_is_reclaimed(tmp_path, caplog):
 
 def test_foreign_manual_channel_is_still_refused(tmp_path, caplog):
     """Without a marker from this boot, a manual channel belongs to someone
-    else (e.g. gpu-fanctl.service) and stays refused — coexistence still
+    else (another fan daemon) and stays refused — coexistence still
     holds; only our own leftovers are reclaimed."""
     caplog.set_level(logging.ERROR)
     root = make_tree(tmp_path, pwm1=(0, 1))

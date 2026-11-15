@@ -7,10 +7,11 @@ it8792=hwmon2) — discovery is always by `name` prefix, never by hwmonN.
 
 pwmN_enable semantics on this board:
     0 = disabled, 1 = manual (software control), 2 = firmware/BIOS SmartFan.
-The running gpu-fanctl service holds it8792 pwm1/pwm3 in manual mode
-(enable=1); the daemon refuses takeover of any channel it finds in manual
-mode, so coexistence is safe (see scripts/protect.py for the snapshot
-check).
+A channel found in manual mode belongs to something else, so takeover is
+refused unless the ownership marker proves we left it there ourselves (a
+restart after a crash) or the assignment sets force_takeover. The daemon
+must end up owning every channel its config assigns — scripts/protect.py
+checks that afterwards.
 """
 from __future__ import annotations
 
@@ -255,7 +256,7 @@ def _parse_temp(raw: str) -> int | None:
 def gpu_temps(runner=None, timeout: float | None = SMI_TIMEOUT_S) -> dict[str, int]:
     """{normalized pci bus: temp_c}, e.g. {"08:00.0": 68, "44:00.0": 69}.
 
-    Port of gpu-fanctl's gpu_temps(); `runner` (a stand-in for the
+    One nvidia-smi call serves every card; `runner` (a stand-in for the
     nvidia-smi subprocess returning the CSV string) is injectable for
     tests. Raises (subprocess.CalledProcessError / TimeoutExpired) if
     nvidia-smi fails or hangs — callers mark GPU sources stale, which now

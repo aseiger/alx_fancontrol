@@ -2,8 +2,8 @@
 
 These NEVER touch real hardware. The fake tree deliberately uses a
 different hwmon index order than the live box, and models the live safety
-situation: it8792 pwm1/pwm3 already in manual mode (enable=1, owned by
-gpu-fanctl).
+situation: it8792 pwm1/pwm3 already in manual mode (enable=1, held by
+another process).
 """
 import json
 import logging
@@ -109,9 +109,10 @@ def test_dry_run_once_changes_nothing_and_logs_guardrails(caplog, tmp_path):
     assert "would take over it8686:pwm3" in text
     # k10temp reads 40.0 C -> default curve -> exactly 20% (floor), raw 51
     assert "would write it8686:pwm3 =  20% (raw 51)" in text
-    # it8792 pwm1/pwm3 are in manual mode in the fake tree (gpu-fanctl):
-    # the takeover guardrail refuses them as manual-conflicts (logged at
-    # initial takeover and re-checked, still refused, at every poll)
+    # it8792 pwm1/pwm3 are in manual mode in the fake tree (another
+    # process): the takeover guardrail refuses them as manual-conflicts
+    # (logged at initial takeover and re-checked, still refused, at every
+    # poll)
     assert "channel it8792:pwm1 already in manual mode" in text
     assert "channel it8792:pwm3 already in manual mode" in text
     assert "would return it8686:pwm3 to firmware" in text
@@ -177,7 +178,7 @@ def test_curve_interpolation_midpoint(tmp_path):
 
 def test_manual_owned_fans_refused_changes_nothing(caplog, tmp_path):
     """non-dry-run assigning only fans another process holds in manual
-    mode (enable=1, the fake tree's gpu-fanctl channels): takes over
+    mode (enable=1, the fake tree's foreign-owned channels): takes over
     nothing, exits 0, changes nothing — the runtime guardrail that
     replaced the old 'protected' config list."""
     caplog.set_level(logging.INFO)
@@ -203,7 +204,7 @@ def test_manual_owned_fans_refused_changes_nothing(caplog, tmp_path):
 def test_manual_conflict_refused(caplog, tmp_path):
     """a channel already in manual mode (enable=1 — owned by another
     process) is refused at takeover — THE runtime guardrail against
-    stomping a fan another daemon (e.g. gpu-fanctl) is driving."""
+    stomping a fan another daemon is driving."""
     caplog.set_level(logging.INFO)
     root = make_tree(tmp_path)
     (root / "hwmon0" / "pwm4_enable").write_text("1\n")

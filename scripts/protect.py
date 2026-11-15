@@ -5,9 +5,9 @@ Usage:
   python3 scripts/protect.py snapshot FILE
   python3 scripts/protect.py check FILE
 
-History: this script used to guard the *other* controller — gpu-fanctl's
-it8792 pwm1/pwm3 — while the two coexisted. gpu-fanctl has been removed
-(`scripts/remove_gpu_fanctl.sh`), so the guarantee that matters now is the
+This check used to prove the opposite: that we never touched the channels a
+*second* controller held on this machine. That program is gone and
+alx_fancontrol is the only writer now, so the guarantee that matters is the
 mirror image: **the daemon must hold every channel its config assigns.**
 A channel that fell out of manual mode means the fail-safe can no longer
 raise that fan, which is exactly how a GPU blower ended up parked at 0%.

@@ -64,6 +64,13 @@ DEFAULTS = {
         # ---- stalled-fan alarm: duty high but tach reads ~0 RPM --------
         "stall_min_duty": 20,
         "stall_after": 10,
+        # ---- escalation once a fan is confirmed not cooling -------------
+        # A stalled blower is not something we can fix by writing duty, so the
+        # alarm has to reach a person and cut the heat at the source.
+        "stall_alert_command": "",   # shell command; see README "Escalation"
+        "stall_alert_timeout_s": 5.0,
+        "stall_alert_repeat_s": 300,  # re-alert while it lasts (0 = once only)
+        "stall_power_limit_w": 0,     # >0: cap the GPU's power on a stall
     },
     "curves": {
         "default":  {"label": "Default",
@@ -199,7 +206,10 @@ def validate(cfg: Config) -> tuple[list[str], list[str]]:
                         ("smi_timeout_s", 0, None),
                         ("watchdog_seconds", 0, None),
                         ("stall_min_duty", 0, 100),
-                        ("stall_after", 1, None)):
+                        ("stall_after", 1, None),
+                        ("stall_alert_timeout_s", 0, None),
+                        ("stall_alert_repeat_s", 0, None),
+                        ("stall_power_limit_w", 0, None)):
         if key not in c:
             continue          # absent = the DEFAULTS value applies (load merges)
         v = c.get(key)
@@ -209,6 +219,10 @@ def validate(cfg: Config) -> tuple[list[str], list[str]]:
             errors.append(f"config.{key} must be >= {lo}")
         elif hi is not None and v > hi:
             errors.append(f"config.{key} must be <= {hi}")
+
+    cmd = c.get("stall_alert_command", "")
+    if cmd is not None and not isinstance(cmd, str):
+        errors.append(f"config.stall_alert_command must be a string, got {cmd!r}")
 
     # (sources are not in the config anymore — they are discovered at
     # runtime; an assignment whose source is not detected is skipped with

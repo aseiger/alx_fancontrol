@@ -211,7 +211,8 @@ def pending_children() -> int:
     return len(_pending)
 
 
-def _run_argv(argv: list[str], timeout: float | None) -> str:
+def _run_argv(argv: list[str], timeout: float | None,
+              env: dict[str, str] | None = None) -> str:
     """Run argv, return stdout as text.
 
     Raises subprocess.TimeoutExpired (child SIGKILLed, NOT waited on) or
@@ -219,7 +220,7 @@ def _run_argv(argv: list[str], timeout: float | None) -> str:
     """
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True,
-                            start_new_session=True)
+                            start_new_session=True, env=env)
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -300,6 +301,46 @@ def gpu_info(runner=None, timeout: float | None = SMI_TIMEOUT_S) -> dict[str, di
             continue
         info[norm_bus(parts[0])] = {"temp": temp, "name": ",".join(parts[2:])}
     return info
+
+
+def gpu_indices(runner=None, timeout: float | None = SMI_TIMEOUT_S) -> dict[str, str]:
+    """{normalized pci bus: nvidia-smi index}, e.g. {"47:00.0": "0"}.
+
+    Power-limiting and friends address GPUs by index, but the config speaks
+    PCI bus (stable across reboots — index order is not), so callers translate
+    through here at the moment they need it."""
+    out = _nvidia_smi_csv("index", "pci.bus_id", timeout=timeout) \
+        if runner is None else runner("index", "pci.bus_id")
+    idx: dict[str, str] = {}
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            continue
+        idx[norm_bus(parts[1])] = parts[0]
+    return idx
+
+
+def run_quiet(argv: list[str],
+              timeout: float | None = SMI_TIMEOUT_S,
+              env: dict[str, str] | None = None) -> tuple[bool, str]:
+    """Run argv for its side effect and NEVER raise — an escalation helper
+    must not be able to break the poll loop. Returns (ok, one-line detail).
+
+    Same child discipline as nvidia-smi: a timeout kills the whole process
+    group and leaves the child to `reap_children()`, so a hung alert hook can
+    neither block the loop nor pile up zombies.
+    """
+    try:
+        out = _run_argv(argv, timeout, env=env)
+        detail = out.strip().splitlines()
+        return True, detail[0] if detail else "ok"
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout}s"
+    except subprocess.CalledProcessError as e:
+        detail = ((e.stderr or "") or (e.output or "")).strip().splitlines()
+        return False, detail[0] if detail else f"exit {e.returncode}"
+    except OSError as e:
+        return False, str(e)
 
 
 # --------------------------------------------------------- sensors.d ------

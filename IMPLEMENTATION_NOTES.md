@@ -534,3 +534,114 @@ ops scripts are now clean of the name; sections 1–18 above keep their mentions
 because they are dated records of what was true then, and this one records what
 is true now: single controller, and `protect.py` asserting that we hold what we
 assign.)*
+
+## 20. Ownership re-verification + stall escalation (2026-11-22)
+
+§18 built the safety net and then, three days later, the fault it was written
+for happened anyway — with the net up. Live incident, this morning:
+
+```
+06:22:15 ERROR FAN it8792:pwm1 STALLED: commanding 52% but tach it8792:fan1 reads 0 RPM for 170 polls
+06:25:01 INFO  write it8792:pwm1 = 100% (raw 255)  [GPU 47:00.0 = 73.0 C]
+06:30:22 ERROR FAN it8792:pwm1 STALLED: commanding 100% but tach ... 610 polls
+06:30:27 INFO  received signal 15 — stopping after this poll      ← box rebooted
+```
+
+Eleven and a half minutes (the counter extrapolates back to ≈06:19:07 at the
+measured 1.11 s/poll), duty ramped 52 %→100 %, GPU0 50 °C→73 °C — and only a
+reboot cleared it, because a boot re-inits the Super I/O. The fan is fine: raw
+74 → 1056 RPM today against 1028 RPM in the October calibration sweep, so the
+blower and its tach are healthy and correctly paired.
+
+**What the net could see and could not act on.** The stall detector fired, exactly
+as designed — and that was the whole of it: an ERROR line, a `status.json`
+entry, no consequence. And the reason duty 100 % moved nothing is a hole §18
+never closed: `get_enable()` was called at takeover (daemon.py:523) and for
+`status.json` (746) — **never in the control loop**. `_write_fan()` writes
+`pwmN` and logs success unconditionally. A firmware/EC flip of
+`pwmN_enable` to 2 or 0 therefore produced a log full of
+`write it8792:pwm1 = 100%` pointing at a header we no longer owned, on a board
+that demonstrably parks unowned headers. Commanded duty is not ownership, and
+we were treating it as if it were.
+
+### Changed
+
+- `Daemon._verify_channels(cfg)` runs at the top of every poll (before duty is
+  computed, so a reclaimed channel gets its real target in the same poll):
+  re-read `pwmN_enable` for everything in `_taken_over`; on any value ≠ 1 →
+  CRITICAL `OWNERSHIP LOST`, drop from `_taken_over`, **forget the remembered
+  duty** (so `rate_limit(None, tgt)` jumps to target instead of crawling up
+  from a value the chip never received), re-run `_takeover(insist=True)`,
+  escalate. Reclaiming every poll is the point — an EC that steals the header
+  every second has to be beaten every second; only the *log* is rate-limited
+  (first + every 30th, like `_refuse`).
+- `_takeover(fan, insist=True)` claims a channel found `enable=0` **when we are
+  the ones who held it**: a 0 there under our ownership is theft, not intent,
+  and refusing it means the card cooks while we respect a value the firmware
+  chose under us. Foreign-manual channels are still refused — `insist` never
+  overrides that, so this cannot stomp a second controller.
+- `_reassert_duty()`: if `pwmN` no longer holds what we wrote, write it back
+  (WARNING first + every 30th). Without this a second writer's value sticks
+  forever, because our own write is skipped whenever the target equals the duty
+  *we remember* (`new != self._duty[fan]`).
+- `_escalate(cfg, fan, kind, detail, eps)` on both faults: CRITICAL, then
+  `stall_alert_command` (env: `ALX_FAN`/`ALX_STATE`/`ALX_DETAIL`/`ALX_DUTY_PCT`/
+  `ALX_RPM`/`ALX_CONFIG`, bounded by `stall_alert_timeout_s` through
+  `hwmon.run_quiet`) and optional `stall_power_limit_w` →
+  `nvidia-smi -i <idx> -pl <W>`, bus→index resolved on the spot via
+  `hwmon.gpu_indices()`. Fires on the transition, then every
+  `stall_alert_repeat_s` (0 = once per episode).
+- `_check_fans` now also reports recovery (`FAN … RECOVERED` + a `recovered`
+  alert), which it could not do before: nothing remembered that a fan had ever
+  been stalled.
+- `ownership-lost` is sticky in `_fan_state`, and pass 2 / `_write_fan` /
+  degraded mode were changed to stop overwriting it. Three separate places
+  clobbered it while writing these tests — which is the strongest argument for
+  the feature existing at all: every layer of the loop concluded "the write
+  succeeded, so the fan is fine".
+- Degraded mode (invalid config, `cfg = None`) now runs `_verify_channels(None)`
+  too, and escalation reads its knobs through `_cfg_num()`, which tolerates a
+  None config and junk values. A fault must never be able to raise its way out
+  of the loop that is trying to save a fan.
+- `status.json`: `errors["ownership-lost:…"]`, `errors["duty-drift:…"]`, and
+  `ESCALATED` appended to the stalled entry. systemd `STATUS=` now leads with
+  `OWNERSHIP LOST …` above `FAN STALLED`.
+
+### Deliberate choices
+
+- **Episode maps are per fault kind** (`_stall_eps` / `_lost_eps`). They were
+  one dict while writing this, and a spinning tach then "recovered" an ownership
+  fault we were still losing every poll — under firmware control the fan often
+  *does* keep turning, so the alert fired once and the header kept getting
+  stolen. There is a test for exactly that.
+- **`enable` unreadable ≠ enable lost.** `get_enable()` returning None is a
+  sysfs hiccup; writing enable blind would mean guessing who holds the channel.
+  Warned first + every 30th, tach alarm still covers the fan.
+- **Power capping is opt-in and defaults to off.** Stopping a fan is not our
+  call to make either, but throttling somebody's running job is a bigger one.
+  Verified this box supports it before writing it: V100-PCIE reports Min/Max
+  Power Limit 100 W / 250 W (`nvidia-smi -q -d POWER`), so `-pl 120` is a real
+  lever here and not a no-op. A rejected value costs a log line, not the alert.
+- **No automatic `systemctl restart` on ownership loss.** Rebooting/restarting
+  looked like the cure in the incident, but a restart hands every channel back
+  to a firmware that parks them (`_restore_all` → `enable→2`) — trading a
+  stalled fan for a window where *all* of them are unowned. Reclaim-in-place is
+  strictly safer, and the operator gets told either way.
+- **Log retention was NOT changed here.** The four rotating files at
+  256 KB × `backupCount=3` hold ~10 hours, which is why "yesterday" could not be
+  reconstructed at all: journal unreadable without sudo, `dmesg` locked, no
+  metrics store. Worth doing next (`maxBytes`/`backupCount`, or log to the
+  journal and read it with `journalctl -u alx_fancontrol`).
+
+### Tests
+
+`tests/test_ownership.py` (14 tests): theft detected + reclaimed + duty
+re-asserted in the same poll; reclaim insists on a disabled header we hold; a
+header that never comes back keeps `state=ownership-lost` and stays in
+`status.json`; loss alerts without falsely reporting recovery; `--dry-run`
+detects and writes nothing; foreign duty write re-asserted; stall escalates to
+the hook once per episode and reports recovery; repeat interval governs nagging;
+ownership fault keeps alerting while a tach spins; power cap fires when asked
+and never by default; a fan with no GPU source says so instead of pretending;
+degraded mode (`cfg=None`) still verifies; junk escalation values fall back.
+Suite: **179 passed** (was 165).

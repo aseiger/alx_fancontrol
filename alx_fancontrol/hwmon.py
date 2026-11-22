@@ -303,23 +303,6 @@ def gpu_info(runner=None, timeout: float | None = SMI_TIMEOUT_S) -> dict[str, di
     return info
 
 
-def gpu_indices(runner=None, timeout: float | None = SMI_TIMEOUT_S) -> dict[str, str]:
-    """{normalized pci bus: nvidia-smi index}, e.g. {"47:00.0": "0"}.
-
-    Power-limiting and friends address GPUs by index, but the config speaks
-    PCI bus (stable across reboots — index order is not), so callers translate
-    through here at the moment they need it."""
-    out = _nvidia_smi_csv("index", "pci.bus_id", timeout=timeout) \
-        if runner is None else runner("index", "pci.bus_id")
-    idx: dict[str, str] = {}
-    for line in out.strip().splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 2 or not parts[0] or not parts[1]:
-            continue
-        idx[norm_bus(parts[1])] = parts[0]
-    return idx
-
-
 def run_quiet(argv: list[str],
               timeout: float | None = SMI_TIMEOUT_S,
               env: dict[str, str] | None = None) -> tuple[bool, str]:

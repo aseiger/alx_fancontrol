@@ -14,6 +14,7 @@ So two things had to change, and both are checked here every poll:
   * a confirmed stall ESCALATES instead of merely being logged, because more
     duty is not an available answer to a fan that is not turning.
 """
+import inspect
 import json
 import logging
 
@@ -33,21 +34,6 @@ def steal(root, value="2", name="pwm1"):
 def set_rpm(root, value, name="fan1"):
     (root / "hwmon0" / f"{name}_input").write_text(f"{value}\n")
 
-
-def config_json(system_source):
-    """Same shape as make_config, but the fan hangs off a NON-GPU source."""
-    return json.dumps({
-        "version": 2,
-        "config": {"poll_seconds": 1.0, "max_rate": 6, "floor_duty": 5,
-                   "dead_temp_c": -10, "failsafe_after": 2,
-                   "watchdog_seconds": 0,
-                   "stall_after": 2, "stall_power_limit_w": 150},
-        "curves": {"sys": {"label": "sys", "points": [[40, 60]]}},
-        "assignments": {
-            "System": {"source": system_source, "curve": "sys",
-                       "fans": ["it8792:pwm1"], "enabled": True,
-                       "tach": {"it8792:pwm1": "it8792:fan1"}}},
-    })
 
 
 # --------------------------------------------------- ownership re-verification
@@ -128,7 +114,6 @@ def test_ownership_loss_alerts_and_recovers(tmp_path, monkeypatch):
                       stall_alert_command=f'echo "$ALX_STATE" >> '
                                           f'{tmp_path / "alerts.txt"}')
     d = Daemon(cfg, root=root, gpu_runner=lambda *f: HOT)
-    monkeypatch.setattr(d, "_power_limit_for", lambda *a, **k: None)
 
     def observe(_d, n):
         if n == 2:
@@ -264,39 +249,28 @@ def test_escalation_rate_is_governed_by_stall_alert_repeat_s(tmp_path,
     assert fired == ["stalled", "stalled"], "must keep nagging while it lasts"
 
 
-def test_stall_can_cap_the_gpu_that_loses_its_air(tmp_path, monkeypatch):
-    """Opt-in throttle: the fan cannot be made to turn, so cut the heat."""
+def test_a_fan_fault_never_reaches_for_the_gpu(tmp_path, monkeypatch):
+    """Fans only. A stalled blower must not buy the daemon a lever into the
+    card: with no alert command configured, a fault may shell out to NOTHING,
+    and nothing in the daemon may ever set a GPU power limit."""
     root = make_tree(tmp_path, pwm1=(0, 2))
-    set_rpm(root, "0")
+    set_rpm(root, "0")                                # blower stopped
     calls = []
-    monkeypatch.setattr(hw, "gpu_indices", lambda **kw: {"43:00.0": "0"})
     monkeypatch.setattr(hw, "run_quiet",
                         lambda argv, **kw: (calls.append(list(argv)),
                                             (True, "ok"))[1])
-    cfg = make_config(tmp_path, stall_after=2, stall_power_limit_w=120)
-    d = Daemon(cfg, root=root, gpu_runner=lambda *f: HOT)
+    d = Daemon(make_config(tmp_path, stall_after=2, stall_alert_repeat_s=0),
+               root=root, gpu_runner=lambda *f: HOT)
 
-    run_polls(d, polls=4)
-
-    assert ["nvidia-smi", "-i", "0", "-pl", "120"] in calls
-
-
-def test_no_power_cap_unless_it_is_asked_for(tmp_path, monkeypatch):
-    """Default is off: silently throttling somebody's inference job is not the
-    daemon's call to make."""
-    root = make_tree(tmp_path, pwm1=(0, 2))
-    set_rpm(root, "0")
-    calls = []
-    monkeypatch.setattr(hw, "gpu_indices", lambda **kw: {"43:00.0": "0"})
-    monkeypatch.setattr(hw, "run_quiet",
-                        lambda argv, **kw: (calls.append(list(argv)),
-                                            (True, "ok"))[1])
-    cfg = make_config(tmp_path, stall_after=2)     # stall_power_limit_w absent
-    d = Daemon(cfg, root=root, gpu_runner=lambda *f: HOT)
-
-    run_polls(d, polls=4)
-
-    assert not [c for c in calls if "-pl" in c]
+    run_polls(d, polls=6)                              # faults, escalates,
+                                                       # recovers, repeats
+    assert not calls, f"a fan fault must not run anything but the alert " \
+                      f"hook: {calls}"
+    assert "stall_power_limit_w" not in config_mod.DEFAULTS["config"], \
+        "the knob must not exist — off-by-default is not the same as unable"
+    src = inspect.getsource(dm)
+    assert "-pl" not in src and "power.limit" not in src, \
+        "the daemon must be incapable of touching a GPU power limit"
 
 
 def test_degraded_mode_still_verifies_ownership(tmp_path, caplog):
@@ -326,7 +300,7 @@ def test_bad_escalation_values_fall_back_instead_of_raising(tmp_path, caplog):
         "version": 2,
         "config": {"poll_seconds": 1.0, "watchdog_seconds": 0, "stall_after": 2,
                    "stall_alert_repeat_s": "soon", "stall_alert_timeout_s": None,
-                   "stall_power_limit_w": "lots", "stall_alert_command": ""},
+                   "stall_alert_command": ""},
         "curves": {"gpu_v100": {"label": "V100", "points": [[50, 26],
                                                              [72, 100]]}},
         "assignments": {}}))
@@ -337,23 +311,3 @@ def test_bad_escalation_values_fall_back_instead_of_raising(tmp_path, caplog):
 
     assert "ESCALATING" in caplog.text
     assert "it8792:pwm1" in d._stall_eps
-
-
-def test_a_fan_with_no_gpu_source_is_not_power_capped_silently(tmp_path,
-                                                              monkeypatch,
-                                                              caplog):
-    """A chassis fan on a CPU/VRM source can lose its air too — say so instead
-    of pretending the cap was applied."""
-    caplog.set_level(logging.WARNING)
-    root = make_tree(tmp_path, pwm1=(0, 2))
-    set_rpm(root, "0")
-    monkeypatch.setattr(hw, "gpu_indices", lambda **kw: {"43:00.0": "0"})
-    monkeypatch.setattr(hw, "run_quiet", lambda argv, **kw: (True, "ok"))
-    cfg_path = tmp_path / "config.json"
-    cfg_path.write_text(
-        config_json(system_source="it8686:temp5"))
-    d = Daemon(cfg_path, root=root, gpu_runner=lambda *f: HOT)
-
-    run_polls(d, polls=4)
-
-    assert "no GPU source is assigned" in caplog.text

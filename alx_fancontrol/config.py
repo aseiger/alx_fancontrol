@@ -66,11 +66,11 @@ DEFAULTS = {
         "stall_after": 10,
         # ---- escalation once a fan is confirmed not cooling -------------
         # A stalled blower is not something we can fix by writing duty, so the
-        # alarm has to reach a person and cut the heat at the source.
+        # alarm has to reach a person. Fans only: there is deliberately no
+        # knob here for touching the GPUs (clocks, power limits, ...).
         "stall_alert_command": "",   # shell command; see README "Escalation"
         "stall_alert_timeout_s": 5.0,
         "stall_alert_repeat_s": 300,  # re-alert while it lasts (0 = once only)
-        "stall_power_limit_w": 0,     # >0: cap the GPU's power on a stall
     },
     "curves": {
         "default":  {"label": "Default",
@@ -208,8 +208,7 @@ def validate(cfg: Config) -> tuple[list[str], list[str]]:
                         ("stall_min_duty", 0, 100),
                         ("stall_after", 1, None),
                         ("stall_alert_timeout_s", 0, None),
-                        ("stall_alert_repeat_s", 0, None),
-                        ("stall_power_limit_w", 0, None)):
+                        ("stall_alert_repeat_s", 0, None)):
         if key not in c:
             continue          # absent = the DEFAULTS value applies (load merges)
         v = c.get(key)

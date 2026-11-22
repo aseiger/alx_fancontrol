@@ -37,11 +37,13 @@ Safety guardrails (enforced in code, see also scripts/protect.py):
   systemd restarts us instead of a hung nvidia-smi freezing every fan.
 - A fan commanded >= `stall_min_duty` whose tach reads 0 RPM for
   `stall_after` polls is reported as `stalled` (log ERROR + status.json) and
-  then ESCALATED: CRITICAL log, optional `stall_alert_command` hook, optional
-  `stall_power_limit_w` cap on the GPU it serves, repeated every
-  `stall_alert_repeat_s` while it lasts. Extra duty is useless against a fan
-  that is not turning, so escalation is about telling someone and cutting the
-  heat at the source.
+  then ESCALATED: CRITICAL log plus the `stall_alert_command` hook, repeated
+  every `stall_alert_repeat_s` while it lasts. Extra duty is useless against
+  a fan that is not turning, so escalation is about getting the event in
+  front of someone. **This daemon controls fans only** — never GPU clocks,
+  power limits or anything else on a card. If a fan fault should also slow a
+  workload down, that response belongs in the alert command the operator
+  writes, not here.
 - OWNERSHIP IS RE-VERIFIED EVERY POLL: `pwmN_enable` can be flipped back to
   2/0 by the firmware, the EC or a second writer while we run, and a duty
   write into a channel we no longer own *succeeds* — the log says "100 %" and
@@ -656,12 +658,17 @@ class Daemon:
         """A fan that cannot cool is not a log line.
 
         Neither of these faults is fixable by writing duty — the fan is either
-        stopped or no longer ours — so escalation does the three things that
-        still have an effect: shout at CRITICAL, hand the event to an operator
-        hook (`stall_alert_command`), and reduce the heat the fan was supposed
-        to carry (`stall_power_limit_w`). Fires on the transition into the
-        fault and then at most every `stall_alert_repeat_s` seconds (0 = once
-        per episode), so a stall that lasts hours nags without flooding.
+        stopped or no longer ours — so escalation does the two things that
+        still have an effect: shout at CRITICAL, and hand the event to an
+        operator hook (`stall_alert_command`). Fires on the transition into
+        the fault and then at most every `stall_alert_repeat_s` seconds
+        (0 = once per episode), so a stall that lasts hours nags without
+        flooding.
+
+        And it deliberately stops there. This is a fan controller: what the
+        box should do with its GPUs when a fan fails is an operator decision,
+        expressible in the alert command, not something the daemon does to
+        somebody's running job on its own initiative.
 
         `eps` is the episode map for THIS kind of fault: a tach stall ends
         when the fan spins again, an ownership loss ends when the channel
@@ -678,7 +685,6 @@ class Daemon:
             self.log.critical("ESCALATING %s (%s): %s — more duty cannot fix a "
                               "fan that is not turning", fan, kind, detail)
         self._alert(cfg, fan, kind, detail)
-        self._power_limit_for(cfg, fan)
 
     def _alert(self, cfg, fan: str, kind: str, detail: str):
         """Run `stall_alert_command` (a shell one-liner: mail, MQTT publish,
@@ -710,60 +716,6 @@ class Daemon:
         else:
             self.log.error("alert command for %s (%s) failed: %s — the fault "
                            "stands, nothing else was notified", fan, kind, out)
-
-    def _power_limit_for(self, cfg, fan: str):
-        """Cut the heat at the source: a card whose blower stopped must not
-        keep asking for its full power budget.
-
-        Opt-in (`stall_power_limit_w`, default 0 = off), because throttling
-        somebody's inference job is a bigger call than spinning a fan. The
-        config addresses GPUs by PCI bus (stable), nvidia-smi -pl by index, so
-        the mapping is looked up on the spot. Best effort: a card that rejects
-        the limit must not cost us the alert.
-        """
-        watts = self._cfg_num(cfg, "stall_power_limit_w", 0.0)
-        if watts <= 0:
-            return
-        buses = self._gpu_buses_on(cfg, fan)
-        if not buses:
-            self.log.warning("power limit for %s: no GPU source is assigned to "
-                             "this fan, cannot cap anything", fan)
-            return
-        try:
-            idx = hwmon.gpu_indices(timeout=self._smi_timeout())
-        except Exception as e:          # hung/offline nvidia-smi must not bite
-            self.log.error("cannot map GPUs to nvidia-smi indices for the "
-                           "power limit on %s: %s", fan, e)
-            return
-        for bus in sorted(buses):
-            i = idx.get(bus)
-            if i is None:
-                self.log.warning("GPU %s (fan %s) has no nvidia-smi index — "
-                                 "not power-capped", bus, fan)
-                continue
-            ok, out = hwmon.run_quiet(
-                ["nvidia-smi", "-i", i, "-pl", str(int(watts))],
-                timeout=self._smi_timeout())
-            if ok:
-                self.log.critical("power-capped GPU %s (index %s) to %d W "
-                                  "because fan %s is not cooling", bus, i,
-                                  int(watts), fan)
-            else:
-                self.log.error("power cap on GPU %s (index %s) failed: %s",
-                               bus, i, out)
-
-    @staticmethod
-    def _gpu_buses_on(cfg, fan: str) -> set[str]:
-        """PCI buses of the enabled GPU assignments that drive `fan`."""
-        out: set[str] = set()
-        for a in (cfg.assignments.values() if cfg else []):
-            if not isinstance(a, dict) or not a.get("enabled", True):
-                continue
-            if fan in (a.get("fans") or []):
-                src = str(a.get("source") or "")
-                if src.startswith("gpu:"):
-                    out.add(hwmon.norm_bus(src[4:]))
-        return out
 
     # -------------------------------------------------------- takeover --
 

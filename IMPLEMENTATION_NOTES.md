@@ -645,3 +645,22 @@ ownership fault keeps alerting while a tach spins; power cap fires when asked
 and never by default; a fan with no GPU source says so instead of pretending;
 degraded mode (`cfg=None`) still verifies; junk escalation values fall back.
 Suite: **179 passed** (was 165).
+
+*(Addendum, same day: **the GPU power-cap was removed** — `stall_power_limit_w`,
+`Daemon._power_limit_for()`, its call in `_escalate()`, and `hwmon.gpu_indices()`
+(which existed only to translate bus→index for `-pl`). It shipped in this PR as
+opt-in, default off, guarded by an early return, and never once run on this box
+(all four cards still at their 250 W default) — and that was still the wrong
+answer. "Off by default" is a promise about the config; it is not the same as
+*unable*, and a fan daemon holding a lever into the GPUs' power budget is a
+surface that some future config edit, copied config, or well-meant `--set 150`
+walks straight into. A fan error should be a fan error: detect it, reclaim the
+channel, shout, reach the operator hook — stop. If a fault should also slow a
+workload, that response lives in `stall_alert_command`, where whoever wrote it
+chose the blast radius and it leaves a log line of its own. The capability is
+now asserted *absent*: `test_a_fan_fault_never_reaches_for_the_gpu` runs a full
+stall episode and fails if the daemon shells out to anything with no hook
+configured, if the knob reappears in `DEFAULTS`, or if `-pl`/`power.limit` shows
+up anywhere in `daemon.py`. Suite: **177 passed** (179 − 3 cap tests + 1
+capability-absence test). The paragraphs above describe what shipped earlier on
+2026-11-22 and are kept as a dated record; this addendum is what is true now.)*

@@ -224,7 +224,6 @@ automatically on load — the TUI re-saves them as v2 on first open.
 | `config.stall_alert_command` | shell command run when a fan fault starts and again when it clears (default `""` = off). Event arrives in the environment: `ALX_FAN`, `ALX_STATE`, `ALX_DETAIL`, `ALX_DUTY_PCT`, `ALX_RPM`, `ALX_CONFIG` |
 | `config.stall_alert_timeout_s` | how long the alert command may run (default 5). Longer than that and it is killed with its process group — the loop that keeps the *other* fans alive is not negotiable |
 | `config.stall_alert_repeat_s` | re-alert every N seconds while a fault persists (default 300; `0` = once per episode) |
-| `config.stall_power_limit_w` | **default 0 = off.** >0 caps the GPU(s) served by a faulted fan to that wattage via `nvidia-smi -pl`, because the fan cannot be made to turn. Must be inside the card's range — check with `nvidia-smi -q -d POWER` (this box's V100-PCIE: 100–250 W) |
 | `sources.*.kind` | `hwmon` or `nvidia` |
 | `sources.*.chip` / `.temp` / `.chip_index` | hwmon source: chip **name prefix** (never `hwmonN` — indices reshuffle across reboots), temp index, and which instance of a duplicated prefix (two `k10temp` packages on this box → `chip_index` 0/1) |
 | `sources.*.pci_bus` | nvidia source: normalized PCI bus, e.g. `08:00.0` |
@@ -295,9 +294,10 @@ Behavior:
   stays up until enable really reads `1` again — a successful duty write is
   *not* evidence the fault is gone.
 - **A fan that cannot cool escalates** (see
-  [Escalation](#escalation-what-happens-when-a-fan-cannot-cool)): tach
-  stall and ownership loss both fire an alert hook and can cap the GPU's
-  power, because more duty is not an available answer to either.
+  [Escalation](#escalation-what-happens-when-a-fan-cannot-cool)): a tach
+  stall and an ownership loss both shout CRITICAL and reach the operator
+  hook, because more duty is not an available answer to either. Nothing more:
+  the daemon's reach ends at the fan header.
 - A GPU reading below `gpu_temp_min_valid_c` (default 15 °C) counts as "no
   reading", never as "ice cold": a card that dropped off the bus reports 0 °C.
 - Fan write fails → keep last duty, log first + every 10th failure,
@@ -375,12 +375,17 @@ Each one, on the transition into the fault and then at most every
    Bounded by `stall_alert_timeout_s` (killed with its process group), and a
    failing hook is logged but never retried into a flood: the fault is still
    reported by the log and status.
-3. **`stall_power_limit_w`** (opt-in) caps the GPU(s) that fan serves:
-   `nvidia-smi -i <index> -pl <watts>`. Off by default — throttling someone's
-   inference job is not the daemon's call to make. PCI bus → nvidia-smi index
-   is resolved at the moment of the fault (bus ids are stable, indices are
-   not), and a card that rejects the value only costs a log line. Fans driven
-   by a non-GPU source cannot be capped, and say so rather than pretending.
+
+**That is all escalation does — this daemon controls fans, and nothing else.**
+It has no code path to a GPU power limit, clock, or persistence setting, and
+there is deliberately no config knob for one: "off by default" is not the same
+as unable. If a fan fault should also slow a workload down, that response
+belongs in `stall_alert_command` — a command you write, that logs what it did,
+and whose blast radius you chose:
+
+```json
+"stall_alert_command": "logger -t alx-fan '$ALX_FAN $ALX_STATE'; nvidia-smi -pl 120"
+```
 
 ### status.json
 

@@ -36,7 +36,18 @@ Safety guardrails (enforced in code, see also scripts/protect.py):
   watchdog thread exits (`watchdog_seconds`) if no poll completes, so
   systemd restarts us instead of a hung nvidia-smi freezing every fan.
 - A fan commanded >= `stall_min_duty` whose tach reads 0 RPM for
-  `stall_after` polls is reported as `stalled` (log ERROR + status.json).
+  `stall_after` polls is reported as `stalled` (log ERROR + status.json) and
+  then ESCALATED: CRITICAL log, optional `stall_alert_command` hook, optional
+  `stall_power_limit_w` cap on the GPU it serves, repeated every
+  `stall_alert_repeat_s` while it lasts. Extra duty is useless against a fan
+  that is not turning, so escalation is about telling someone and cutting the
+  heat at the source.
+- OWNERSHIP IS RE-VERIFIED EVERY POLL: `pwmN_enable` can be flipped back to
+  2/0 by the firmware, the EC or a second writer while we run, and a duty
+  write into a channel we no longer own *succeeds* — the log says "100 %" and
+  the fan sits parked, because this board parks headers it owns. So each poll
+  re-reads `pwmN_enable` (and `pwmN`) for every channel we hold, reclaims /
+  re-asserts on any drift, and treats the loss as an escalation.
 - Takeover from pwmN_enable=2 records the original value and restores it
   EXACTLY on clean exit. Opt in to taking over a channel whatever its
   state with per-assignment `"force_takeover": true`.
@@ -108,6 +119,13 @@ class Daemon:
         self._missing_count: dict[str, int] = {}
         self._refuse_count: dict[str, int] = {}
         self._stall_count: dict[str, int] = {}
+        # fan -> monotonic time of the last escalation for the current episode
+        self._stall_eps: dict[str, float] = {}
+        self._lost_eps: dict[str, float] = {}
+        # fan -> consecutive polls on which we did NOT hold the channel
+        self._lost_count: dict[str, int] = {}
+        self._drift_count: dict[str, int] = {}
+        self._enable_unreadable: dict[str, int] = {}
         self._write_fail_count: dict[str, int] = {}
         self._gpu_fail_count = 0
         self._gpu_warned = False
@@ -375,6 +393,9 @@ class Daemon:
             if isinstance(a, dict) and a.get("enabled", True)
             and a.get("force_takeover")
             for f in a.get("fans", [])}
+        # Do we still OWN these channels? Checked before any duty is computed
+        # so a reclaimed channel gets its real target this same poll.
+        self._verify_channels(cfg)
         # Pass 1: every enabled assignment computes the duty its source
         # requests (its own curve, clamped by its own floor/ceiling).
         # A fan may be requested by SEVERAL assignments — pass 2 drives
@@ -447,7 +468,12 @@ class Daemon:
             new = curve.rate_limit(self._duty.get(fan), tgt, max_rate)
             if new != self._duty.get(fan):
                 self._write_fan(cfg, fan, new, t, src_id)
-            if self._fan_state.get(fan) != "write-error":
+            # write-error and ownership-lost stay visible: they describe the
+            # channel, not this poll's duty decision, and status.json is where
+            # an operator looks DURING the fault (a reclaim that keeps failing
+            # must not read as "ok")
+            if self._fan_state.get(fan) not in ("write-error",
+                                                "ownership-lost"):
                 self._fan_state[fan] = "failsafe" if failsafe else "ok"
         self._check_fans(cfg)
 
@@ -455,7 +481,11 @@ class Daemon:
         """Read one tach per controlled fan: cache it for status.json and
         alarm when we command real duty but the tach says the fan is not
         turning (stalled, tach pin unplugged, or a header the firmware took
-        back). Commanded duty alone never proves that anything cools."""
+        back). Commanded duty alone never proves that anything cools.
+
+        A confirmed stall escalates (`_escalate`): we cannot fix a stopped fan
+        by asking for more duty, so what is left is to reach a person and to
+        reduce the heat the fan is supposed to carry."""
         c = cfg.config
         try:
             min_duty = float(c.get("stall_min_duty", 20))
@@ -472,12 +502,268 @@ class Daemon:
                 self._stall_count[fan] = n
                 if n >= after:
                     self._fan_state[fan] = "stalled"
+                    self._escalate(cfg, fan, "stalled",
+                                   f"tach {tach} reads 0 RPM at {duty}% duty "
+                                   f"for {n} polls", self._stall_eps)
                 if n == after or n % after == 0:
                     self.log.error(
                         "FAN %s STALLED: commanding %d%% but tach %s reads "
                         "0 RPM for %d polls", fan, duty, tach, n)
             else:
                 self._stall_count.pop(fan, None)
+                if fan in self._stall_eps:
+                    self.log.warning("FAN %s RECOVERED: tach %s reads %s RPM "
+                                     "again", fan, tach, self._rpm[fan])
+                    self._stall_eps.pop(fan, None)
+                    self._alert(cfg, fan, "recovered",
+                                f"tach {tach} reads {self._rpm[fan]} RPM again")
+
+    # ------------------------------------------- ownership re-verification --
+
+    def _verify_channels(self, cfg):
+        """Re-check EVERY poll that each channel we took over is still ours.
+
+        `pwmN` is a plain sysfs file: the firmware/EC can flip `pwmN_enable`
+        back to 2 (or 0) at any moment — a BIOS polling loop, an EC watchdog,
+        a hot-replug, another controller — and this board then parks the
+        header wherever its policy wants, including 0 %. A duty write into a
+        channel we no longer own *succeeds*: the log cheerfully reports
+        "write it8792:pwm1 = 100%" while the fan stays stopped and the card
+        heats, which is precisely how a GPU blower ends up stuck at 0 RPM with
+        a daemon that looks healthy. Commanded duty is not ownership.
+
+        So: re-read `pwmN_enable`, reclaim on any loss, and re-assert the duty
+        too (with a second writer our remembered duty can differ from what the
+        chip holds, and `new != self._duty[fan]` would then skip the write
+        forever, pinning the fan at someone else's value).
+
+        Re-asserting every poll is deliberate — an EC that steals the header
+        every second has to be beaten every second. Only the LOG is
+        rate-limited. `--dry-run` still detects and reports, but writes
+        nothing.
+        """
+        for fan in sorted(self._taken_over):
+            res = hwmon.resolve_fan(fan, self._chips, self.root)
+            if res is None:
+                continue          # _write_fan already reports unresolved channels
+            chip_dir, pwm = res
+            en = hwmon.get_enable(chip_dir, pwm)
+            if en == hwmon.ENABLE_MANUAL:
+                if fan in self._lost_count:
+                    self.log.warning("ownership of %s re-established "
+                                     "(pwm%d_enable is 1 again)", fan, pwm)
+                    self._lost_count.pop(fan, None)
+                    # cleared here, since pass 2 deliberately leaves
+                    # ownership-lost alone; pass 2 re-decides ok/failsafe below
+                    self._fan_state[fan] = "ok"
+                    if fan in self._lost_eps:
+                        self._lost_eps.pop(fan, None)
+                        self._alert(cfg, fan, "ownership-recovered",
+                                    f"pwm{pwm}_enable reads 1 again")
+                self._enable_unreadable.pop(fan, None)
+                self._reassert_duty(fan, chip_dir, pwm)
+                continue
+            if en is None:
+                # Cannot read enable. Do NOT write enable blind: we do not
+                # know who holds it. The tach alarm still covers the fan.
+                n = self._enable_unreadable.get(fan, 0) + 1
+                self._enable_unreadable[fan] = n
+                if n == 1 or n % 30 == 0:
+                    self.log.warning("cannot read pwm%d_enable for %s (%d "
+                                     "polls in a row) — ownership unconfirmed",
+                                     pwm, fan, n)
+                continue
+            self._lose_channel(cfg, fan, chip_dir, pwm, en)
+
+    def _lose_channel(self, cfg, fan: str, chip_dir, pwm: int, en: int):
+        """The firmware/EC took a channel back while we were running."""
+        n = self._lost_count.get(fan, 0) + 1
+        self._lost_count[fan] = n
+        if n == 1 or n % 30 == 0:
+            self.log.critical(
+                "OWNERSHIP LOST on %s: pwm%d_enable reads %d, not 1 — the "
+                "firmware took the channel back, so our duty writes are "
+                "IGNORED and the fan is now wherever its policy leaves it "
+                "(tach last read %s RPM; on this board that can be 0). "
+                "Reclaiming every poll until it holds (%d polls in a row).",
+                fan, pwm, en, self._rpm.get(fan), n)
+        rpm = self._rpm.get(fan)
+        # Re-run the full takeover path, insisting on a header the firmware
+        # left DISABLED: we held it manual, so a 0 here is theft, not intent.
+        # Forget the remembered duty so the first write after reclaiming is
+        # the real target, not a rate-limited crawl from a value the chip
+        # never received.
+        self._taken_over.discard(fan)
+        self._duty.pop(fan, None)
+        self._rpm.pop(fan, None)
+        self._stall_count.pop(fan, None)
+        self._takeover(fan, insist=True)
+        # AFTER the takeover attempt: a successful one ends by setting "ok",
+        # which would erase the fault we are reporting. A failed one keeps its
+        # own write-error state, which is the more precise truth.
+        if fan in self._taken_over:
+            self._fan_state[fan] = "ownership-lost"
+        self._escalate(cfg, fan, "ownership-lost",
+                       f"pwm{pwm}_enable reads {en}, not 1 — our duty writes "
+                       f"were being ignored (tach last read {rpm} RPM)",
+                       self._lost_eps)
+
+    def _reassert_duty(self, fan: str, chip_dir, pwm: int):
+        """Re-write `pwmN` if the chip no longer holds what we wrote."""
+        want_pct = self._duty.get(fan)
+        if want_pct is None:
+            return
+        want = curve.pct_to_raw255(want_pct)
+        have = hwmon.read_duty_raw(chip_dir, pwm)
+        if have is None or have == want:
+            if fan in self._drift_count:
+                self.log.info("duty on %s is back to what we wrote (raw %d)",
+                              fan, want)
+                self._drift_count.pop(fan, None)
+            return
+        n = self._drift_count.get(fan, 0) + 1
+        self._drift_count[fan] = n
+        if n == 1 or n % 30 == 0:
+            self.log.warning("duty on %s reads raw %d but we wrote raw %d "
+                             "(%d polls in a row) — another writer? "
+                             "re-asserting", fan, have, want, n)
+        if self.dry_run:
+            return
+        try:
+            hwmon.write_duty(chip_dir, pwm, want)
+        except OSError as e:
+            self._fan_state[fan] = "write-error"
+            self.log.error("re-asserting duty on %s failed: %s — keeping last "
+                           "duty, retrying", fan, e)
+
+    @staticmethod
+    def _cfg_num(cfg, key: str, default: float) -> float:
+        """A config number that cannot break an escalation path.
+
+        `cfg` can legitimately be None (degraded mode, where the file is
+        invalid by definition) and any value in it can be any type, so the
+        safety path falls back to the default rather than raising out of a
+        poll that is trying to save a fan."""
+        try:
+            return float((cfg.config if cfg else {}).get(key, default))
+        except (TypeError, ValueError, AttributeError):
+            return float(default)
+
+    # --------------------------------------------------------- escalation --
+
+    def _escalate(self, cfg, fan: str, kind: str, detail: str,
+                  eps: dict[str, float]):
+        """A fan that cannot cool is not a log line.
+
+        Neither of these faults is fixable by writing duty — the fan is either
+        stopped or no longer ours — so escalation does the three things that
+        still have an effect: shout at CRITICAL, hand the event to an operator
+        hook (`stall_alert_command`), and reduce the heat the fan was supposed
+        to carry (`stall_power_limit_w`). Fires on the transition into the
+        fault and then at most every `stall_alert_repeat_s` seconds (0 = once
+        per episode), so a stall that lasts hours nags without flooding.
+
+        `eps` is the episode map for THIS kind of fault: a tach stall ends
+        when the fan spins again, an ownership loss ends when the channel
+        comes back to manual mode. Sharing one map would let a spinning tach
+        "recover" an ownership fault we are still losing every poll.
+        """
+        now = time.monotonic()
+        last = eps.get(fan)
+        repeat = self._cfg_num(cfg, "stall_alert_repeat_s", 300.0)
+        if last is not None and (repeat <= 0 or now - last < repeat):
+            return
+        eps[fan] = now
+        if last is None:
+            self.log.critical("ESCALATING %s (%s): %s — more duty cannot fix a "
+                              "fan that is not turning", fan, kind, detail)
+        self._alert(cfg, fan, kind, detail)
+        self._power_limit_for(cfg, fan)
+
+    def _alert(self, cfg, fan: str, kind: str, detail: str):
+        """Run `stall_alert_command` (a shell one-liner: mail, MQTT publish,
+        desktop notification, ...). The event is passed in the environment:
+        ALX_FAN, ALX_STATE (stalled | ownership-lost | recovered |
+        ownership-recovered), ALX_DETAIL, ALX_DUTY_PCT, ALX_RPM, ALX_CONFIG.
+
+        Best effort and bounded by `stall_alert_timeout_s`: the poll loop is
+        what keeps every OTHER fan alive, so a hung alert script has to cost
+        at most its timeout, never the loop."""
+        cmd = cfg.config.get("stall_alert_command") if cfg else None
+        if not isinstance(cmd, str) or not cmd.strip():
+            return
+        timeout = self._cfg_num(cfg, "stall_alert_timeout_s", 5.0)
+        env = dict(os.environ)
+        env.update({
+            "ALX_FAN": fan,
+            "ALX_STATE": kind,
+            "ALX_DETAIL": detail,
+            "ALX_DUTY_PCT": "" if self._duty.get(fan) is None
+                            else str(self._duty[fan]),
+            "ALX_RPM": "" if self._rpm.get(fan) is None else str(self._rpm[fan]),
+            "ALX_CONFIG": str(self.cfg_path),
+        })
+        ok, out = hwmon.run_quiet(["/bin/sh", "-c", cmd],
+                                  timeout=timeout or None, env=env)
+        if ok:
+            self.log.info("alert command for %s (%s): %s", fan, kind, out)
+        else:
+            self.log.error("alert command for %s (%s) failed: %s — the fault "
+                           "stands, nothing else was notified", fan, kind, out)
+
+    def _power_limit_for(self, cfg, fan: str):
+        """Cut the heat at the source: a card whose blower stopped must not
+        keep asking for its full power budget.
+
+        Opt-in (`stall_power_limit_w`, default 0 = off), because throttling
+        somebody's inference job is a bigger call than spinning a fan. The
+        config addresses GPUs by PCI bus (stable), nvidia-smi -pl by index, so
+        the mapping is looked up on the spot. Best effort: a card that rejects
+        the limit must not cost us the alert.
+        """
+        watts = self._cfg_num(cfg, "stall_power_limit_w", 0.0)
+        if watts <= 0:
+            return
+        buses = self._gpu_buses_on(cfg, fan)
+        if not buses:
+            self.log.warning("power limit for %s: no GPU source is assigned to "
+                             "this fan, cannot cap anything", fan)
+            return
+        try:
+            idx = hwmon.gpu_indices(timeout=self._smi_timeout())
+        except Exception as e:          # hung/offline nvidia-smi must not bite
+            self.log.error("cannot map GPUs to nvidia-smi indices for the "
+                           "power limit on %s: %s", fan, e)
+            return
+        for bus in sorted(buses):
+            i = idx.get(bus)
+            if i is None:
+                self.log.warning("GPU %s (fan %s) has no nvidia-smi index — "
+                                 "not power-capped", bus, fan)
+                continue
+            ok, out = hwmon.run_quiet(
+                ["nvidia-smi", "-i", i, "-pl", str(int(watts))],
+                timeout=self._smi_timeout())
+            if ok:
+                self.log.critical("power-capped GPU %s (index %s) to %d W "
+                                  "because fan %s is not cooling", bus, i,
+                                  int(watts), fan)
+            else:
+                self.log.error("power cap on GPU %s (index %s) failed: %s",
+                               bus, i, out)
+
+    @staticmethod
+    def _gpu_buses_on(cfg, fan: str) -> set[str]:
+        """PCI buses of the enabled GPU assignments that drive `fan`."""
+        out: set[str] = set()
+        for a in (cfg.assignments.values() if cfg else []):
+            if not isinstance(a, dict) or not a.get("enabled", True):
+                continue
+            if fan in (a.get("fans") or []):
+                src = str(a.get("source") or "")
+                if src.startswith("gpu:"):
+                    out.add(hwmon.norm_bus(src[4:]))
+        return out
 
     # -------------------------------------------------------- takeover --
 
@@ -510,7 +796,7 @@ class Daemon:
             getattr(self.log, level)("%s (%d polls in a row)", msg, n)
         self._fan_state[fan] = state
 
-    def _takeover(self, fan: str):
+    def _takeover(self, fan: str, insist: bool = False):
         if fan in self._taken_over:
             return
         res = hwmon.resolve_fan(fan, self._chips, self.root)
@@ -544,15 +830,24 @@ class Daemon:
                                  "mode (foreign owner) — taking it over as "
                                  "configured", fan)
         if en == hwmon.ENABLE_DISABLED:
-            if fan not in self._force_fans:
+            if fan not in self._force_fans and not insist:
                 self._refuse(fan, "disabled", "warning",
                              f"channel {fan} disabled (enable=0) — skipping")
                 return
-            self.log.warning("force_takeover: %s was disabled (enable=0) — "
-                             "enabling it as configured", fan)
+            if insist and fan not in self._force_fans:
+                self.log.critical("%s was left disabled (enable=0) while we "
+                                  "hold it — enabling it: a header parked at 0 "
+                                  "cools nothing", fan)
+            else:
+                self.log.warning("force_takeover: %s was disabled (enable=0) — "
+                                 "enabling it as configured", fan)
         # what to hand back on exit: the value recorded before WE first took
-        # it (from the marker), not the 1 we are about to write
+        # it (from the marker), not the 1 we are about to write. Kept across a
+        # mid-run reclaim, so an EC that steals and releases the header still
+        # gets the board's original setting back, not our 1.
         orig = self._marker_orig.get(fan)
+        if orig is None:
+            orig = self._orig_enable.get(fan)
         if orig is None:
             orig = hwmon.ENABLE_FIRMWARE if en == hwmon.ENABLE_MANUAL else en
         if self.dry_run:
@@ -607,7 +902,12 @@ class Daemon:
             self._fan_state[fan] = "write-error"
             return
         self._duty[fan] = new_pct
-        self._fan_state[fan] = "ok"
+        # An unresolved ownership fault stays up until _verify_channels sees
+        # enable back at 1: a duty write into a header the firmware holds also
+        # "succeeds", so a successful write is not evidence that the fault went
+        # away (that illusion is what hid the original stuck-at-0 incident).
+        if self._fan_state.get(fan) != "ownership-lost":
+            self._fan_state[fan] = "ok"
         self.log.info("write %s = %3d%% (raw %d)  [%s = %s]",
                       fan, new_pct, raw, label, tstr)
 
@@ -767,7 +1067,16 @@ class Daemon:
             if n >= after:
                 data["errors"][f"stalled:{fan}"] = (
                     f"commanding {self._duty.get(fan)}%% but tach reads "
-                    f"0 RPM for {n} polls")
+                    f"0 RPM for {n} polls"
+                    + (" — ESCALATED" if fan in self._stall_eps else ""))
+        for fan, n in sorted(self._lost_count.items()):
+            data["errors"][f"ownership-lost:{fan}"] = (
+                f"pwmN_enable left manual mode ({n} poll(s)) — the firmware "
+                f"took it back; duty writes before the reclaim were ignored")
+        for fan, n in sorted(self._drift_count.items()):
+            data["errors"][f"duty-drift:{fan}"] = (
+                f"pwmN does not hold the duty we wrote ({n} polls) — second "
+                f"writer? re-asserting every poll")
         try:
             status_mod.write_status(status_mod.status_path_for(self.cfg_path),
                                     data)
@@ -925,11 +1234,18 @@ class Daemon:
         for fan in sorted(self._degraded_fans):
             self._takeover(fan)
         while not self._stop:
+            # especially here: a header the firmware takes back can no longer
+            # be raised by us, and degraded mode is exactly when nobody is
+            # watching. cfg is None (that is why we are here), so escalation
+            # runs on defaults.
+            self._verify_channels(None)
             for fan in sorted(self._taken_over):
                 if self._duty.get(fan) != duty:
                     self._write_fan(None, fan, duty, None,
                                     "fail-safe (invalid config)")
-                self._fan_state[fan] = "failsafe"
+                if self._fan_state.get(fan) not in ("write-error",
+                                                    "ownership-lost"):
+                    self._fan_state[fan] = "failsafe"
             self._write_status(None)
             self._last_tick = time.time()
             self._beat(None)
@@ -981,6 +1297,8 @@ class Daemon:
         """systemd keep-alive + a one-line status (both best effort)."""
         if self._degraded:
             state = "DEGRADED (invalid config, fail-safe duty)"
+        elif any(v == "ownership-lost" for v in self._fan_state.values()):
+            state = "OWNERSHIP LOST (firmware took a fan channel back)"
         elif any(v == "stalled" for v in self._fan_state.values()):
             state = "FAN STALLED"
         elif any(v == "failsafe" for v in self._fan_state.values()):

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alx-fancontrol"
-version = "0.2.1"
+version = "0.3.0"
 description = "TUI-first fan control daemon: hwmon + nvidia-smi sources, piecewise-linear curves"
 requires-python = ">=3.11"
 dependencies = []                     # daemon is pure stdlib

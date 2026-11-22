@@ -220,7 +220,11 @@ automatically on load — the TUI re-saves them as v2 on first open.
 | `config.gpu_temp_min_valid_c` | **default 15** — a GPU reading below this is not a temperature (a card that dropped off the bus reports 0 °C), so it counts as "no reading" |
 | `config.smi_timeout_s` | nvidia-smi timeout in seconds (default 3, `0` = no timeout). A hung nvidia-smi is killed and NOT waited on; a short backoff keeps hung children from piling up |
 | `config.watchdog_seconds` | poll-loop watchdog (default 30, `0` = off). If no poll completes in time the daemon exits with status 70 so systemd restarts it — fans keep their last duty and are reclaimed on startup |
-| `config.stall_min_duty` / `config.stall_after` | stalled-fan alarm: tach reads ~0 RPM while we command ≥ this duty for this many polls (default 20 % / 10 polls) → `state: "stalled"` + log ERROR + `status.json` `errors` |
+| `config.stall_min_duty` / `config.stall_after` | stalled-fan alarm: tach reads ~0 RPM while we command ≥ this duty for this many polls (default 20 % / 10 polls) → `state: "stalled"` + log ERROR + `status.json` `errors`, then **escalates** (see [Escalation](#escalation-what-happens-when-a-fan-cannot-cool)) |
+| `config.stall_alert_command` | shell command run when a fan fault starts and again when it clears (default `""` = off). Event arrives in the environment: `ALX_FAN`, `ALX_STATE`, `ALX_DETAIL`, `ALX_DUTY_PCT`, `ALX_RPM`, `ALX_CONFIG` |
+| `config.stall_alert_timeout_s` | how long the alert command may run (default 5). Longer than that and it is killed with its process group — the loop that keeps the *other* fans alive is not negotiable |
+| `config.stall_alert_repeat_s` | re-alert every N seconds while a fault persists (default 300; `0` = once per episode) |
+| `config.stall_power_limit_w` | **default 0 = off.** >0 caps the GPU(s) served by a faulted fan to that wattage via `nvidia-smi -pl`, because the fan cannot be made to turn. Must be inside the card's range — check with `nvidia-smi -q -d POWER` (this box's V100-PCIE: 100–250 W) |
 | `sources.*.kind` | `hwmon` or `nvidia` |
 | `sources.*.chip` / `.temp` / `.chip_index` | hwmon source: chip **name prefix** (never `hwmonN` — indices reshuffle across reboots), temp index, and which instance of a duplicated prefix (two `k10temp` packages on this box → `chip_index` 0/1) |
 | `sources.*.pci_bus` | nvidia source: normalized PCI bus, e.g. `08:00.0` |
@@ -276,6 +280,24 @@ Behavior:
   config edit — and its fan drops back off the fail-safe as soon as it
   reads again. Fans are taken over even when their source is absent at
   startup, because the fail-safe cannot act on a channel we do not own.
+- **Ownership is re-verified every poll.** `pwmN_enable` is not ours just
+  because we set it once: the firmware/EC can flip it back to `2` (or `0`)
+  at any moment, and a duty write into a channel we no longer own
+  **succeeds** — the log reports `write it8792:pwm1 = 100%` while the fan
+  sits where the firmware left it, which on this board can be 0 %. So each
+  poll re-reads `pwmN_enable` *and* `pwmN` for every channel we hold:
+  enable drifted → CRITICAL `OWNERSHIP LOST`, reclaimed immediately (a
+  header the firmware left disabled is re-enabled: we held it, so a `0`
+  there is theft, not intent) and the remembered duty dropped so the next
+  write is the real target; duty drifted → WARNING + re-asserted (a second
+  writer's value would otherwise stick, because our own write is skipped
+  whenever the target equals the duty we remember). `state=ownership-lost`
+  stays up until enable really reads `1` again — a successful duty write is
+  *not* evidence the fault is gone.
+- **A fan that cannot cool escalates** (see
+  [Escalation](#escalation-what-happens-when-a-fan-cannot-cool)): tach
+  stall and ownership loss both fire an alert hook and can cap the GPU's
+  power, because more duty is not an available answer to either.
 - A GPU reading below `gpu_temp_min_valid_c` (default 15 °C) counts as "no
   reading", never as "ice cold": a card that dropped off the bus reports 0 °C.
 - Fan write fails → keep last duty, log first + every 10th failure,
@@ -326,6 +348,39 @@ Behavior:
   below a hot one's demand. The rate limiter runs **once** per poll,
   bounded by the winning assignment's `max_rate`; ties go to the lowest
   assignment id.
+
+### Escalation: what happens when a fan cannot cool
+
+Two faults mean a card is heating with nothing moving its air, and neither
+is fixable by writing more duty:
+
+| fault | detected | ends when |
+|---|---|---|
+| `stalled` | tach ~0 RPM while commanded ≥ `stall_min_duty` for `stall_after` polls | the tach spins again (`FAN … RECOVERED` + a `recovered` alert) |
+| `ownership-lost` | `pwmN_enable` no longer `1` on a channel we hold (checked every poll) | enable reads `1` again (`ownership … re-established`) |
+
+Each one, on the transition into the fault and then at most every
+`stall_alert_repeat_s` seconds:
+
+1. **CRITICAL** log line, plus `status.json` `errors` (`stalled:…`,
+   `ownership-lost:…`, `duty-drift:…`) and a systemd `STATUS=` that names
+   the fault, so `systemctl status alx_fancontrol` shows it without grep.
+2. **`stall_alert_command`** runs through `/bin/sh -c` with the event in the
+   environment — mail, MQTT publish, a light turning red:
+
+   ```json
+   "stall_alert_command": "mosquitto_pub -t home/fan/alert -m \"$ALX_FAN $ALX_STATE: $ALX_DETAIL\""
+   ```
+
+   Bounded by `stall_alert_timeout_s` (killed with its process group), and a
+   failing hook is logged but never retried into a flood: the fault is still
+   reported by the log and status.
+3. **`stall_power_limit_w`** (opt-in) caps the GPU(s) that fan serves:
+   `nvidia-smi -i <index> -pl <watts>`. Off by default — throttling someone's
+   inference job is not the daemon's call to make. PCI bus → nvidia-smi index
+   is resolved at the moment of the fault (bus ids are stable, indices are
+   not), and a card that rejects the value only costs a log line. Fans driven
+   by a non-GPU source cannot be capped, and say so rather than pretending.
 
 ### status.json
 
@@ -489,6 +544,11 @@ the other. The three guardrails that keep a single controller honest:
    and refusing it forever would pin the fan at its last duty (possibly 0).
    A marker from another boot, or one whose pid is a live alx_fancontrol,
    is never claimed.
+   **The mirror image is checked too:** every channel we *do* hold is
+   re-read every poll, and a `pwmN_enable` that left manual mode is
+   reclaimed and reported (`OWNERSHIP LOST`). Ownership is not a startup
+   event — writing duty into a header the firmware took back succeeds, and
+   the fan does not move.
 2. `--dry-run` writes nothing at all, and the acceptance path for new
    configs is a dry run.
 3. `scripts/protect.py` snapshots/checks the channels *this daemon must
@@ -588,6 +648,23 @@ Additional rules honored everywhere:
   `disabled` means
   `pwmN_enable=0` (BIOS disabled the header); `unresolved` means the
   chip is gone (reboot reshuffle).
+- **`OWNERSHIP LOST` in the log / `state: "ownership-lost"`** — the
+  firmware took a header back while we ran, so our duty writes were being
+  ignored; the daemon reclaims it every poll, but the *cause* is off-box:
+  a BIOS/EC fan policy still managing that header (turn Q-Fan/fan control
+  off for headers the daemon owns), a second controller, or hot-replug.
+  `sudo python3 scripts/protect.py check` names every channel we no longer
+  hold. If it recurs on the same header at boot, the BIOS is re-asserting
+  control after the daemon takes over.
+- **Fan reads 0 RPM but the log says high duty, and nothing recovers it**
+  — that is the incident this feature exists for (11 minutes at 100 %,
+  GPU0 to 73 °C, only a reboot cleared it). Read `status.json`: `enable`
+  ≠ 1 means ownership loss; `enable` = 1 with 0 RPM means the fan or its
+  tach lead. Note these blowers need **~8 % duty to start from a stop**
+  (raw 20; measured sweep archived in
+  `/var/backups/gpu-fanctl-*.tar.gz:fan-calibration.json`) and keep
+  spinning down to ~6 %, so a curve whose bottom sits below 8 % can park a
+  blower that will never restart on its own.
 
 ## Layout
 

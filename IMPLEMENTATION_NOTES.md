@@ -664,3 +664,108 @@ configured, if the knob reappears in `DEFAULTS`, or if `-pl`/`power.limit` shows
 up anywhere in `daemon.py`. Suite: **177 passed** (179 − 3 cap tests + 1
 capability-absence test). The paragraphs above describe what shipped earlier on
 2026-11-22 and are kept as a dated record; this addendum is what is true now.)*
+
+## 21. A stalled fan gets driven, not just described (2026-11-23)
+
+§20 shipped detection and deliberately stopped at the log line: *"more duty
+cannot fix a fan that is not turning"*. On this box that sentence cost a card.
+
+### The live failure
+
+2026-11-23, card 0 (V100-PCIE-32GB, PCI `47:00.0`). Its blower's tach went to
+**0 RPM at 12:00:19** while commanded 60 %. The daemon escalated **within ten
+seconds** — `CRITICAL ESCALATING it8792:pwm1 (stalled)` — and then spent the
+next **nineteen minutes** logging `FAN … STALLED` (1,180 polls) at a card it was
+asking for 80 % of, because asking was all `_check_fans` did. `stall_alert_command`
+was empty, so nobody was told either. GPU 47 stopped answering `nvidia-smi` at
+~12:19 (`FAIL-SAFE: … source unreadable for 180 polls`) and the host went down at
+12:22–12:23 with it — unclean, no `shutdown` record in `wtmp`.
+
+Detection was never the weak part. The response was: §20 had removed the one
+automatic response (the power cap) on the grounds that a response belongs in the
+operator hook, and the hook was never configured. What is left when a fan stops
+is *the header itself*, and the daemon had stopped touching it.
+
+### Changed
+
+- `Daemon._stall_drive(cfg, fan, seen)` — a poll-driven phase machine over the
+  stalled channel: **pin** (`stall_full_duty`, default 100 %) → **kick** (a brief
+  `stall_kick_stop_s` at 0 so a jammed blade can swing free, then
+  `stall_kick_run_s` at full duty, judged by the tach) → `stall_kick_attempts`
+  lunges per round, rounds spaced by `stall_kick_backoff_s` → **cooldown**
+  (`stall_kick_cooldown_s` at full after the tach spins) → hand back to the curve.
+- Pass 2 of `_poll` defers to `self._kick_duty[fan]` instead of the rate limiter
+  while an episode owns the header. The override lives there rather than in
+  `_check_fans`, so highest-wins, takeover and `_write_fan`'s logging/ownership
+  semantics all still apply to a pinned write.
+- `_check_fans` now classifies the tach read (`spinning` / `stopped` / `pulsing`
+  / `unknown`) and calls `_stall_drive` every poll; keeps an episode armed
+  whatever the duty, and stays quiet about a 0 RPM it caused itself.
+- `_lose_channel` drops a pending pulse instead of leaving a 0 in a header it has
+  just lost; `_restore_fan` refuses to hand back a header parked below full while
+  an episode is live.
+- `status.json` gains `fans.<fan>.kick = {phase, attempts}`, so an operator
+  looking *during* the fault sees the daemon working on it, not only recording
+  that it is not turning.
+- `config.py`: seven validated knobs (`stall_full_duty`, `stall_kick`,
+  `stall_kick_attempts|stop_s|run_s|backoff_s|cooldown_s`). `validate()` rejects
+  a non-bool `stall_kick` (a `"false"` string is truthy, and this is the one
+  setting whose default does something physical) and rejects
+  `stall_full_duty < stall_min_duty`.
+
+### Deliberate choices
+
+- **The header is the whole blast radius.** This is not §20's power cap coming
+  back through a side door: pinning and kicking touch `pwmN` and nothing else.
+  `test_a_fan_fault_never_reaches_for_the_gpu` still passes untouched, and
+  `test_the_stall_drive_reaches_the_chip_not_the_gpu` re-asserts the invariant
+  with the new action in the path — a fault shells out to nothing but the hook,
+  and `-pl`/`power.limit` appear nowhere in `daemon.py`. Escalation is unchanged
+  and keeps running underneath; what the box does with an airless GPU is still
+  `stall_alert_command`'s business.
+- **Never parked.** The pulse is the only part of this that can *cause* an
+  overheat, so it is fenced three ways: never on a shared header (dropping a fan
+  two cards share steals air from the other one — helping a stalled card is not
+  licence to hurt a working one), never on a header the firmware currently holds
+  (every write there is ignored, so a pulse would be theatre with a 0 in it), and
+  never left behind on exit. `stall_kick: false` keeps the pin — which cannot
+  cost anything — and turns the pulses off.
+- **Nothing sleeps.** Phases advance on the poll loop, each lasting at least its
+  configured time and at most one poll more. A kick must never cost the other
+  fans more than a poll, for exactly the reason `_alert` bounds its hook.
+- **Bounded attempts, repeating rounds.** A seized winding drawing stall current
+  forever cooks itself and possibly the fan driver, so a round is capped; but a
+  bearing that seizes hot often frees once it stops trying, so the header stays
+  pinned and another round starts after `stall_kick_backoff_s`. Giving up
+  permanently would mean the next dropout is met with the log line that killed
+  card 0.
+
+### Two bugs the tests caught (both real, both pre-fix-of-the-fix)
+
+1. Suppressing the alarm during our own pulse also suppressed **phase
+   advancement** — a fan would sit at 0 forever, which is precisely the failure
+   mode the feature exists to cure. Fixed by classifying the tach read instead of
+   conflating "ours" with "not stopped": `pulsing` advances the clock and only the
+   *alarm* stays quiet.
+2. `_restore_fan` originally compared **its own** `kick_duty` against full, but a
+   phase can advance in the same poll that wrote the pulse — so the 0 was only
+   ever in the chip, and an exit at that instant handed firmware a parked header.
+   Fixed by reading `pwmN` back and comparing the chip.
+
+### Tests
+
+`tests/test_stall_kick.py` (15 tests): pinned past what the curve asked; the pin
+jumps rather than crawling at `max_rate`; the runtime clamp under
+`stall_min_duty`; a pulse that really lands on the chip in the right order;
+attempts bounded and rounds spaced; kick off still pins and never touches 0;
+restart holds full then hands back without a cliff; an exit inside a pulse never
+leaves the header parked (and asserts the test really landed inside one); a
+shared header pinned but never pulsed; no theatre on a firmware-held header;
+validate rejects `full < min` and a non-bool `stall_kick`; `cfg=None` junk still
+pins; `status.json` reports the fight.
+
+New helper `run_clocked()`: kick phases are timed in seconds, so these tests drive
+a virtual clock (each sleep advances `time.monotonic()` by `step`) instead of
+racing the runner — same hermetic contract as `test_safety_net.run_polls`.
+
+Suite: **192 passed** (177 + 15).

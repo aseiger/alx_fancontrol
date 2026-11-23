@@ -512,14 +512,29 @@ top item), so: **keys navigate, clicks focus** fields/tables.
    selected preview source, every point marked `●` and the selected one
    `◆`). The curve knows nothing about floor/ceiling — those are
    per-fan settings (Assign screen: floor % / ceiling % / rate %/poll;
-   the daemon falls back to the global `config` values). Mouse: **drag a `●` point** to move it —
-   clicking empty plot area does nothing. Points are added only from
-   the table: `a` inserts a point **between the selected row and the
-   next** (prompt pre-filled at their midpoint; if the selected row is
-   last it tacks one on at last + 5 °C). Keys: `d` delete, `s` save,
-   `+`/`-` duty ±1, shift+←/→ temp ±1, shift+↑/↓ duty ±5. **Save** (button or `s` — the
-   button can fall below the fold on short terminals) writes the sorted
-   points. On the **Assign** screen `s` likewise saves.
+   the daemon falls back to the global `config` values). Mouse: **drag a
+   `●` point** to move it — clicking empty plot area does nothing. Points
+   are added only from the table: `a` inserts a point **between the
+   selected row and the next** (prompt pre-filled at their midpoint; if the
+   selected row is last it tacks one on at last + 5 °C; on an **empty**
+   curve it asks for the first point, so deleting every point no longer
+   bricks a curve). Keys: `d` delete, `s` save, `+`/`-` duty ±1,
+   shift+←/→ temp ±1, shift+↑/↓ duty ±5.
+   **Curve management** (buttons and keys): **New** (`n`) creates a curve —
+   the id is asked for (assignments reference curves by it, and a collision
+   is refused rather than silently overwriting one), seeded with the
+   built-in default shape so the config stays valid the moment it exists;
+   **Copy** (`c`) duplicates the selected curve *as currently edited*,
+   unsaved point moves included — the usual way to tune "same curve,
+   shifted 5 °C"; **Delete** (`shift+d`) removes an **unused** curve after
+   confirmation and refuses one that assignments still reference, naming
+   them: the daemon skips an assignment whose curve is missing (its fans
+   stay at their last duty), so deleting one in use would silently stop
+   those fans following their curve — re-point them on Assign first. The
+   line beside the label field shows `used by: …` for exactly that reason.
+   **Save** (button or `s` — the button can fall below the fold on short
+   terminals) writes the sorted points **and** the label every picker
+   displays. On the **Assign** screen `s` likewise saves.
 4. **Sources** — read-only live table of the temperature sources
    *detected at runtime* (id, label, kind, chip/bus detail, °C; GPU rows
    show the `nvidia-smi` model). Nothing to configure here: any of them

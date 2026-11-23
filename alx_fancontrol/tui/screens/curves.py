@@ -1,15 +1,34 @@
-"""Curves: points table + live text-plot preview.
+"""Curves: points table + live text-plot preview + curve management.
 
 Left: DataTable of [temp, duty] points — cursor-selectable, bindings:
   a add point (inserted between the selected row and the next one,
   prompt pre-filled at their midpoint; at the end of the curve:
-  last + 5 °C), d delete, +/− nudge duty ±1,
+  last + 5 °C; on an EMPTY curve: the first point), d delete,
+  +/− nudge duty ±1,
   shift+left/right nudge temp ±1, shift+up/down nudge duty ±5.
 Right: a text plot (curve as █ columns, live temperature marker ◄,
 point markers ● with the selected point as ◆) with mouse support:
 drag a ● point to move it. Points are added ONLY from the table —
 clicking the plot never adds anything.
-Save → curves[id].points (sorted) → app.save_config().
+Save → curves[id].points (sorted) + curves[id].label → app.save_config().
+
+Curve management (buttons, and `n` / `c` / `shift+d`):
+  * **New** creates a curve (id + label asked for — the id is what
+    assignments reference, so it is never invented and a collision is
+    refused rather than silently overwriting), seeded with the built-in
+    default shape so the config stays valid and the first `a` has
+    something to insert between;
+  * **Copy** duplicates the curve AS CURRENTLY EDITED (unsaved point moves
+    included) — the normal way to tune "same curve, shifted 5 °C";
+  * **Delete** removes an UNUSED curve after confirmation. A curve that
+    assignments still reference is refused with the list of them named:
+    deleting it would leave those assignments without one (the daemon skips
+    them and their fans sit at their last duty), so re-point them on the
+    Assign screen first. The two built-in curves are refused as well —
+    `config.load()` merges DEFAULTS back in, so deleting one would not
+    survive the next load (audit finding F14).
+A hint line shows which assignments use the selected curve for exactly that
+reason.
 
 The curve knows NOTHING about floor/ceiling: those are per-assignment
 fan settings on the Assign screen (daemon.py: assignment floor_duty /
@@ -17,6 +36,7 @@ max_duty, falling back to the global config floor_duty default).
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 
 from rich.text import Text
@@ -25,9 +45,11 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Label, Select, Static
 
+from alx_fancontrol import config as config_mod
 from alx_fancontrol import curve as curve_mod
 from alx_fancontrol.tui.reader import LiveUpdate
-from alx_fancontrol.tui.screens.base import BaseScreen, sel_value
+from alx_fancontrol.tui.screens.base import (BaseScreen, ConfirmScreen,
+                                             sel_value)
 
 PLOT_W = 58
 PLOT_H = 16
@@ -169,6 +191,82 @@ class PointPromptModal(ModalScreen[tuple[float, int] | None]):
             self.dismiss((t, int(round(d))))
 
 
+class NewCurveModal(ModalScreen[tuple[str, str] | None]):
+    """(id, label) for a new or copied curve.
+
+    The id is asked for rather than invented because assignments reference
+    curves by it, and a collision is refused here instead of quietly
+    overwriting a curve some other fan depends on."""
+
+    ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+    DEFAULT_CSS = """
+    NewCurveModal {
+        align: center middle;
+    }
+    NewCurveModal #nc-box {
+        width: 52;
+        height: auto;
+        border: tall;
+        padding: 1 2;
+    }
+    NewCurveModal .nc-ctx {
+        color: $text-muted;
+    }
+    NewCurveModal #nc-box Button {
+        margin-top: 1;
+        margin-right: 1;
+        width: 18;
+    }
+    """
+
+    def __init__(self, suggested_id: str = "", label: str = "",
+                 context: str = "", taken=()):
+        super().__init__()
+        self.suggested_id = suggested_id
+        self.label = label
+        self.context = context
+        self.taken = set(taken)
+
+    def compose(self):
+        with Vertical(id="nc-box"):
+            yield Label("New curve")
+            if self.context:
+                yield Label(self.context, classes="nc-ctx")
+            yield Input(placeholder="id (letters, digits, - and _)",
+                        id="nc-id", restrict=r"[A-Za-z0-9_-]+",
+                        max_length=24)
+            yield Input(placeholder="label (shown in the pickers)",
+                        id="nc-label", max_length=32)
+            yield Button("Create", id="nc-ok", variant="primary")
+            yield Button("Cancel", id="nc-cancel")
+
+    def on_mount(self):
+        self.query_one("#nc-id", Input).value = self.suggested_id
+        self.query_one("#nc-label", Input).value = self.label
+
+    def on_button_pressed(self, event):
+        if event.button.id == "nc-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "nc-ok":
+            return
+        cid = self.query_one("#nc-id", Input).value.strip()
+        label = self.query_one("#nc-label", Input).value.strip()
+        if not cid:
+            self.notify("Give the curve an id", severity="warning")
+            return
+        if not self.ID_RE.match(cid):
+            self.notify("id: letters, digits, - and _ only",
+                        severity="warning")
+            return
+        if cid in self.taken:
+            self.notify(f"A curve named '{cid}' already exists",
+                        severity="warning")
+            return
+        self.dismiss((cid, label or cid))
+
+
 class CurvePlot(Static):
     """Text plot with mouse: drag a ● point (radius 3 cells) → move it.
     Clicking empty plot area does NOTHING — points are added only from
@@ -242,6 +340,9 @@ class CurveEditorScreen(BaseScreen):
         Binding("a", "add_point", "Add point"),
         Binding("d", "delete_point", "Delete point"),
         Binding("s", "save_curve", "Save curve"),
+        Binding("n", "new_curve", "New curve"),
+        Binding("c", "duplicate_curve", "Copy curve"),
+        Binding("shift+d", "delete_curve", "Delete curve"),
         Binding("+", "nudge_duty_up", "Duty +1"),
         Binding("-", "nudge_duty_down", "Duty -1"),
         Binding("shift+left", "nudge_temp_left", "Temp -1"),
@@ -256,6 +357,26 @@ class CurveEditorScreen(BaseScreen):
     #plot {
         height: 17;
     }
+    /* One row of curve actions. Buttons keep their natural width; the row
+       is pinned to a single control row so nothing stretches. */
+    #curve-manage {
+        height: 3;
+    }
+    #curve-manage Button {
+        width: auto;
+        margin-right: 1;
+    }
+    #curve-label-row {
+        height: 3;
+    }
+    #curve-label {
+        width: 1fr;
+    }
+    #curve-used {
+        width: auto;
+        margin-left: 1;
+        color: $text-muted;
+    }
     """
 
     def content(self) -> Iterator:
@@ -265,11 +386,20 @@ class CurveEditorScreen(BaseScreen):
         with Horizontal():
             with Vertical(id="curve-left"):
                 yield Select([], id="curve-pick", prompt="curve")
+                with Horizontal(id="curve-manage"):
+                    yield Button("New", id="new-curve")
+                    yield Button("Copy", id="dup-curve")
+                    yield Button("Delete", id="del-curve", variant="error")
+                with Horizontal(id="curve-label-row"):
+                    yield Input(placeholder="label (shown in pickers)",
+                                id="curve-label", max_length=32)
+                    yield Static("", id="curve-used")
                 yield DataTable(id="points")
                 yield Static("a add (between selected row & next) · "
                              "d delete · s save · +/− duty ±1 · "
                              "shift+←/→ temp ±1 · shift+↑/↓ duty ±5 · "
-                             "drag ● points (◆ = selected)", classes="hint")
+                             "drag ● points (◆ = selected) · n new · c copy"
+                             " · shift+d delete curve", classes="hint")
             with Vertical(id="curve-right"):
                 yield Select([], id="preview-src", prompt="preview source")
                 yield CurvePlot(self)
@@ -282,15 +412,7 @@ class CurveEditorScreen(BaseScreen):
         table = self.query_one("#points", DataTable)
         table.add_columns(("temp °C", "pt"), ("duty %", "pd"))
         table.cursor_type = "row"  # row events need this
-        pick = self.query_one("#curve-pick", Select)
-        curve_opts = [(c.get("label", cid), cid)
-                      for cid, c in sorted(app.cfg.curves.items())]
-        pick.set_options(curve_opts)
-        if curve_opts:
-            # set_options() resets the selection to blank — without this
-            # the picker shows empty and Save bails with "Pick a curve"
-            # even though the table is showing the first curve's points.
-            pick.value = curve_opts[0][1]
+        curve_opts = self._refresh_curve_options()
         pv = self.query_one("#preview-src", Select)
         src_opts = [(s.label, s.id)
                     for s in sorted(app.sources, key=lambda x: x.id)]
@@ -304,11 +426,137 @@ class CurveEditorScreen(BaseScreen):
         self.pts = [[float(t), float(d)]
                     for t, d in (crv or {}).get("points", [])]
         self._sel_point = self.pts[0] if self.pts else None
+        self.query_one("#curve-label", Input).value = \
+            (crv or {}).get("label", cid or "")
+        self._refresh_used(cid)
         self._refresh()
+
+    def _refresh_curve_options(self, keep: str | None = "") -> list[tuple]:
+        """Rebuild the curve picker (after create/copy/delete) and return
+        its options. `set_options()` resets the selection to blank — which
+        is why first mount has to re-assert it, or Save bails with "Pick a
+        curve" while the table is already showing a curve's points.
+        keep=None means "whatever is selected now" (falling back to the
+        first option when that id is gone)."""
+        pick = self.query_one("#curve-pick", Select)
+        current = keep if keep is not None else sel_value(pick)
+        opts = [(c.get("label", cid), cid)
+                for cid, c in sorted(self.app.cfg.curves.items())]
+        pick.set_options(opts)
+        if opts:
+            values = [v for _l, v in opts]
+            pick.value = current if current in values else opts[0][1]
+        return opts
+
+    def _used_by(self, cid: str) -> list[str]:
+        """Assignments referencing this curve — the reason it cannot simply
+        be deleted."""
+        return sorted(name for name, a in self.app.cfg.assignments.items()
+                      if a.get("curve") == cid)
+
+    def _refresh_used(self, cid):
+        used = self._used_by(cid) if cid else []
+        self.query_one("#curve-used", Static).update(
+            "used by: " + ", ".join(used) if used
+            else "not used by any assignment")
 
     def on_select_changed(self, event: Select.Changed):
         if event.select.id == "curve-pick":
             self._load_curve(sel_value(event.select))
+
+    # ------------------------------------------------------- curve CRUD --
+    @staticmethod
+    def _free_id(base: str, taken) -> str:
+        cid, n = base, 2
+        while cid in taken:
+            cid, n = f"{base}-{n}", n + 1
+        return cid
+
+    def action_new_curve(self):
+        # 'n' / New. Seeded with the built-in default shape: a curve with no
+        # points is invalid (validate() needs >= 1), and seeding also means
+        # there is immediately a row to insert between.
+        self.run_worker(self._new_curve_flow(
+            suggested=self._free_id("newcurve", set(self.app.cfg.curves)),
+            label="",
+            context="seeded with the default curve's points — then drag or "
+                    "nudge them and press s",
+            seed=[list(p) for p in
+                  config_mod.DEFAULTS["curves"]["default"]["points"]]),
+            exclusive=False)
+
+    def action_duplicate_curve(self):
+        # 'c' / Copy — the normal way to tune ("same curve, shifted 5 °C").
+        # Copies what is on screen, unsaved moves included.
+        cid = sel_value(self.query_one("#curve-pick", Select))
+        if not cid:
+            self.notify("Pick a curve to copy first", severity="warning")
+            return
+        lab = self.app.cfg.curves[cid].get("label", cid)
+        self.run_worker(self._new_curve_flow(
+            suggested=self._free_id(f"{cid}-copy", set(self.app.cfg.curves)),
+            label=f"{lab} copy",
+            context=f"copied from '{lab}' as currently edited (unsaved "
+                    "moves included)",
+            seed=[list(p) for p in self._sorted_pts()]), exclusive=False)
+
+    async def _new_curve_flow(self, suggested, label, context, seed):
+        result = await self.app.push_screen_wait(
+            NewCurveModal(suggested_id=suggested, label=label,
+                          context=context, taken=set(self.app.cfg.curves)))
+        if result is None:
+            return
+        cid, lab = result
+        # persisted immediately: the config is the truth and a seeded curve
+        # is valid, so nothing is lost by writing it now
+        self.app.cfg.curves[cid] = {"label": lab, "points": seed}
+        if self.app.save_config(f"Curve '{lab}' created — set its points "
+                                "and press s"):
+            self._refresh_curve_options(keep=cid)
+            self._load_curve(cid)
+
+    def action_delete_curve(self):
+        # shift+d / Delete. A curve assignments still reference is refused by
+        # name: the daemon skips an assignment whose curve is missing (its
+        # fans stay at their last duty), so deleting one is a silent loss of
+        # cooling — re-pointing is the Assign screen's job.
+        cid = sel_value(self.query_one("#curve-pick", Select))
+        if not cid:
+            self.notify("Pick a curve to delete first", severity="warning")
+            return
+        used = self._used_by(cid)
+        if used:
+            self.notify(f"Curve '{cid}' is used by {len(used)} assignment(s): "
+                        f"{', '.join(used)} — re-point them on the Assign "
+                        "screen (2) first", severity="error", timeout=12)
+            return
+        if cid in config_mod.DEFAULTS["curves"]:
+            # config.load() deep-merges DEFAULTS, so a curve the file no
+            # longer has comes back on the next load (daemon hot-reload or
+            # TUI restart). Offering Delete for those two would be a button
+            # that does nothing — the honest answer until the defaults merge
+            # is reworked (audit F14) is to say so.
+            self.notify(f"'{cid}' is a built-in curve: config.load() merges "
+                        "the defaults back in, so deleting it would not "
+                        "stick. It controls nothing on its own — rename its "
+                        "label if it misleads here.",
+                        severity="warning", timeout=12)
+            return
+        self.run_worker(self._delete_curve_flow(cid), exclusive=False)
+
+    async def _delete_curve_flow(self, cid):
+        lab = self.app.cfg.curves[cid].get("label", cid)
+        ok = await self.app.push_screen_wait(ConfirmScreen(
+            f"Delete curve '{lab}'?",
+            ("No assignment uses it. There is no undo in the TUI —",
+             "config.json.bak keeps the previous file."),
+            ok_label="Delete", ok_variant="error"))
+        if not ok:
+            return
+        del self.app.cfg.curves[cid]
+        if self.app.save_config(f"Curve '{lab}' deleted"):
+            opts = self._refresh_curve_options(keep=None)
+            self._load_curve(opts[0][1] if opts else None)
 
     # -------------------------------------------------------------- table
     def _sorted_pts(self):
@@ -350,6 +598,14 @@ class CurveEditorScreen(BaseScreen):
         # ever added from the table.
         sel = self._selected()
         if sel is None:
+            if not self.pts:
+                # An empty curve used to be a dead end: 'a' demanded a
+                # selected row, so the first point could never exist — and
+                # deleting every point of a curve bricked it.
+                self.run_worker(self._add_point(
+                    (40.0, 20), "first point of this curve"),
+                    exclusive=False)
+                return
             self.notify("Select a point row first", severity="warning")
             return
         sp = self._sorted_pts()
@@ -496,9 +752,15 @@ class CurveEditorScreen(BaseScreen):
         # so BaseScreen.on_button_pressed (sidebar nav) also runs for
         # this message — no super() call here (that would double-fire
         # nav actions and double-switch screens).
-        if event.button.id != "save-curve":
-            return
-        self.save_curve()
+        bid = event.button.id
+        if bid == "save-curve":
+            self.save_curve()
+        elif bid == "new-curve":
+            self.action_new_curve()
+        elif bid == "dup-curve":
+            self.action_duplicate_curve()
+        elif bid == "del-curve":
+            self.action_delete_curve()
 
     def action_save_curve(self):
         # 's' binding — the Save button can fall below the fold on short
@@ -521,5 +783,14 @@ class CurveEditorScreen(BaseScreen):
                 self.notify("Duty must be 0-100", severity="error")
                 return
         self.app.cfg.curves[cid]["points"] = pts
-        if self.app.save_config(f"Curve '{cid}' saved"):
+        # the label is part of the same edit: one field, one Save. A blank
+        # field is not an error worth interrupting for — it falls back to
+        # whatever label the curve has, or its id.
+        lab = (self.query_one("#curve-label", Input).value.strip()
+               or self.app.cfg.curves[cid].get("label") or cid)
+        self.app.cfg.curves[cid]["label"] = lab
+        if self.app.save_config(f"Curve '{lab}' saved"):
+            # the picker shows labels, so a rename is only visible once the
+            # options are rebuilt
+            self._refresh_curve_options(keep=cid)
             self._load_curve(cid)

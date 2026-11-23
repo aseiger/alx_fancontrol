@@ -9,8 +9,8 @@ the real TUI against the synthetic machine (`tests/fake_machine.py`) and
 asserted on the file written to disk. Probes were deleted after running;
 the findings below cite the evidence each one produced.
 **Tree:** `6209746` (2026-11-23).
-**Status:** step 1 landed — **F2, F3, F8, F9 fixed** (see §D and
-`IMPLEMENTATION_NOTES.md` §22). F4–F7, F10–F13 still open.
+**Status:** steps 1–2 landed — **F2, F3, F7, F8, F9 fixed** (see §D,
+`IMPLEMENTATION_NOTES.md` §22–§23). F4–F6, F10–F13 still open.
 
 ---
 
@@ -24,7 +24,7 @@ when something fails) not at all.
 |---|---|---|---|---|
 | `config.*` globals | 22 | **0** | 0 | **22** |
 | `assignments.*` | 12 | 6 (+`tach` auto) | `enabled` | `failsafe`, `failsafe_duty`, `failsafe_after`, `force_takeover`, `tach` (manual) |
-| `curves.*` | 3 fields | `points` | `label`, `id` | create / delete / rename a curve |
+| `curves.*` | 3 fields | `points`, `label` (step 2) | `id` | delete of an **in-use** curve (refused by design); id rename (out of scope) |
 
 The GUI surface has not moved since the v2 redesign, while the config
 surface has grown from 4 globals (`poll_seconds`, `max_rate`, `floor_duty`,
@@ -97,10 +97,10 @@ rendered on any of the four screens.)
 | `points` | ✅ excellent — table + drag plot + nudges + midpoint insert |
 | `label` | 👁 view only — cannot rename |
 | curve `id` | 👁 view only |
-| **new curve** | ✗ no button, no binding |
-| **duplicate curve** | ✗ |
-| **delete curve** | ✗ |
-| **first point of an empty curve** | ✗ dead end (F7) |
+| **new curve** | ✅ `n` / New (step 2) |
+| **duplicate curve** | ✅ `c` / Copy — copies unsaved edits too (step 2) |
+| **delete curve** | ✅ `shift+d`, unused only, refuses by name (step 2) |
+| **first point of an empty curve** | ✅ `a` prompts (step 2) |
 
 ---
 
@@ -195,11 +195,13 @@ show it on screen. Note the asymmetry: the *global* fail-safe is also
 invisible (F1), so there is no place at all where "what happens if this
 source dies" can be read.
 
-### F7 · Medium-high (bug, partly mitigated) — curves cannot be created, renamed, deleted; an empty curve is unrecoverable
+### F7 · Medium-high (bug, **fixed in step 2**) — curves cannot be created, renamed, deleted; an empty curve is unrecoverable
 
-> Step 1 stopped the *saving* half of this (an empty curve is now refused by
-> `save_config`, so a curve can no longer be bricked by accident); the dead
-> end itself — no first point, no new/duplicate/delete/rename — remains.
+> Step 1 stopped the *saving* half of this (an empty curve is refused by
+> `save_config`); step 2 closed the rest: New / Copy / Delete with a usage
+> guard and `used by: …` hint, label editing, and `a` prompting for the
+> first point of an empty curve. Renaming a curve **id** remains out of scope
+> on purpose — it means rewriting every assignment that references it.
 
 `action_add_point` (`curves.py:346-352`) requires a **selected existing
 point**. Proven: with `points: []`, pressing `a` warns
@@ -288,6 +290,29 @@ all of the excellent explanation lives in the README.
 (sources are discovered at runtime). The GUI is not wrong here, but anyone
 reading the table to learn what to edit will look for a screen that cannot
 exist.
+
+### F14 · Medium — `config.load()` re-injects the built-in curves, so some edits cannot stick *(found in step 2)*
+
+`load()` returns `_deep_merge(DEFAULTS, doc)`. For `config.*` that is the
+feature (a key added in §21 has a value even in a v1 file), but it applies to
+`curves` too: a file with `{"curves": {"mine": …}}` loads as
+`[default, gpu_v100, mine]`, and any save writes both built-ins back.
+
+Two consequences beyond curves:
+
+* **Delete curve** cannot remove `default` / `gpu_v100` — they return on the
+  next load. Step 2 refuses those two with the reason rather than offering a
+  button that silently does nothing.
+* Any future "remove this setting" edit has the same trap: absent-from-file
+  and set-to-default are the same state to the loader, so the GUI cannot
+  express "I deleted it".
+
+Fix belongs with step 4's schema: seed defaults **once** (`seed_if_missing`
+already does exactly that) and have `load()` merge only what the schema marks
+as additive. Not done in step 2 on purpose — a hand-written config that
+references `default` without defining it works today, and replace-semantics
+would turn that into a validation error whose runtime consequence is a skipped
+assignment (fans holding their last duty).
 
 ---
 
@@ -399,9 +424,9 @@ F1 from coming back next time a knob is added — which, given §18→§21 added
 | step | delivers | touches | risk |
 |---|---|---|---|
 | 1 ✅ | F2 clear-override, F3 enable toggle, F9 rename-confirm, F8 validate-before-save | `assign.py`, `app.save_config` | small, local |
-| 2 | F7 curve new/duplicate/delete/label + first point | `curves.py` | small |
+| 2 ✅ | F7 curve new/duplicate/delete/label + first point | `curves.py`, `base.py` (`ConfirmScreen`) | small |
 | 3 | F4 tach editor + no-tach warning + stale-entry cleanup | `assign.py`, `app.py` | medium (safety-relevant) |
-| 4 | F1 Settings screen + `SCHEMA` refactor of `validate()` | `config.py`, new `tui/screens/settings.py`, `base.py`, `app.py` | medium, mostly mechanical |
+| 4 | F1 Settings screen + `SCHEMA` refactor of `validate()` **+ F14 (seed defaults once, don't re-merge on load)** | `config.py`, new `tui/screens/settings.py`, `base.py`, `app.py` | medium, mostly mechanical |
 | 5 | F5 ownership column + `force_takeover` control | `assign.py`, `hwmon.py` (read enable per channel) | medium |
 | 6 | F10 Overview upgrades, F11 config path, F12 input polish, F13 README | `overview.py`, screens, README | low |
 

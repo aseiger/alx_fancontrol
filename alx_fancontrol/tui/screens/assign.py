@@ -29,8 +29,7 @@ from collections.abc import Iterator
 
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
-from textual.widgets import (Button, DataTable, Input, Label, Select, Static,
+from textual.widgets import (Button, DataTable, Input, Select, Static,
                              Switch)
 
 from textual.widgets._select import SelectOverlay
@@ -38,67 +37,9 @@ from textual.widgets._select import SelectOverlay
 from alx_fancontrol import config as config_mod
 from alx_fancontrol import hwmon
 from alx_fancontrol.tui.reader import LiveUpdate
-from alx_fancontrol.tui.screens.base import (BaseScreen, restore_table_cursor,
-                                             sel_value, table_cursor_key,
-                                             table_hover_key)
-
-
-class ConfirmScreen(ModalScreen[bool]):
-    """Yes/no confirmation for one destructive assignment change.
-
-    Every path that changes what the fans do while the daemon is live
-    (delete, disable, rename onto an existing name) asks here, with the
-    consequence spelled out rather than a bare "are you sure"."""
-
-    DEFAULT_CSS = """
-    ConfirmScreen {
-        align: center middle;
-    }
-    ConfirmScreen #confirm-box {
-        width: 62;
-        height: auto;
-        border: tall $error;
-        padding: 1 2;
-    }
-    ConfirmScreen #confirm-box Button {
-        margin-top: 1;
-        margin-right: 1;
-        width: 18;
-    }
-    """
-    BINDINGS = [Binding("enter", "yes", "Confirm"),
-                Binding("escape", "no", "Cancel")]
-
-    def __init__(self, title: str, lines=(), ok_label: str = "OK",
-                 ok_variant: str = "error", ok_id: str = "confirm-ok"):
-        super().__init__()
-        # 'name' collides with the read-only Widget.name property
-        self.title_text = title
-        self.lines = tuple(lines)
-        self.ok_label = ok_label
-        self.ok_variant = ok_variant
-        self.ok_id = ok_id
-
-    def compose(self):
-        with Vertical(id="confirm-box"):
-            yield Label(self.title_text)
-            for line in self.lines:
-                yield Label(line)
-            yield Button("Cancel", id="confirm-cancel")
-            yield Button(self.ok_label, id=self.ok_id,
-                         variant=self.ok_variant)
-
-    def on_button_pressed(self, event):
-        if event.button.id == "confirm-cancel":
-            self.dismiss(False)
-        elif event.button.id == self.ok_id:
-            self.dismiss(True)
-
-    def action_yes(self):
-        self.dismiss(True)
-
-    def action_no(self):
-        self.dismiss(False)
+from alx_fancontrol.tui.screens.base import (BaseScreen, ConfirmScreen,
+                                             restore_table_cursor, sel_value,
+                                             table_cursor_key, table_hover_key)
 
 
 class ConfirmDeleteScreen(ConfirmScreen):

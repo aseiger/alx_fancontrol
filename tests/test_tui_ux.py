@@ -41,6 +41,7 @@ from alx_fancontrol.tui.screens.assign import (AssignScreen,
                                                ConfirmScreen)
 from alx_fancontrol.tui.screens.base import sel_value
 from alx_fancontrol.tui.screens.curves import (CurveEditorScreen,
+                                               NewCurveModal,
                                                PointPromptModal)
 from alx_fancontrol.tui.screens.overview import OverviewScreen
 from alx_fancontrol.tui.screens.sources import SourcesScreen
@@ -1476,13 +1477,15 @@ def test_add_point_at_end_tacks_on(temp_config, machine):
     asyncio.run(run())
 
 
-def test_add_point_requires_selected_row(temp_config, machine, notices):
-    """'a' with an empty curve (nothing selected) warns instead of
-    opening a prompt."""
-    from alx_fancontrol import config as _cfg_mod
-    cfg = _cfg_mod.load(temp_config)
+def test_add_point_on_an_empty_curve_asks_for_the_first_point(temp_config,
+                                                              machine):
+    """'a' on an EMPTY curve opens the prompt instead of refusing. Deleting
+    every point of a curve used to be a dead end: 'a' demanded a selected
+    row and there was no way to create a curve, so the only repair path was
+    editing JSON."""
+    cfg = config_mod.load(temp_config)
     cfg.curves["empty"] = {"label": "Empty", "points": []}
-    _cfg_mod.save(cfg, temp_config)
+    config_mod.save(cfg, temp_config)
 
     async def run():
         async with FanControlApp(config_path=temp_config,
@@ -1496,10 +1499,212 @@ def test_add_point_requires_selected_row(temp_config, machine, notices):
             await pilot.pause()
             assert editor.pts == []
             await pilot.press("a")
+            modal = await wait_modal(pilot, PointPromptModal)
+            assert modal.defaults == (40.0, 20)
+            await pilot.click("#pp-ok")
+            await wait_not_modal(pilot)
+            assert editor.pts == [[40.0, 20]], editor.pts
+            # and the curve is recoverable all the way to a valid save
+            editor.save_curve()
             await pilot.pause()
-            assert isinstance(pilot.app.screen, CurveEditorScreen)
-            assert any("select a point" in m.lower()
-                       for _s, m in notices), notices
+            assert read_cfg(temp_config)["curves"]["empty"]["points"] == \
+                [[40.0, 20]]
+
+    asyncio.run(run())
+
+
+def test_delete_every_point_then_rebuild_the_curve(temp_config, machine):
+    """The F7 dead end, end to end: delete every point of a live curve and
+    it is still recoverable in the GUI — 'a' offers the first point and the
+    curve saves again. (Deleting a point from a NON-empty curve re-selects a
+    row, so this is the only state with nothing to insert between.)"""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            editor = await _goto_curves(pilot)
+            while editor.pts:
+                editor.action_delete_point()
+                await pilot.pause()
+            assert editor.pts == [] and editor._sel_point is None
+            await pilot.press("a")
+            await wait_modal(pilot, PointPromptModal)
+            await pilot.click("#pp-ok")
+            await wait_not_modal(pilot)
+            editor.save_curve()
+            await pilot.pause()
+            assert read_cfg(temp_config)["curves"]["default"]["points"] == \
+                [[40.0, 20]]
+
+    asyncio.run(run())
+
+
+# ------------------------------------------------------------ curve CRUD --
+
+def _goto_curves(pilot):
+    async def _go():
+        await pilot.press("3")
+        await pilot.pause()
+        return pilot.app.screen
+    return _go()
+
+
+def test_new_curve_creates_selects_and_persists_it(temp_config, machine):
+    """`n` / New: a curve that did not exist before — the id is asked for
+    (assignments reference it), and it lands in the config immediately."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_curves(pilot)
+            await pilot.click("#new-curve")
+            modal = await wait_modal(pilot, NewCurveModal)
+            modal.query_one("#nc-id", Input).value = "case-fans"
+            modal.query_one("#nc-label", Input).value = "Case fans"
+            await pilot.click("#nc-ok")
+            await wait_not_modal(pilot)
+            doc = read_cfg(temp_config)
+            assert "case-fans" in doc["curves"]
+            assert doc["curves"]["case-fans"]["label"] == "Case fans"
+            # seeded from the built-in default shape, so it is valid at once
+            assert doc["curves"]["case-fans"]["points"] == \
+                config_mod.DEFAULTS["curves"]["default"]["points"]
+            assert sel_value(scr.query_one("#curve-pick", Select)) == \
+                "case-fans"
+            assert len(scr.pts) == 4
+
+    asyncio.run(run())
+
+
+def test_new_curve_refuses_an_id_that_is_taken(temp_config, machine, notices):
+    """Overwriting an existing curve by typo-ing its id would silently move
+    another fan's cooling — the modal refuses and stays open."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await _goto_curves(pilot)
+            await pilot.click("#new-curve")
+            modal = await wait_modal(pilot, NewCurveModal)
+            modal.query_one("#nc-id", Input).value = "default"
+            before = read_cfg(temp_config)
+            await pilot.click("#nc-ok")
+            await pilot.pause()
+            assert isinstance(pilot.app.screen, NewCurveModal)
+            assert any("already exists" in m.lower() for _s, m in notices)
+            assert read_cfg(temp_config) == before
+            await pilot.click("#nc-cancel")
+            await wait_not_modal(pilot)
+
+    asyncio.run(run())
+
+
+def test_copy_duplicates_the_curve_as_currently_edited(temp_config, machine):
+    """`c` / Copy is the normal way to tune: same curve, shifted — including
+    point moves that have not been saved yet."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_curves(pilot)
+            scr.action_nudge_duty_up5()      # unsaved edit
+            nudge = list(scr.pts[0])
+            await pilot.click("#dup-curve")
+            modal = await wait_modal(pilot, NewCurveModal)
+            assert modal.suggested_id == "default-copy"
+            await pilot.click("#nc-ok")
+            await wait_not_modal(pilot)
+            doc = read_cfg(temp_config)
+            assert "default-copy" in doc["curves"]
+            assert doc["curves"]["default-copy"]["points"][0] == nudge
+            # the original was NOT changed by the copy
+            assert doc["curves"]["default"]["points"][0] != nudge
+
+    asyncio.run(run())
+
+
+def test_delete_curve_refuses_one_that_assignments_use(temp_config, machine,
+                                                       notices):
+    """Deleting a curve in use leaves those assignments with no curve — the
+    daemon skips them and their fans stay at their last duty. Refused, and
+    the assignments are named."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_curves(pilot)
+            assert "used by: CPU" in str(
+                scr.query_one("#curve-used", Static).render())
+            await pilot.click("#del-curve")
+            await pilot.pause()
+            assert not isinstance(pilot.app.screen, ConfirmScreen)
+            assert any("used by 1 assignment" in m.lower()
+                       and "cpu" in m.lower() for _s, m in notices), notices
+            assert "default" in read_cfg(temp_config)["curves"]
+
+    asyncio.run(run())
+
+
+def test_delete_unused_curve_after_confirm(temp_config, machine):
+    cfg = config_mod.load(temp_config)
+    cfg.curves["spare"] = {"label": "Spare", "points": [[50, 30]]}
+    config_mod.save(cfg, temp_config)
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_curves(pilot)
+            sel = scr.query_one("#curve-pick", Select)
+            sel.value = "spare"
+            await pilot.pause()
+            assert "not used by any assignment" in str(
+                scr.query_one("#curve-used", Static).render())
+            await pilot.click("#del-curve")
+            modal = await wait_modal(pilot, ConfirmScreen)
+            assert "Spare" in modal.title_text
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert "spare" not in read_cfg(temp_config)["curves"]
+            # the picker moved to a curve that still exists
+            assert sel_value(scr.query_one("#curve-pick", Select)) != "spare"
+
+    asyncio.run(run())
+
+
+def test_curve_label_rename_shows_up_in_the_pickers(temp_config, machine):
+    """The label is what every picker displays, so it is part of the same
+    Save as the points."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_curves(pilot)
+            assert scr.query_one("#curve-label", Input).value == "Default"
+            scr.query_one("#curve-label", Input).value = "CPU ramp"
+            scr.save_curve()
+            await pilot.pause()
+            assert read_cfg(temp_config)["curves"]["default"]["label"] == \
+                "CPU ramp"
+            labels = [lab for lab, _v in select_options(
+                scr.query_one("#curve-pick", Select))]
+            assert any("CPU ramp" in str(lab) for lab in labels)
 
     asyncio.run(run())
 
@@ -1919,5 +2124,30 @@ def test_global_config_error_blocks_and_says_where_to_fix_it(temp_config,
             assert str(temp_config) in text
             await pilot.press("escape")
             await wait_not_modal(pilot)
+
+    asyncio.run(run())
+
+
+def test_delete_refuses_a_builtin_curve(temp_config, machine, notices):
+    """config.load() deep-merges DEFAULTS, so 'default' / 'gpu_v100' come
+    back on the next load whether the file has them or not (F14). A Delete
+    button that does not stick is worse than none, so it refuses and says
+    why instead of writing a file that changes nothing."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_curves(pilot)
+            assert sel_value(scr.query_one("#curve-pick", Select)) == "default"
+            before = read_cfg(temp_config)
+            await pilot.click("#del-curve")
+            await pilot.pause()
+            assert not isinstance(pilot.app.screen, ConfirmScreen)
+            assert any("built-in curve" in m.lower()
+                       and "would not stick" in m.lower()
+                       for _s, m in notices), notices
+            assert read_cfg(temp_config) == before
 
     asyncio.run(run())

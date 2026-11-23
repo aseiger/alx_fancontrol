@@ -13,10 +13,12 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.coordinate import Coordinate
-from textual.screen import Screen
-from textual.widgets import Button, DataTable, Footer, Header, Select, Static
+from textual.screen import ModalScreen, Screen
+from textual.widgets import (Button, DataTable, Footer, Header, Label, Select,
+                             Static)
 
 
 def _row_key_at(table: DataTable, row: int):
@@ -84,6 +86,66 @@ class NavButton(Button):
     ring (a focus ring would land on the topmost button after every
     screen switch)."""
     can_focus = False
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    """Yes/no confirmation for one destructive change.
+
+    Every path that changes what the fans do while the daemon is live
+    (delete/disable an assignment, delete a curve) asks here, with the
+    consequence spelled out rather than a bare "are you sure" — and naming
+    what is about to happen is also what makes an accidental Enter on a
+    destructive button unlikely."""
+
+    DEFAULT_CSS = """
+    ConfirmScreen {
+        align: center middle;
+    }
+    ConfirmScreen #confirm-box {
+        width: 62;
+        height: auto;
+        border: tall $error;
+        padding: 1 2;
+    }
+    ConfirmScreen #confirm-box Button {
+        margin-top: 1;
+        margin-right: 1;
+        width: 18;
+    }
+    """
+    BINDINGS = [Binding("enter", "yes", "Confirm"),
+                Binding("escape", "no", "Cancel")]
+
+    def __init__(self, title: str, lines=(), ok_label: str = "OK",
+                 ok_variant: str = "error", ok_id: str = "confirm-ok"):
+        super().__init__()
+        # 'name' collides with the read-only Widget.name property
+        self.title_text = title
+        self.lines = tuple(lines)
+        self.ok_label = ok_label
+        self.ok_variant = ok_variant
+        self.ok_id = ok_id
+
+    def compose(self):
+        with Vertical(id="confirm-box"):
+            yield Label(self.title_text)
+            for line in self.lines:
+                yield Label(line)
+            yield Button("Cancel", id="confirm-cancel")
+            yield Button(self.ok_label, id=self.ok_id,
+                         variant=self.ok_variant)
+
+    def on_button_pressed(self, event):
+        if event.button.id == "confirm-cancel":
+            self.dismiss(False)
+        elif event.button.id == self.ok_id:
+            self.dismiss(True)
+
+    def action_yes(self):
+        self.dismiss(True)
+
+    def action_no(self):
+        self.dismiss(False)
 
 
 class BaseScreen(Screen):

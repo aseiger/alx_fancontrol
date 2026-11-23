@@ -868,3 +868,113 @@ cannot be saved; a bad *global* blocks too and points at the config path.
 tuple of modal classes — it had to be taught about every new modal before.
 
 Suite: **205 passed** (192 + 13).
+
+---
+
+## 23. Config↔GUI audit, step 2: curves become manageable (2026-11-23)
+
+The curve was the one object the TUI could edit but not create, copy, rename
+or delete — and, as step 1 showed, it could be bricked in three keystrokes.
+
+### Why this mattered
+
+- **No New.** Adding a curve for new hardware meant editing JSON. Curves are
+  tuned by copying one and shifting it ("same as the V100 blower, 5 °C
+  later"), and that path did not exist in the GUI at all.
+- **No first point.** `action_add_point` demanded a *selected existing*
+  point, so an empty curve could never be filled — the dead end the audit
+  proved with `points: []` + `a` → "Select a point row first", the only
+  button on the screen being Save.
+- **No Delete, and no idea whether a curve was in use.** That missing
+  information is exactly what makes deletion dangerous: `_poll` skips an
+  assignment whose curve is gone (`fan_state = "curve-missing"`) and its
+  fans sit at their last duty. A delete button without a usage count would
+  have been worse than no button.
+
+### Changed
+
+- `NewCurveModal` asks for **id + label**. The id is asked rather than
+  invented because assignments reference curves by it, and an id already in
+  use is refused *in the modal* — silently overwriting a curve another fan
+  depends on is not an acceptable outcome of a typo. Allowed ids are
+  `[A-Za-z0-9_-]+` (they are config keys and Select values).
+- **New** seeds the built-in default shape
+  (`config.DEFAULTS["curves"]["default"]["points"]`) and saves immediately:
+  a curve with no points is invalid, so seeding keeps the config valid at
+  every moment, and it gives `a` something to insert between right away.
+- **Copy** duplicates the curve *as currently edited*, unsaved point moves
+  included — that is the point of copying. Suggested id `<id>-copy` (then
+  `-copy-2`, … via `_free_id`), label `<label> copy`.
+- **Delete** removes an unused curve after confirmation; a curve with users
+  is refused with the assignment names in the message. A new hint line
+  (`#curve-used`) shows `used by: CPU, System` / `not used by any
+  assignment` for the selected curve, so the rule is visible before anyone
+  reaches for the button. The two **built-in** curves are refused too — see
+  F14 below.
+- **Label** is now editable (`#curve-label`) and written by the same Save as
+  the points; the picker options are rebuilt afterwards, since they display
+  labels and a rename that did not appear there would look like it failed.
+- `a` on an **empty** curve opens the prompt for its first point (40 °C /
+  20 %) instead of refusing. The "Select a point row first" warning stays as
+  the fallback for the state where points exist but none is selected.
+- `_refresh_curve_options(keep=…)` replaces the inline option building in
+  `on_mount`, so create/copy/delete/save all rebuild the picker and re-assert
+  a selection that still exists (`set_options()` resets it to blank).
+- `ConfirmScreen` moved from `assign.py` to `base.py` — it is now used by two
+  screens, and screens importing each other is not a dependency worth
+  creating. `assign.py` re-imports it, so `ConfirmDeleteScreen` and every
+  existing import path are unchanged.
+
+### F14, found on the way: deleting a built-in curve cannot stick
+
+While testing Delete: `config.load()` does `_deep_merge(DEFAULTS, doc)`, so
+`default` and `gpu_v100` are injected into every config that does not carry
+them — a file with `{"curves": {"mine": …}}` loads as
+`[default, gpu_v100, mine]`, and the next save writes them back. Deleting one
+in the TUI would therefore vanish on the next load (daemon hot-reload or TUI
+restart): a button that quietly does nothing.
+
+Refusing it, with the reason, is the honest step-2 behaviour. The real fix
+belongs with step 4's schema work: `DEFAULTS` should seed a config **once**
+(`seed_if_missing`, which already does exactly that) instead of being merged
+on every load — at which point Delete can allow the built-ins. Changing the
+merge now was rejected: a hand-written config that references `default`
+without defining it works today (implicitly, and arguably wrongly), and under
+replace-semantics that assignment would start failing validation and be
+skipped at runtime — fans holding their last duty is not a regression to take
+for the sake of a tidier curve list.
+
+### Deliberate choices
+
+- **Create writes immediately.** The alternative (a pending curve that only
+  exists in memory until Save) means the config and the screen disagree, and
+  a curve is harmless once seeded. Everything else on this screen still needs
+  an explicit Save, because points are an *edit*.
+- **Delete refuses instead of re-pointing.** "Delete and move its assignments
+  to another curve" sounds convenient but silently changes how several fans
+  cool at once. Re-pointing is one visible edit per assignment on the Assign
+  screen — which is the right cost for a change that moves air.
+- **Renaming an id is not offered.** A label rename is display-only; an id
+  rename would have to rewrite every assignment referencing it. That is a
+  different operation (and step 3's territory: it belongs next to the tach
+  and ownership edits), not a text field on a curve screen.
+- **The action row is its own line.** Sharing it with the picker collapsed the
+  Select to 1 cell (`width: 1fr` next to auto-width buttons does not behave as
+  one expects), so the picker kept its full-width row and New/Copy/Delete got
+  their own.
+
+### Tests
+
+9 new tests (net +8: `test_add_point_requires_selected_row` asserted the
+behaviour this step deliberately reverses, so it became the empty-curve
+prompt test): `a` on an empty curve prompts and the curve then
+saves; delete-every-point-then-rebuild end to end (the F7 regression);
+New creates, selects and persists with the seeded shape; a taken id is
+refused with the file untouched; Copy carries unsaved moves and leaves the
+original alone; Delete refuses an in-use curve by name (and the hint line
+says `used by: CPU`); Delete removes an unused one after confirmation and the
+picker lands on a curve that still exists; label rename persists and shows up
+in the picker options; Delete refuses a built-in curve without touching the
+file (F14).
+
+Suite: **213 passed** (205 + 8).

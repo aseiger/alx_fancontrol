@@ -252,9 +252,12 @@ automatically on load — the TUI re-saves them as v2 on first open.
 never writes the config; it hot-reloads on mtime change every poll
 (atomic replace on the writer side means it never reads a torn file; a
 bad edit keeps the old in-memory config and shows a red error in
-`status.json`). The TUI remembers the mtime it loaded and, if the file
-changed on disk, asks **Reload / Overwrite** before saving. Don't run
-two TUIs at once.
+`status.json`). Because *any* validation error makes the daemon keep its
+previous config, the TUI runs `config.validate()` **before** writing and
+refuses the save with the reason on screen — "Saved" for a file the daemon
+will ignore is worse than no save at all. The TUI remembers the mtime it
+loaded and, if the file changed on disk, asks **Reload / Overwrite** before
+saving. Don't run two TUIs at once.
 
 ## Daemon
 
@@ -486,14 +489,24 @@ top item), so: **keys navigate, clicks focus** fields/tables.
 2. **Assign** — top: a list of the existing assignments (name, source,
    curve, fans, floor, max, rate, on/off). **Click a row to load it into the
    form below and edit it** (no need to remember names); saving with the
-   same name overwrites it in place (it keeps its `enabled` state).
-   **Delete** button or `d` removes the selected row after a
-   confirmation (the daemon then restores firmware control of its
-   fans); **New** resets the form. Form: source `Select` (rows show
-   live °C), curve `Select`, fan picker (click a row to toggle ✓ —
-   every channel is pickable; channels another process holds in manual
-   mode are refused by the *daemon* at takeover, not by the UI),
-   optional floor % / ceiling % / rate %/poll, name, **Save** (or `s`).
+   same name overwrites it in place. **Enable/disable** button or `e`
+   toggles the selected row: disabling releases its fans to firmware control
+   (it asks first — giving up control is the destructive direction; enabling
+   just reclaims them), and unlike deleting it keeps the curve, floor and
+   tach mapping for when the fan comes back. **Delete** button or `d` removes
+   the selected row after a confirmation (the daemon then restores firmware
+   control of its fans); **New** resets the form. Form: name — editing the
+   name of a loaded assignment **renames** it (confirmed; the entry moves,
+   rather than a second assignment being left behind driving the same fans),
+   source `Select` (rows show live °C), curve `Select`, fan picker (click a
+   row to toggle ✓ — every channel is pickable; channels another process
+   holds in manual mode are refused by the *daemon* at takeover, not by the
+   UI), floor % / ceiling % / rate %/poll — **blank means "no override": the
+   global `config` value applies and the per-assignment key is removed**, and
+   the placeholders show the global values currently in effect — and an
+   **enabled** switch. Keys this form does not manage (`failsafe`,
+   `failsafe_duty`, `failsafe_after`, `force_takeover`, hand-set `tach`
+   entries for fans that stay picked) are carried through untouched.
 3. **Curves** — points table (cursor-selectable) + live text plot
    (curve as `█` columns, `◄` marker at the current temp of the
    selected preview source, every point marked `●` and the selected one

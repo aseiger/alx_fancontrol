@@ -1,5 +1,5 @@
 """FanControlApp: textual shell — sidebar nav, live-refresh worker,
-single save path with stale-write guard.
+single save path with validation and a stale-write guard.
 
 The TUI never writes to hwmon (read-only); the only file it writes is the
 config (atomically, with .bak). `config_path` is injectable so tests use a
@@ -13,7 +13,7 @@ from pathlib import Path
 
 from textual.app import App
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label
 
@@ -59,6 +59,61 @@ class StaleConfigScreen(ModalScreen[bool]):
             self.dismiss(False)
         elif event.button.id == "stale-overwrite":
             self.dismiss(True)
+
+
+class ConfigErrorsScreen(ModalScreen[None]):
+    """A save that would write a config the running daemon refuses is
+    blocked here, with the reason from `config.validate()` on screen.
+
+    Without this the file lands anyway, the daemon's hot reload rejects it,
+    keeps its previous config, and the only trace is one fragment of the
+    Overview status line — "Saved" followed by silence is the worst failure
+    mode a tool that drives fans can have."""
+
+    DEFAULT_CSS = """
+    ConfigErrorsScreen {
+        align: center middle;
+    }
+    ConfigErrorsScreen #cfgerr-box {
+        width: 76;
+        height: auto;
+        max-height: 85%;
+        border: tall red;
+        padding: 1 2;
+    }
+    ConfigErrorsScreen #cfgerr-box Button {
+        margin-top: 1;
+        width: 24;
+    }
+    """
+    BINDINGS = [Binding("enter", "close", "OK"),
+                Binding("escape", "close", "OK")]
+
+    def __init__(self, errors):
+        super().__init__()
+        self.errors = list(errors)
+
+    def compose(self):
+        with VerticalScroll(id="cfgerr-box"):
+            yield Label(f"Not saved — the daemon would refuse this config "
+                        f"({len(self.errors)} problem(s)):")
+            for e in self.errors[:15]:
+                yield Label(f"  • {e}")
+            if len(self.errors) > 15:
+                yield Label(f"  … and {len(self.errors) - 15} more "
+                            "(run: alx-fancontrol check)")
+            if any(e.startswith("config.") for e in self.errors):
+                yield Label("Global settings cannot be edited in the TUI "
+                            f"yet — fix them in {self.app.cfg_path} and save "
+                            "again (the previous file is kept as .bak).")
+            yield Button("Back to editing", id="cfgerr-ok", variant="primary")
+
+    def on_button_pressed(self, event):
+        if event.button.id == "cfgerr-ok":
+            self.dismiss(None)
+
+    def action_close(self):
+        self.dismiss(None)
 
 
 class FanControlApp(App):
@@ -252,10 +307,25 @@ class FanControlApp(App):
             self,
             message: str = "Saved — running daemon reloads within ~1 s",
     ) -> bool:
-        """THE single save path: stale guard (mtime) → config.save()
-        (atomic + .bak) → notification. Returns False when a stale-write
-        modal is shown instead of saving directly (textual 8 requires
-        push_screen_wait to run in a worker, so the modal flow is one)."""
+        """THE single save path: validate → stale guard (mtime) →
+        config.save() (atomic + .bak) → notification. Returns False when
+        nothing was written — either a validation failure (modal with the
+        reason) or a stale-write modal is shown instead of saving directly
+        (textual 8 requires push_screen_wait to run in a worker, so the
+        modal flow is one).
+
+        Validating here matters because of how the daemon consumes the file:
+        ANY error makes its hot reload keep the previous config
+        (`daemon._maybe_reload`), so writing an invalid one is not "a save
+        that has not taken effect yet" — it is a save that does nothing,
+        silently, while the UI says Saved."""
+        errors, _warnings = config_mod.validate(self.cfg)
+        if errors:
+            # warnings are deliberately not shown here: they are conditions
+            # the daemon handles at runtime (unknown curve, shared fan) and
+            # the screens that create them already explain them
+            self.push_screen(ConfigErrorsScreen(errors))
+            return False
         try:
             m = self.cfg_path.stat().st_mtime
         except OSError:

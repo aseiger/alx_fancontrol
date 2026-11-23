@@ -2,13 +2,21 @@
 
 Top: a list of the assignments in the config — click a row to load it
 into the form (edit/overwrite by name), Delete button or `d` to remove
-one (with confirmation; the daemon then restores firmware control of
-its fans).
+one, Enable/disable button or `e` to release/reclaim its fans (both with
+confirmation; releasing hands the fans back to the firmware).
 
-Form: source Select (live °C in the labels), curve Select, fan picker
-as a click-to-toggle DataTable, optional floor/max, an assignment name,
-and Save → app.save_config(). Saving with an existing name overwrites it
-(the existing `enabled` state is preserved).
+Form: assignment name (also the rename path — renaming asks first, and
+renaming in place rather than leaving a second assignment behind),
+source Select (live °C in the labels), curve Select, fan picker as a
+click-to-toggle DataTable, an enabled Switch, and floor / ceiling / rate
+inputs. Blank floor/ceiling/rate means "no override: use the global
+default" and REMOVES the key, so an override is reversible from the GUI.
+Save → app.save_config() (which validates before writing).
+
+Keys this form does not manage (`failsafe`, `failsafe_duty`,
+`failsafe_after`, `force_takeover`, hand-set `tach` entries for fans that
+are still picked) are carried through untouched — safety settings edited
+in JSON survive an edit made here.
 
 Note: channels already held in manual mode by another process are
 selectable here, but the daemon refuses to take them over at runtime
@@ -22,10 +30,12 @@ from collections.abc import Iterator
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Input, Label, Select, Static
+from textual.widgets import (Button, DataTable, Input, Label, Select, Static,
+                             Switch)
 
 from textual.widgets._select import SelectOverlay
 
+from alx_fancontrol import config as config_mod
 from alx_fancontrol import hwmon
 from alx_fancontrol.tui.reader import LiveUpdate
 from alx_fancontrol.tui.screens.base import (BaseScreen, restore_table_cursor,
@@ -33,45 +43,76 @@ from alx_fancontrol.tui.screens.base import (BaseScreen, restore_table_cursor,
                                              table_hover_key)
 
 
-class ConfirmDeleteScreen(ModalScreen[bool]):
-    """Delete-assignment confirmation — destructive: the daemon restores
-    firmware (BIOS) control of the fans once the assignment is gone."""
+class ConfirmScreen(ModalScreen[bool]):
+    """Yes/no confirmation for one destructive assignment change.
+
+    Every path that changes what the fans do while the daemon is live
+    (delete, disable, rename onto an existing name) asks here, with the
+    consequence spelled out rather than a bare "are you sure"."""
 
     DEFAULT_CSS = """
-    ConfirmDeleteScreen {
+    ConfirmScreen {
         align: center middle;
     }
-    ConfirmDeleteScreen #confirm-box {
+    ConfirmScreen #confirm-box {
         width: 62;
         height: auto;
         border: tall $error;
         padding: 1 2;
     }
-    ConfirmDeleteScreen #confirm-box Button {
+    ConfirmScreen #confirm-box Button {
         margin-top: 1;
         margin-right: 1;
-        width: 16;
+        width: 18;
     }
     """
+    BINDINGS = [Binding("enter", "yes", "Confirm"),
+                Binding("escape", "no", "Cancel")]
 
-    def __init__(self, assignment_name: str):
+    def __init__(self, title: str, lines=(), ok_label: str = "OK",
+                 ok_variant: str = "error", ok_id: str = "confirm-ok"):
         super().__init__()
         # 'name' collides with the read-only Widget.name property
-        self.assignment_name = assignment_name
+        self.title_text = title
+        self.lines = tuple(lines)
+        self.ok_label = ok_label
+        self.ok_variant = ok_variant
+        self.ok_id = ok_id
 
     def compose(self):
         with Vertical(id="confirm-box"):
-            yield Label(f"Delete assignment '{self.assignment_name}'?")
-            yield Label("The daemon stops driving its fans and restores")
-            yield Label("firmware (BIOS) control of them.")
+            yield Label(self.title_text)
+            for line in self.lines:
+                yield Label(line)
             yield Button("Cancel", id="confirm-cancel")
-            yield Button("Delete", id="confirm-del", variant="error")
+            yield Button(self.ok_label, id=self.ok_id,
+                         variant=self.ok_variant)
 
     def on_button_pressed(self, event):
         if event.button.id == "confirm-cancel":
             self.dismiss(False)
-        elif event.button.id == "confirm-del":
+        elif event.button.id == self.ok_id:
             self.dismiss(True)
+
+    def action_yes(self):
+        self.dismiss(True)
+
+    def action_no(self):
+        self.dismiss(False)
+
+
+class ConfirmDeleteScreen(ConfirmScreen):
+    """Delete-assignment confirmation — destructive: the daemon restores
+    firmware (BIOS) control of the fans once the assignment is gone."""
+
+    def __init__(self, assignment_name: str):
+        super().__init__(
+            f"Delete assignment '{assignment_name}'?",
+            ("The daemon stops driving its fans and restores",
+             "firmware (BIOS) control of them."),
+            ok_label="Delete", ok_variant="error", ok_id="confirm-del")
+        # kept for tests/back-compat: the assignment this modal is about
+        self.assignment_name = assignment_name
 
 
 class AssignScreen(BaseScreen):
@@ -79,6 +120,7 @@ class AssignScreen(BaseScreen):
     BINDINGS = [
         Binding("s", "save_assignment", "Save assignment"),
         Binding("d", "delete_assignment", "Delete assignment"),
+        Binding("e", "toggle_enabled", "Enable/disable"),
     ]
     CSS = """
     /* The container defaults are Horizontal/Vertical { height: 1fr } —
@@ -111,13 +153,31 @@ class AssignScreen(BaseScreen):
     #floor, #maxduty {
         margin-right: 1;
     }
+    #enabled-row {
+        height: auto;
+    }
+    #enabled-row Switch {
+        margin: 0 1 0 0;
+    }
     """
+
+    def _global_default(self, key: str) -> str:
+        """The value the global `config` block currently holds, for a
+        placeholder — hard-coding "(default 5)" would start lying the
+        moment the user changes the global."""
+        cfg = getattr(self.app, "cfg", None)
+        v = (cfg.config.get(key) if cfg is not None
+             else config_mod.DEFAULTS["config"][key])
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return str(v)
+        return f"{v:g}"
 
     def content(self) -> Iterator:
         yield Static("Assignments — click a row to edit it",
                      classes="title")
         with Horizontal(id="list-actions"):
             yield Button("New", id="new")
+            yield Button("Enable/disable", id="toggle-enabled")
             yield Button("Delete", id="delete", variant="error")
         yield DataTable(id="assign-list")
         yield Static("New assignment", id="form-title", classes="title")
@@ -131,12 +191,24 @@ class AssignScreen(BaseScreen):
                          classes="hint")
             yield DataTable(id="fan-pick")
             with Horizontal():
-                yield Input(placeholder="floor % (default 5)",
-                            id="floor", restrict=r"[0-9]", max_length=3)
-                yield Input(placeholder="ceiling % (default 100)",
-                            id="maxduty", restrict=r"[0-9]", max_length=3)
-                yield Input(placeholder="rate %/poll (default 6)",
-                            id="rate", restrict=r"[0-9]", max_length=3)
+                yield Input(
+                    placeholder=f"floor % (global "
+                                f"{self._global_default('floor_duty')}, "
+                                f"blank = use it)",
+                    id="floor", restrict=r"[0-9]", max_length=3)
+                yield Input(
+                    placeholder=f"ceiling % (global 100, blank = use it)",
+                    id="maxduty", restrict=r"[0-9]", max_length=3)
+                yield Input(
+                    placeholder=f"rate %/poll (global "
+                                f"{self._global_default('max_rate')}, "
+                                f"blank = use it)",
+                    id="rate", restrict=r"[0-9]", max_length=3)
+            with Horizontal(id="enabled-row"):
+                yield Switch(value=True, id="enabled")
+                yield Static("enabled — off releases these fans to the "
+                             "firmware (their curve stops applying)",
+                             classes="hint")
             yield Button("Save assignment", id="save", variant="primary")
 
     def on_mount(self):
@@ -252,7 +324,8 @@ class AssignScreen(BaseScreen):
 
     def _load_assignment(self, name: str):
         """Click-to-edit: load the named assignment into the form.
-        Saving with the same name overwrites it (enabled is preserved)."""
+        Saving with the same name overwrites it; saving under a different
+        name renames it (after asking — see `_rename_flow`)."""
         app = self.app
         a = app.cfg.assignments.get(name)
         if a is None:
@@ -281,6 +354,7 @@ class AssignScreen(BaseScreen):
             str(a["max_duty"]) if a.get("max_duty") is not None else "")
         self.query_one("#rate", Input).value = (
             str(a["max_rate"]) if a.get("max_rate") is not None else "")
+        self.query_one("#enabled", Switch).value = bool(a.get("enabled", True))
         self._refresh_fans()
         self.query_one("#form-title", Static).update(
             f"Editing '{name}' — saving overwrites it")
@@ -293,6 +367,7 @@ class AssignScreen(BaseScreen):
         self.query_one("#floor", Input).value = ""
         self.query_one("#maxduty", Input).value = ""
         self.query_one("#rate", Input).value = ""
+        self.query_one("#enabled", Switch).value = True
         self._refresh_fans()
         self.query_one("#form-title", Static).update("New assignment")
 
@@ -325,6 +400,49 @@ class AssignScreen(BaseScreen):
     def action_delete_assignment(self):
         # 'd' binding (mirrors Curves' d=delete)
         self._start_delete(self._selected_list_name())
+
+    # --------------------------------------------------- enable / disable --
+    def _start_toggle_enabled(self, name: str | None):
+        """Release a set of fans to the firmware, or take them back.
+        Disabling is the safe alternative to deleting (the curve, floor and
+        tach mapping survive), and it is what `config.py`'s own comments
+        recommend for an assignment whose source is gone for good."""
+        if name is None or name not in self.app.cfg.assignments:
+            self.notify("No assignment selected — click or arrow to a row "
+                        "first", severity="warning")
+            return
+        a = self.app.cfg.assignments[name]
+        if a.get("enabled", True):
+            # giving up control is the destructive direction → ask
+            self.run_worker(self._disable_flow(name), exclusive=False)
+        else:
+            self._apply_enabled(name, True)
+
+    async def _disable_flow(self, name: str):
+        fans = ", ".join(self.app.cfg.assignments[name].get("fans", []))
+        ok = await self.app.push_screen_wait(ConfirmScreen(
+            f"Disable assignment '{name}'?",
+            (f"The daemon releases {fans or '(no fans)'} to firmware",
+             "control: they stop following their curve until enabled."),
+            ok_label="Disable", ok_variant="error"))
+        if ok:
+            self._apply_enabled(name, False)
+
+    def _apply_enabled(self, name: str, on: bool):
+        app = self.app
+        a = dict(app.cfg.assignments[name])
+        a["enabled"] = on
+        app.cfg.assignments[name] = a
+        if self._editing == name:
+            self.query_one("#enabled", Switch).value = on
+        if on:
+            msg = (f"Assignment '{name}' enabled — the daemon takes its "
+                   "fans back within ~1 s")
+        else:
+            msg = (f"Assignment '{name}' disabled — the daemon restores "
+                   "firmware control of its fans")
+        if app.save_config(msg):
+            self._refresh_list()
 
     # --------------------------------------------------------------- fans
     def _refresh_fans(self):
@@ -396,6 +514,12 @@ class AssignScreen(BaseScreen):
             self._reset_form()
         elif event.button.id == "delete":
             self._start_delete(self._selected_list_name())
+        elif event.button.id == "toggle-enabled":
+            self._start_toggle_enabled(self._selected_list_name())
+
+    def action_toggle_enabled(self):
+        # 'e' binding
+        self._start_toggle_enabled(self._selected_list_name())
 
     def action_save_assignment(self):
         # 's' binding — the Save button sits at the bottom of a long form
@@ -428,9 +552,92 @@ class AssignScreen(BaseScreen):
         if floor is not None and maxd is not None and floor > maxd:
             self.notify("floor % must be <= ceiling %", severity="warning")
             return
-        fans = sorted(self._picked)
-        # a fan may be controlled by several assignments: the daemon
-        # drives it to the HIGHEST requested duty — say so on save
+        form = {"source": src_id, "curve": curve_id,
+                "fans": sorted(self._picked),
+                "enabled": bool(self.query_one("#enabled", Switch).value),
+                "floor_duty": floor, "max_duty": maxd, "max_rate": rate}
+        editing = self._editing
+        if editing and name != editing:
+            # The name field doubles as the rename path. Writing the form
+            # under the new key alone would leave the OLD assignment in the
+            # config driving the same fans, with nothing but a generic
+            # shared-fan notice to hint that anything happened — so renaming
+            # is confirmed, and MOVES the entry instead of duplicating it.
+            self.run_worker(self._rename_flow(editing, name, form),
+                            exclusive=False)
+            return
+        self._commit(name, form)
+
+    async def _rename_flow(self, old: str, new: str, form: dict):
+        exists = new in self.app.cfg.assignments
+        if exists:
+            ok = await self.app.push_screen_wait(ConfirmScreen(
+                f"'{new}' already exists — overwrite it with '{old}'?",
+                ("The edited settings replace what "
+                 f"'{new}' holds, and '{old}' is removed; its fans stay",
+                 "controlled by the result."),
+                ok_label="Overwrite", ok_variant="error"))
+            msg = (f"'{old}' written over '{new}' — daemon picks it up "
+                   "within ~1 s")
+        else:
+            ok = await self.app.push_screen_wait(ConfirmScreen(
+                f"Rename assignment '{old}' to '{new}'?",
+                ("The same source, curve, fans and overrides move under the",
+                 "new name — no second assignment is left driving them."),
+                ok_label="Rename", ok_variant="primary"))
+            msg = (f"Assignment '{old}' renamed to '{new}' — daemon picks it "
+                   "up within ~1 s")
+        if not ok:
+            return
+        # merge onto the entry being kept: the target when overwriting, the
+        # assignment being renamed otherwise
+        base = dict(self.app.cfg.assignments.get(new if exists else old, {}))
+        self._commit(new, form, base=base, drop=old, message=msg)
+
+    def _commit(self, name: str, form: dict, base: dict | None = None,
+                drop: str | None = None, message: str | None = None):
+        """Write the form into the config under `name` and save.
+
+        Merge rules, since these decide what a save really does:
+          * a form field left BLANK (floor / ceiling / rate) REMOVES the key.
+            That is how "back to the global default" is expressed — keeping
+            the previous value would make an override impossible to undo in
+            the GUI, and typing the global's number instead pins it per
+            assignment, which is a different thing.
+          * keys this form does not manage (`failsafe`, `failsafe_duty`,
+            `failsafe_after`, `force_takeover`, ...) are carried over, so
+            hand-edited safety settings survive an edit made here.
+          * `tach` keeps explicit mappings for fans that are still picked (a
+            hand-set tach must not vanish on a save) and drops entries whose
+            fan is no longer in the assignment.
+        """
+        app = self.app
+        assignment = dict(base if base is not None
+                          else app.cfg.assignments.get(name, {}))
+        assignment.update({"source": form["source"], "curve": form["curve"],
+                           "fans": form["fans"], "enabled": form["enabled"]})
+        for key in ("floor_duty", "max_duty", "max_rate"):
+            if form[key] is None:
+                assignment.pop(key, None)   # blank = use the global default
+            else:
+                assignment[key] = form[key]
+        fans = form["fans"]
+        tach = {f: t for f, t in (assignment.get("tach") or {}).items()
+                if f in fans}
+        for f in fans:
+            if f not in tach:
+                guess = app.guess_tach(f)
+                if guess:
+                    tach[f] = guess
+        if tach:
+            assignment["tach"] = tach
+        else:
+            assignment.pop("tach", None)
+        app.cfg.assignments[name] = assignment
+        if drop and drop != name:
+            app.cfg.assignments.pop(drop, None)
+        # a fan may be controlled by several assignments: the daemon drives
+        # it to the HIGHEST requested duty — say so on save
         shared: list[str] = []
         for other, oa in app.cfg.assignments.items():
             if other == name:
@@ -438,34 +645,9 @@ class AssignScreen(BaseScreen):
             common = sorted(set(fans) & set(oa.get("fans", [])))
             if common:
                 shared.append(f"'{other}' ({', '.join(common)})")
-        # overwriting an existing assignment keeps its enabled state — and
-        # any key this form does not manage (failsafe, failsafe_duty,
-        # force_takeover, ...): hand-edited safety settings must survive an
-        # edit made in the TUI
-        existing = app.cfg.assignments.get(name, {})
-        assignment: dict = dict(existing)
-        assignment.update({
-            "source": src_id,
-            "curve": curve_id,
-            "fans": fans,
-            "enabled": existing.get("enabled", True),
-        })
-        if floor is not None:
-            assignment["floor_duty"] = floor
-        if maxd is not None:
-            assignment["max_duty"] = maxd
-        if rate is not None:
-            assignment["max_rate"] = rate
-        tach = {}
-        for f in fans:
-            guess = app.guess_tach(f)
-            if guess:
-                tach[f] = guess
-        if tach:
-            assignment["tach"] = tach
-        app.cfg.assignments[name] = assignment
-        if app.save_config(f"Assignment '{name}' saved — daemon picks "
-                                 f"it up within ~1 s"):
+        if app.save_config(message
+                           or f"Assignment '{name}' saved — daemon picks "
+                              "it up within ~1 s"):
             if shared:
                 self.notify(
                     "Shared fan(s) are driven to the HIGHEST requested "

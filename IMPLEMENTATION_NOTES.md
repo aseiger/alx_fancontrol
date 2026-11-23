@@ -769,3 +769,102 @@ a virtual clock (each sleep advances `time.monotonic()` by `step`) instead of
 racing the runner — same hermetic contract as `test_safety_net.run_polls`.
 
 Suite: **192 passed** (177 + 15).
+
+---
+
+## 22. Config↔GUI audit, step 1: the four things the TUI got wrong (2026-11-23)
+
+An audit of every option the daemon honours against what the TUI can show and
+change (`CONFIG_GUI_AUDIT.md`) found the mapping side (source → curve → fans)
+in good shape and the policy side absent: **22 global `config.*` keys, none of
+them viewable or editable in the GUI** — the fail-safe, liveness, escalation
+and stall-drive knobs added by §18–§21 all landed JSON-only. Four of the
+findings were not taste but bugs, reproduced by driving the real TUI against
+the synthetic machine and reading the file back. This step fixes those four;
+the Settings screen (`config.*`) and the tach/ownership work are deliberately
+left for their own steps.
+
+### The four bugs
+
+1. **A blank override field did nothing.** `save_assignment` started from
+   `dict(existing)` and only ever *set* `floor_duty` / `max_duty` / `max_rate`
+   when the field was filled, so clearing the field left the old override in
+   the file: "follow the global default again" was not expressible, and typing
+   the global's number instead pins it per assignment — a different setting
+   that stops following the global.
+2. **`enabled` was displayed and never editable.** The list has had an on/off
+   column since the beginning and the save path carefully preserved it, but no
+   button or key ever changed it — so the action `config.py`'s own comments
+   recommend ("prefer deleting/disabling such an assignment") required hand
+   editing JSON, while the wrong tool (Delete) was the one on screen.
+3. **Renaming duplicated the assignment.** The name field is the key, so
+   loading `CPU`, retyping it as `CPU-box` and saving wrote a second entry:
+   both then drove `it8686:pwm1`, and the only signal was a generic "shared
+   fan" notice that never said the old one still existed.
+4. **Invalid configs were saved with a smile.** `save_config` never called
+   `config.validate()`. Delete every point of a curve, press save: notification
+   *"Curve 'default' saved"*, file now invalid, and because
+   `Daemon._maybe_reload` keeps the **previous** config on any error, nothing
+   at all happened — silently. For a tool that moves fans, "Saved" followed by
+   silence is the worst failure mode it can have.
+
+### Changed
+
+- `AssignScreen._commit(name, form, base=None, drop=None, message=None)` — the
+  single write path for the form, with the merge rules written down: a blank
+  floor/ceiling/rate **removes** the key; keys the form does not manage
+  (`failsafe`, `failsafe_duty`, `failsafe_after`, `force_takeover`) are carried
+  over; `tach` keeps explicit mappings for fans still picked and drops entries
+  whose fan left the assignment (they used to linger forever).
+- `AssignScreen._rename_flow` — a name change while editing asks (or, if the
+  target name is taken, asks about *overwriting*), then moves the entry
+  (`drop=old`) instead of adding one. Cancel leaves the config untouched.
+- `Switch(id="enabled")` in the form, plus an **Enable/disable** button and the
+  `e` binding acting on the selected list row. Disabling confirms — it hands
+  fans to the firmware mid-run; enabling does not, it only reclaims.
+- `FanControlApp.save_config` validates before touching the file and shows
+  `ConfigErrorsScreen` with the reasons. The screen that created the problem is
+  usually one keystroke away, so this replaces a round trip through
+  `status.json`.
+- `ConfirmScreen` — the delete confirmation generalised (title, body lines,
+  button label/variant/id, Enter/Escape); `ConfirmDeleteScreen` is now a thin
+  subclass so its tests and ids are unchanged.
+- Placeholders read the live globals (`floor % (global 5, blank = use it)`)
+  instead of hard-coding "default 5", which would start lying the first time
+  someone changed `config.floor_duty`.
+
+### Deliberate choices
+
+- **Validation blocks, including for global keys.** An out-of-range
+  `config.*` value can only be fixed in JSON until the Settings screen exists,
+  so there is a temptation to let assignment edits through. Not so: the daemon
+  rejects the *whole file* for any error, so saving "just my fan edit" would
+  write a file that changes nothing — exactly the lie this fix exists to stop.
+  The modal therefore names the offending key and points at the file.
+- **Blank means remove, not zero.** `floor_duty: 0` is a real setting (a fan
+  allowed to stop); an absent key means "inherit". Collapsing the two would
+  lose the distinction the daemon makes (`a.get("floor_duty", cfg.config…)`).
+- **Disable keeps everything.** Only `enabled` flips. That is the point of
+  offering it as the alternative to Delete: the curve, floor and tach mapping
+  are what make re-enabling safe later.
+- **Confirm one direction only.** Every confirm on this screen costs a
+  keystroke, so only the direction that gives up control (disable, delete) and
+  the one that can silently clobber another assignment (rename onto an existing
+  name) ask.
+
+### Tests
+
+13 new UX tests in `tests/test_tui_ux.py`, all driving widgets rather than
+internals: blank fields remove all three overrides and leave unmanaged keys
+alone; placeholders track the globals; the form switch writes
+`enabled=false` (list cell flips to `off`); `e` disables behind a confirm and
+enables without one; cancel keeps `enabled=true`; toggle with no selection
+warns; rename moves the entry (and preserves its floor), cancel keeps the old
+name, rename onto a taken name overwrites and removes the source; an invalid
+config blocks a fan edit with the reason and no "Saved" notice; an empty curve
+cannot be saved; a bad *global* blocks too and points at the config path.
+
+`wait_not_modal` now waits on `ModalScreen` generally instead of a hard-coded
+tuple of modal classes — it had to be taught about every new modal before.
+
+Suite: **205 passed** (192 + 13).

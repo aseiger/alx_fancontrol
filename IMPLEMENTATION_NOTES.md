@@ -1357,3 +1357,67 @@ one existing test now asserts the confirmation appears for an assignment that
 already has `"failsafe": false`; `failsafe_max_rate` validated per assignment.
 
 Suite: **250 passed** (243 + 7, plus the config guard).
+
+## 28. Config↔GUI audit, step 6b: Overview tells the truth, and the sidebar says which file (2026-11-27)
+
+F10, F11, F13. The last of the audit's findings except cosmetic ones.
+
+### Overview was throwing away the daemon's own reporting
+
+`status.json` already carries `degraded`, a structured `errors` map, per-fan
+`kick: {phase, attempts}`, `duty_raw` and `orig_enable` — and the screen used
+none of it (F10). Three fixes, all of them "the data was already there":
+
+- **Degraded gets a banner.** `degraded: true` means the daemon is running with
+  a config it *rejected*, holding fans at fail-safe duty rather than following
+  curves — the single most important state on the box — and it was dropped on
+  the floor while the screen reported "daemon: running".
+- **Errors get one line each**, keyed (`stalled:it8686:pwm1: …`,
+  `duty-drift:it8686:pwm3: …`), capped at four with a pointer to the journal.
+  They used to be `" | ".join(...)` into the status line, which on a box with
+  four GPUs meant the line scrolled past and every entry but the first was
+  never read. Hidden entirely when clean — absence is information here, and a
+  permanent empty warning box trains people to ignore it.
+- **`kick` shows in the state cell** (`STALLED: … — kicking stop attempt 2`).
+  §21's code comment asks for exactly this: a daemon that is *fighting* for a
+  fan is a different situation from one that is *reporting* on it, and the
+  difference is visible nowhere else but the log.
+- **`duty_raw` shows when it disagrees** with the commanded duty
+  (`20 (raw 120!)`). §20's whole lesson is that commanded duty is not
+  ownership; showing a second number on every row would be noise, so it appears
+  only on drift. (`orig_enable` stays off the table — it matters for restoring,
+  not for reading the present, and it is in `status.json` when needed.)
+
+And the fan table now lists fans of **disabled** assignments, marked
+`CPU (disabled)` / `disabled — firmware holds it`. Listing only enabled ones
+made a header vanish from the screen at precisely the moment you disabled it to
+watch what the firmware does with it. Also deleted a dead duplicate loop in
+`_refresh_sources` (leftover that computed strings and discarded them).
+
+### Which config am I even editing (F11)
+
+The sidebar now ends with `config: ~/.config/alx_fancontrol/config.json` (or
+`/etc/...`) on every screen. Root edits `/etc`, a dev shell edits `$HOME`, and
+until now nothing said which — so a sudo-less session could produce a perfectly
+valid edit that changes nothing, discovered only by the fans not responding.
+The non-root banner says that out loud now instead of just "no fan control".
+
+### README lied about a removed section (F13)
+
+The config table still documented `sources.*.kind` / `.chip` / `.temp` /
+`.chip_index` / `.pci_bus` — keys deleted in §14 when sources became
+discovery-derived. Replaced with a `assignments.*.source` row plus a short
+"There is no `sources` section" note (ids like `k10temp[0]:temp1`,
+`gpu:47:00.0`; old files are migrated on load), and the troubleshooting bullet
+that told people to set `chip_index: 0/1` now describes the `[0]`/`[1]` id
+suffix that actually exists. `assignments.*.tach` and the fail-safe override
+row were updated to point at the screens that edit them.
+
+### Tests
+
+6 new: disabled assignment's fans listed and marked; degraded banner appears
+with its meaning; errors render one keyed line each and hide when clean; kick
+phase/attempt in the state cell; `_duty_cell` unit test (no marker on agreement,
+`(raw 120!)` on drift); sidebar shows the config path.
+
+Suite: **256 passed** (250 + 6).

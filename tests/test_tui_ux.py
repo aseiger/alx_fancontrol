@@ -2971,3 +2971,146 @@ def test_fractional_duty_survives_the_form(temp_config, machine):
             assert saved["max_duty"] == 97.5
 
     asyncio.run(run())
+
+
+# ------------------------------------------------- Overview depth (F10/F11) --
+
+def _fan_row_cells(table, fan):
+    for r in range(table.row_count):
+        if row_key(table, r) == fan:
+            return [str(table.get_cell_at((r, c)))
+                    for c in range(len(table.columns))]
+    raise AssertionError(f"no fan row {fan}")
+
+
+def test_overview_lists_a_disabled_assignments_fans(temp_config, machine):
+    """Disabling is the recommended safe action, and listing only enabled
+    assignments made the header vanish at exactly the moment you wanted to
+    watch it hand control back."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": False})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = pilot.app.screen
+            scr._refresh(machine.live_payload())
+            table = scr.query_one("#fan-table", DataTable)
+            cells = _fan_row_cells(table, "it8686:pwm1")
+            assert any("CPU (disabled)" in c for c in cells), cells
+            assert any("disabled — firmware holds it" in c
+                       for c in cells), cells
+
+    asyncio.run(run())
+
+
+def test_overview_shows_the_degraded_flag_as_a_banner(temp_config, machine):
+    """`degraded: true` means the daemon is holding fans at fail-safe duty
+    because its config was rejected — the most important state on the box, and
+    it used to be dropped on the floor."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = pilot.app.screen
+            data = machine.live_payload()
+            data["status"] = {"ts": time.time(), "degraded": True,
+                              "errors": {"startup_config": "bad json"}}
+            scr._refresh(data)
+            line = scr.query_one("#degraded-line", Static)
+            assert "DEGRADED" in str(line.render())
+            assert line.display
+            # errors get their own lines, keyed
+            errs = str(scr.query_one("#errors-box", Static).render())
+            assert "startup_config: bad json" in errs
+
+    asyncio.run(run())
+
+
+def test_overview_error_lines_are_separate_and_hidden_when_clean(
+        temp_config, machine):
+    """One joined line scrolled past unreadable on a box with four GPUs; each
+    problem now gets a line, and nothing shows when there are none."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = pilot.app.screen
+            data = machine.live_payload()
+            data["status"] = {"ts": time.time(), "errors": {
+                "nvidia_smi": "3 consecutive failure(s)",
+                "stalled:it8686:pwm1": "commanding 80% but 0 RPM",
+                "duty-drift:it8686:pwm3": "register says 12, we asked 60"}}
+            scr._refresh(data)
+            errs = str(scr.query_one("#errors-box", Static).render())
+            for frag in ("nvidia_smi:", "stalled:it8686:pwm1:",
+                         "duty-drift:it8686:pwm3:"):
+                assert frag in errs, errs
+            assert "\n" in errs
+            # clean status hides it again
+            data["status"] = {"ts": time.time(), "errors": {}}
+            scr._refresh(data)
+            assert not scr.query_one("#errors-box", Static).display
+
+    asyncio.run(run())
+
+
+def test_overview_state_shows_the_kick_the_daemon_is_running(
+        temp_config, machine):
+    """§21's comment asks for exactly this on screen: fighting for a fan is
+    not the same as reporting that it is stalled."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = pilot.app.screen
+            data = machine.live_payload()
+            data["status"] = {"ts": time.time(), "fans": {
+                "it8686:pwm1": {"state": "stalled",
+                                "kick": {"phase": "stop", "attempts": 2}}}}
+            scr._refresh(data)
+            cells = _fan_row_cells(scr.query_one("#fan-table", DataTable),
+                                   "it8686:pwm1")
+            assert any("STALLED" in c and "kicking stop attempt 2" in c
+                       for c in cells), cells
+
+    asyncio.run(run())
+
+
+def test_duty_cell_shows_the_register_when_it_disagrees():
+    """§20: commanded duty is not ownership. The raw value is published on
+    every row; showing it only on drift keeps the table readable."""
+    from alx_fancontrol.tui.screens.overview import OverviewScreen as O
+
+    assert O._duty_cell({"duty_pct": 20, "duty_raw": 51}) == "20"
+    assert O._duty_cell({"duty_pct": 20, "duty_raw": 120}) == "20 (raw 120!)"
+    assert O._duty_cell({}) == "—"
+
+
+def test_sidebar_says_which_config_this_session_edits(temp_config, machine):
+    """F11: root edits /etc and a dev shell edits ~/.config; until now the
+    TUI never said which one it was writing, so a sudo-less session could
+    produce a valid config that changes nothing."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            text = str(pilot.app.screen.query_one("#cfg-path",
+                                                  Static).render())
+            assert "config:" in text and "config.json" in text, text
+
+    asyncio.run(run())

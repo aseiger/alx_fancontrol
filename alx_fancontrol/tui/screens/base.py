@@ -11,6 +11,7 @@ to "jump back to the top". The selection is shown by the `active`
 class instead (set on_mount by the screen that owns it)."""
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 
 from textual.binding import Binding
@@ -78,6 +79,16 @@ def sel_value(widget: Select):
     """Select.value, mapping textual 8's Select.NULL sentinel to None."""
     v = widget.value
     return None if v is Select.NULL else v
+
+
+def _short_path(p) -> str:
+    """Config path with $HOME as ~ — the sidebar is 26 columns and
+    `/home/alex/.config/alx_fancontrol/config.json` does not fit."""
+    s = str(p)
+    home = os.path.expanduser("~")
+    if s.startswith(home):
+        s = "~" + s[len(home):]
+    return f"config: {s}"
 
 
 class NavButton(Button):
@@ -164,13 +175,23 @@ class BaseScreen(Screen):
         with Horizontal(id="shell"):
             with Vertical(id="sidebar"):
                 if not self.app.is_root:
-                    yield Static("⚠ non-root: no fan control — "
-                                 "use sudo alx-fancontrol", id="root-warn")
+                    # F11: it is not enough to say "no fan control". A
+                    # sudo-less session writes the HOME config, which the
+                    # running daemon (root, /etc) will never read — a
+                    # perfectly valid edit that changes nothing, discovered
+                    # only by the fans not responding.
+                    yield Static("⚠ non-root: no fan control — use sudo "
+                                 "alx-fancontrol. Saves below go to the file "
+                                 "shown here, which the running daemon does "
+                                 "not read.", id="root-warn")
                 yield NavButton("1 · Overview", id="nav-1")
                 yield NavButton("2 · Assign", id="nav-2")
                 yield NavButton("3 · Curves", id="nav-3")
                 yield NavButton("4 · Sources", id="nav-4")
                 yield NavButton("5 · Settings", id="nav-5")
+                # ...and which file every save in this session writes. Root
+                # edits /etc, a dev shell edits ~/.config (config.default_path).
+                yield Static(_short_path(self.app.cfg_path), id="cfg-path")
             with Vertical(id="content"):
                 yield from self.content()
 

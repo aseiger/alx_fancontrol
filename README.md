@@ -237,16 +237,20 @@ automatically on load — the TUI re-saves them as v2 on first open.
 | `config.stall_alert_command` | shell command run when a fan fault starts and again when it clears (default `""` = off). Event arrives in the environment: `ALX_FAN`, `ALX_STATE`, `ALX_DETAIL`, `ALX_DUTY_PCT`, `ALX_RPM`, `ALX_CONFIG` |
 | `config.stall_alert_timeout_s` | how long the alert command may run (default 5). Longer than that and it is killed with its process group — the loop that keeps the *other* fans alive is not negotiable |
 | `config.stall_alert_repeat_s` | re-alert every N seconds while a fault persists (default 300; `0` = once per episode) |
-| `sources.*.kind` | `hwmon` or `nvidia` |
-| `sources.*.chip` / `.temp` / `.chip_index` | hwmon source: chip **name prefix** (never `hwmonN` — indices reshuffle across reboots), temp index, and which instance of a duplicated prefix (two `k10temp` packages on this box → `chip_index` 0/1) |
-| `sources.*.pci_bus` | nvidia source: normalized PCI bus, e.g. `08:00.0` |
+| `assignments.*.source` | a source id string — **there is no `sources` section any more** (see the note below): ids come from runtime discovery, e.g. `k10temp[0]:temp1`, `it8686:temp5`, `gpu:47:00.0`. Screen 4 lists what exists right now; screen 2 offers them with live °C |
 | `curves.*.points` | `[temp_c, duty_pct]` pairs, ≥1, temps strictly increasing, duty 0–100. Eval clamps flat beyond the ends. |
 | `assignments.*.fans` | list of `chip:pwmN` — a fan **may** appear in several assignments; the daemon then drives it to the **highest** requested duty (validation warns) |
-| `assignments.*.tach` | optional `chip:pwmN → chip:fanN` RPM display map (the TUI auto-guesses it from sensors.d labels) |
+| `assignments.*.tach` | optional `chip:pwmN → chip:fanN` RPM source map. Screen 2 edits it per header (pre-filled from matching sensors.d labels, "(no tach)" selectable); a header with no entry reads no RPM, so **a stall on it cannot be detected** |
 | `assignments.*.floor_duty` / `.max_duty` / `.max_rate` | **per-fan** floor / ceiling / max duty change per poll — override the global fallbacks (floor ≤ max enforced) |
 | `assignments.*.failsafe` | `false` opts this assignment out of the fail-safe (it holds last duty instead of ramping). Validation warns — prefer disabling/deleting the assignment |
-| `assignments.*.failsafe_duty` / `.failsafe_after` | per-assignment fail-safe overrides |
+| `assignments.*.failsafe_duty` / `.failsafe_after` / `.failsafe_max_rate` | per-assignment fail-safe overrides; screen 2 edits all three, blank inherits the global |
 | `assignments.*.force_takeover` | `true` claims the channel even when `pwmN_enable` is 1 (manual, another owner) or 0 (disabled). Opt-in for headers the BIOS parks where they cannot cool anything; the value found there is still what gets restored on exit |
+
+**There is no `sources` section.** Sources are a property of the machine,
+not a setting: they are discovered at every daemon start (`sources.py`, from
+the hwmon tree plus one `nvidia-smi` call), and an assignment references one by
+its canonical id. A config that still carries `sources` is migrated on load —
+the ids are rewritten to what discovery produces (§14).
 
 **Writers:** only the TUI and humans (plain JSON by design). The daemon
 never writes the config; it hot-reloads on mtime change every poll
@@ -763,8 +767,10 @@ Additional rules honored everywhere:
   last duty; hwmon-driven fans keep moving. The failure is logged first
   + every 30th time.
 - **Two k10temp packages** — this box exposes the CPU temperature twice
-  (two packages/sockets). Use `chip_index: 0/1` on `k10temp` sources to
-  disambiguate (seeded as `cpu0`/`cpu1`).
+  (two packages/sockets). Discovery disambiguates duplicated chip prefixes
+  with a `[0]` / `[1]` suffix in the source id (`k10temp[0]:temp1`), so an
+  assignment says which package it reads even after a reboot reshuffles the
+  `hwmonN` numbering.
 - **TUI says "Config changed externally"** — someone/something edited
   the JSON since the TUI loaded it: Reload (discard in-TUI edits) or
   Overwrite. Don't run two TUIs at once.

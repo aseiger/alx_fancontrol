@@ -187,6 +187,21 @@ class FanControlApp(App):
         color: $text-muted;
         margin-bottom: 1;
     }
+    /* degradation and errors get their own styling: they mean "the fans are
+       not following your config", which is not a hint */
+    .alarm {
+        color: $error;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #errors-box {
+        color: $warning;
+        margin-bottom: 1;
+    }
+    #sidebar #cfg-path {
+        color: $text-muted;
+        margin-top: 1;
+    }
     """
 
     def __init__(self, config_path=None, live: bool = True):

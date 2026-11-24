@@ -121,6 +121,9 @@ class Daemon:
         self._missing_count: dict[str, int] = {}
         self._refuse_count: dict[str, int] = {}
         self._stall_count: dict[str, int] = {}
+        # fans we drive that have no usable RPM (no tach, or an id that does
+        # not resolve) — counted so the warning is logged once, not per poll
+        self._no_tach_count: dict[str, int] = {}
         # fan -> active stall-drive episode {phase, attempts, until, pulse}
         self._kick: dict[str, dict] = {}
         # fan -> duty % the episode commands right now; pass 2 defers to it
@@ -511,6 +514,31 @@ class Daemon:
             tach = self._tach_for(fan, cfg)
             tres = hwmon.resolve_tach(tach, self._chips, self.root) if tach else None
             self._rpm[fan] = hwmon.read_rpm(*tres) if tres else None
+            # A fan we drive with no tach is a fan nobody can see: every stall
+            # path below compares RPM against commanded duty, so with no tach
+            # it stays silent however hot the card gets. Say so once (and every
+            # 30 polls) instead of leaving the operator to discover it from a
+            # blank RPM column.
+            if tach is None:
+                n = self._no_tach_count.get(fan, 0) + 1
+                self._no_tach_count[fan] = n
+                if n == 1 or n % 30 == 0:
+                    self.log.warning(
+                        "FAN %s is driven with NO tach mapping: RPM stays "
+                        "unknown and a stall cannot be detected — set "
+                        "assignments.*.tach for it (TUI: screen 2, tach list)",
+                        fan)
+            elif self._rpm[fan] is None:
+                # mapped, but the mapping produces nothing: the chip is gone,
+                # or there is no fanN_input behind that number
+                n = self._no_tach_count.get(fan, 0) + 1
+                self._no_tach_count[fan] = n
+                if n == 1 or n % 30 == 0:
+                    self.log.warning(
+                        "FAN %s: tach %s yields no RPM reading — a stall on "
+                        "this header cannot be detected", fan, tach)
+            else:
+                self._no_tach_count.pop(fan, None)
             duty = self._duty.get(fan) or 0
             # A kick of ours parks the header at 0 for a poll. That 0 RPM is
             # something we did on purpose, so it must not raise the alarm we
@@ -1213,6 +1241,9 @@ class Daemon:
                 "label": self._fan_label(fan),
                 "duty_pct": self._duty.get(fan),
                 "rpm": self._rpm.get(fan),
+                # which tach backs that RPM (null = none: the fan is unwatched
+                # for stalls) — published so a reader does not have to guess
+                "tach": self._tach_for(fan, cfg),
                 "orig_enable": self._orig_enable.get(fan),
                 "state": self._fan_state.get(fan, "idle"),
             }

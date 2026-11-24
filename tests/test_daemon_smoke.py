@@ -461,3 +461,55 @@ def test_shared_fan_dead_source_still_driven_by_live_one(tmp_path, caplog):
     st = json.loads((cfg_path.parent / "status.json").read_text())
     assert st["fans"]["it8686:pwm3"]["state"] == "ok"
     assert st["sources"]["k10temp:temp1"]["stale"] is True
+
+
+# --------------------------------------------------------- tach visibility --
+
+def test_fan_without_tach_is_reported(caplog, tmp_path):
+    """A header we drive with no tach can never raise the stall alarm: every
+    stall path compares RPM against commanded duty, and there is no RPM. The
+    daemon used to be completely silent about that (§18/§20's failure stayed
+    invisible for exactly this reason), so it now says it out loud."""
+    caplog.set_level(logging.INFO)
+    root = make_tree(tmp_path)
+    cfg = make_config(tmp_path, {
+        "free": {"source": "k10temp:temp1", "curve": "default",
+                 "fans": ["it8686:pwm3"], "enabled": True},   # no tach at all
+    })
+    assert run_daemon(cfg, root, dry_run=False) == 0
+    assert "NO tach mapping" in caplog.text
+    assert "stall cannot be detected" in caplog.text
+    st = json.loads((cfg.parent / "status.json").read_text())
+    assert st["fans"]["it8686:pwm3"]["tach"] is None
+    assert st["fans"]["it8686:pwm3"]["rpm"] is None
+
+
+def test_mapped_tach_is_published_and_quiet(caplog, tmp_path):
+    caplog.set_level(logging.INFO)
+    root = make_tree(tmp_path)
+    cfg = make_config(tmp_path, {
+        "free": {"source": "k10temp:temp1", "curve": "default",
+                 "fans": ["it8686:pwm3"], "enabled": True,
+                 "tach": {"it8686:pwm3": "it8686:fan3"}},
+    })
+    assert run_daemon(cfg, root, dry_run=False) == 0
+    assert "NO tach mapping" not in caplog.text
+    st = json.loads((cfg.parent / "status.json").read_text())
+    assert st["fans"]["it8686:pwm3"]["tach"] == "it8686:fan3"
+    assert st["fans"]["it8686:pwm3"]["rpm"] == 3229
+
+
+def test_tach_that_does_not_resolve_is_reported(caplog, tmp_path):
+    """Mapped to an input that does not exist is the same blindness, with a
+    config line that looks correct — so it gets its own message."""
+    caplog.set_level(logging.INFO)
+    root = make_tree(tmp_path)
+    cfg = make_config(tmp_path, {
+        "free": {"source": "k10temp:temp1", "curve": "default",
+                 "fans": ["it8686:pwm3"], "enabled": True,
+                 "tach": {"it8686:pwm3": "it8686:fan9"}},
+    })
+    assert run_daemon(cfg, root, dry_run=False) == 0
+    assert "yields no RPM reading" in caplog.text
+    st = json.loads((cfg.parent / "status.json").read_text())
+    assert st["fans"]["it8686:pwm3"]["rpm"] is None

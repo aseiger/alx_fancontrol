@@ -38,7 +38,8 @@ from alx_fancontrol.tui.app import ConfigErrorsScreen, FanControlApp
 from alx_fancontrol.tui.reader import LiveUpdate
 from alx_fancontrol.tui.screens.assign import (AssignScreen,
                                                ConfirmDeleteScreen,
-                                               ConfirmScreen)
+                                               ConfirmScreen,
+                                               TachPickerModal)
 from alx_fancontrol.tui.screens.base import sel_value
 from alx_fancontrol.tui.screens.curves import (CurveEditorScreen,
                                                NewCurveModal,
@@ -1551,6 +1552,14 @@ def _goto_curves(pilot):
     return _go()
 
 
+def _goto_assign(pilot):
+    async def _go():
+        await pilot.press("2")
+        await pilot.pause()
+        return pilot.app.screen
+    return _go()
+
+
 def test_new_curve_creates_selects_and_persists_it(temp_config, machine):
     """`n` / New: a curve that did not exist before — the id is asked for
     (assignments reference it), and it lands in the config immediately."""
@@ -2149,5 +2158,224 @@ def test_delete_refuses_a_builtin_curve(temp_config, machine, notices):
                        and "would not stick" in m.lower()
                        for _s, m in notices), notices
             assert read_cfg(temp_config) == before
+
+    asyncio.run(run())
+
+
+# ------------------------------------------------------------- tach mapping --
+
+def _pick_fan(pilot, scr, fan):
+    """Click a row of the fan picker (the click-to-toggle entry point)."""
+    table = scr.query_one("#fan-pick", DataTable)
+    rows = {table.get_cell_at((r, 1)): r for r in range(table.row_count)}
+    return post_row_selected(pilot, table, rows[fan])
+
+
+def _cell(table: DataTable, row_key, col: int):
+    """Cell of the row whose key is `row_key` (keys are RowKey wrappers that
+    compare equal to the plain str we passed to add_row)."""
+    for r in range(table.row_count):
+        if table.coordinate_to_cell_key((r, 0))[0] == row_key:
+            return table.get_cell_at((r, col))
+    raise AssertionError(f"no row {row_key!s} in {table.id}")
+
+
+def test_picking_a_fan_shows_the_tach_it_guessed(temp_config, machine):
+    """The tach table pre-fills from matching sensors.d labels (pwm5 label ==
+    fan5 label), which is the common case and must not need a click."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await _pick_fan(pilot, scr, "it8686:pwm5")
+            tachs = scr.query_one("#tach-pick", DataTable)
+            assert tachs.row_count == 1
+            assert _cell(tachs, "it8686:pwm5", 1) == "it8686:fan5"
+
+    asyncio.run(run())
+
+
+def test_unmapped_header_saves_without_tach_and_warns(temp_config, machine,
+                                                     notices):
+    """Where the labels do not pair there is no guess: the row says so, and
+    saving warns that a stall on that header cannot be detected (F4 — before
+    this, an unmapped fan was simply unwatched, with no signal anywhere)."""
+    machine.labels["it8686"].pop("fan5", None)
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await _pick_fan(pilot, scr, "it8686:pwm5")
+            tachs = scr.query_one("#tach-pick", DataTable)
+            assert _cell(tachs, "it8686:pwm5", 1) == "(none)"
+            assert "stall" in _cell(tachs, "it8686:pwm5", 2)
+            scr.query_one("#name", Input).value = "unwatched"
+            scr.query_one("#source", Select).value = "k10temp:temp1"
+            scr.query_one("#curve", Select).value = "default"
+            scr.save_assignment()
+            await pilot.pause()
+            saved = read_cfg(temp_config)["assignments"]["unwatched"]
+            assert "tach" not in saved, saved
+            assert any("cannot be detected" in m.lower() and "pwm5" in m
+                       for _s, m in notices), notices
+
+    asyncio.run(run())
+
+
+def test_tach_picker_maps_a_header_the_guess_missed(temp_config, machine,
+                                                   notices):
+    """The fix for F4: with no label match the user can still say 'this fanN
+    is its RPM source', and that lands in the config."""
+    machine.labels["it8686"].pop("fan5", None)
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await _pick_fan(pilot, scr, "it8686:pwm5")
+            tachs = scr.query_one("#tach-pick", DataTable)
+            await post_row_selected(pilot, tachs, 0)
+            modal = await wait_modal(pilot, TachPickerModal)
+            # the cursor opens on the current mapping (here: no tach), so
+            # move to the first candidate and select it
+            table = modal.query_one("#tp-list", DataTable)
+            await post_row_selected(pilot, table, 0)
+            await wait_not_modal(pilot)
+            assert _cell(tachs, "it8686:pwm5", 1) == "it8686:fan1"
+            scr.query_one("#name", Input).value = "mapped"
+            scr.query_one("#source", Select).value = "k10temp:temp1"
+            scr.query_one("#curve", Select).value = "default"
+            scr.save_assignment()
+            await pilot.pause()
+            assert read_cfg(temp_config)["assignments"]["mapped"]["tach"] \
+                == {"it8686:pwm5": "it8686:fan1"}
+
+    asyncio.run(run())
+
+
+def test_tach_picker_lists_same_chip_inputs_first_with_their_labels(
+        temp_config, machine):
+    """Ordering and notes are how a human identifies the right tach: this
+    chip's inputs first, the sensors.d label beside each, and a flag on the
+    one whose label matches the header being mapped."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            opts = scr._tach_candidates("it8686:pwm1")
+            ids = [t for t, _n in opts]
+            # the machine exposes fan1/3/4 on it8686 and fan1/3 on it8792:
+            # this chip's inputs come first, then the other chip's
+            assert ids == ["it8686:fan1", "it8686:fan3", "it8686:fan4",
+                           "it8792:fan1", "it8792:fan3"]
+            notes = dict(opts)
+            assert "matches this header" in notes["it8686:fan1"]
+            assert notes["it8686:fan3"] == "SYS_FAN2"
+            assert notes["it8792:fan1"] == "SYS_FAN5_PUMP"
+
+    asyncio.run(run())
+
+
+def test_no_tach_choice_removes_an_existing_mapping(temp_config, machine):
+    """Explicitly unmapping must be possible (a tach wire that was moved to
+    another header is worse than no reading at all: it lies)."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True,
+                           "tach": {"it8686:pwm1": "it8686:fan1"}})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, scr)
+            tachs = scr.query_one("#tach-pick", DataTable)
+            assert _cell(tachs, "it8686:pwm1", 1) == "it8686:fan1"
+            await post_row_selected(pilot, tachs, 0)
+            modal = await wait_modal(pilot, TachPickerModal)
+            table = modal.query_one("#tp-list", DataTable)
+            await post_row_selected(pilot, table, table.row_count - 1)
+            await wait_not_modal(pilot)
+            assert _cell(tachs, "it8686:pwm1", 1) == "(none)"
+            scr.save_assignment()
+            await pilot.pause()
+            assert "tach" not in \
+                read_cfg(temp_config)["assignments"]["CPU"]
+
+    asyncio.run(run())
+
+
+def test_manual_tach_choice_beats_the_label_guess_on_later_saves(
+        temp_config, machine):
+    """A hand-set mapping must not be re-guessed away by an unrelated edit."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm5"], "enabled": True,
+                           "tach": {"it8686:pwm5": "it8686:fan2"}})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, scr)
+            # guess_tach would say it8686:fan5 (the labels pair); the config
+            # says fan2 and that is what the form must show and keep
+            assert app_guess(scr, "it8686:pwm5") == "it8686:fan5"
+            assert scr._tach_map["it8686:pwm5"] == "it8686:fan2"
+            scr.query_one("#floor", Input).value = "15"
+            scr.save_assignment()
+            await pilot.pause()
+            assert read_cfg(temp_config)["assignments"]["CPU"]["tach"] == \
+                {"it8686:pwm5": "it8686:fan2"}
+
+    asyncio.run(run())
+
+
+def app_guess(scr, fan):
+    return scr.app.guess_tach(fan)
+
+
+def test_unlabeled_tach_is_listed_without_a_redundant_note(temp_config,
+                                                           machine):
+    """sensors.d has no label for every input. The generic 'fan3 (it8686)'
+    fallback would only restate the id in the column beside it, so the note
+    stays blank — and an unlabeled input must still be mappable."""
+    machine.labels["it8686"].pop("fan4")
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            notes = dict(scr._tach_candidates("it8686:pwm1"))
+            assert notes["it8686:fan4"] == ""
+            assert notes["it8686:fan3"] == "SYS_FAN2"
+            # and it can actually be chosen
+            await _pick_fan(pilot, scr, "it8686:pwm5")
+            tachs = scr.query_one("#tach-pick", DataTable)
+            await post_row_selected(pilot, tachs, 0)
+            modal = await wait_modal(pilot, TachPickerModal)
+            table = modal.query_one("#tp-list", DataTable)
+            rows = {table.get_cell_at((r, 0)): r
+                    for r in range(table.row_count)}
+            await post_row_selected(pilot, table, rows["it8686:fan4"])
+            await wait_not_modal(pilot)
+            assert _cell(tachs, "it8686:pwm5", 1) == "it8686:fan4"
 
     asyncio.run(run())

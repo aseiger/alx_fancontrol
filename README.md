@@ -483,7 +483,9 @@ top item), so: **keys navigate, clicks focus** fields/tables.
 
 1. **Overview** — live tables: *Sources* (label, kind, chip/bus, °C,
    stale?) and *Fans* (assignment, label, source °C, live duty % from
-   `pwmN`, live RPM from the tach, state) + a daemon status line
+   `pwmN`, live RPM from the tach — or **`no tach`**, meaning nothing is
+   mapped to that header so a stall there cannot be detected —, state)
+   + a daemon status line
    (running / stale >3 s / absent, config mtime, last error from
    `status.json`).
 2. **Assign** — top: a list of the existing assignments (name, source,
@@ -501,12 +503,18 @@ top item), so: **keys navigate, clicks focus** fields/tables.
    source `Select` (rows show live °C), curve `Select`, fan picker (click a
    row to toggle ✓ — every channel is pickable; channels another process
    holds in manual mode are refused by the *daemon* at takeover, not by the
-   UI), floor % / ceiling % / rate %/poll — **blank means "no override": the
+   UI), **RPM source (tach) table** (one row per picked fan: which `fanN`
+   reports its RPM, what that input is called in `sensors.d`, and the RPM it
+   reads now. Picking a header pre-fills the input whose label matches it;
+   **click a row to choose another** — including *“(no tach)”* for a header
+   with no tach wire. Saving with a header left unmapped warns: no RPM means
+   the stall detector (§20/§21) can never fire for that fan), floor % /
+   ceiling % / rate %/poll — **blank means "no override": the
    global `config` value applies and the per-assignment key is removed**, and
    the placeholders show the global values currently in effect — and an
    **enabled** switch. Keys this form does not manage (`failsafe`,
-   `failsafe_duty`, `failsafe_after`, `force_takeover`, hand-set `tach`
-   entries for fans that stay picked) are carried through untouched.
+   `failsafe_duty`, `failsafe_after`, `force_takeover`) are carried through
+   untouched.
 3. **Curves** — points table (cursor-selectable) + live text plot
    (curve as `█` columns, `◄` marker at the current temp of the
    selected preview source, every point marked `●` and the selected one

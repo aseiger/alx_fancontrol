@@ -105,10 +105,19 @@ class OverviewScreen(BaseScreen):
             assign_cell = aid
             duty = d.get("duty_pct")
             rpm = d.get("rpm")
+            # A blank RPM means one of two very different things, and the
+            # difference decides whether a stall on this header can be seen
+            # at all: no tach mapped (nothing to read) vs. a tach that reads
+            # nothing right now. Say which.
+            if rpm is None:
+                rpm_cell = "no tach" if ("tach" in d and d["tach"] is None) \
+                    else "—"
+            else:
+                rpm_cell = str(rpm)
             fan.add_row(
                 f, d.get("label", "—"), assign_cell, src_cell,
                 "—" if duty is None else f"{duty:.0f}",
-                "—" if rpm is None else str(rpm),
+                rpm_cell,
                 self._fan_state(f, aid, data),
                 key=f,
             )

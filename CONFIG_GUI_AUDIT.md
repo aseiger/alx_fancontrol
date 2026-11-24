@@ -9,8 +9,8 @@ the real TUI against the synthetic machine (`tests/fake_machine.py`) and
 asserted on the file written to disk. Probes were deleted after running;
 the findings below cite the evidence each one produced.
 **Tree:** `6209746` (2026-11-23).
-**Status:** steps 1–2 landed — **F2, F3, F7, F8, F9 fixed** (see §D,
-`IMPLEMENTATION_NOTES.md` §22–§23). F4–F6, F10–F13 still open.
+**Status:** steps 1–3 landed — **F2, F3, F4, F7, F8, F9 fixed** (see §D,
+`IMPLEMENTATION_NOTES.md` §22–§24). F5–F6, F10–F13 still open.
 
 ---
 
@@ -84,7 +84,7 @@ rendered on any of the four screens.)
 | `max_duty` | ⚠️ edit | same |
 | `max_rate` | ⚠️ edit | same |
 | `enabled` | 👁 view | list shows `on`/`off`; **no control at all** (F3) |
-| `tach` | ⚠️ auto | written only by `app.guess_tach()`; no editor (F4) |
+| `tach` | ✅ editor | tach table per picked fan (`#tach-pick`) + `TachPickerModal`; guess is a pre-fill, "(no tach)" selectable; unmapped warns — §24 |
 | `failsafe` | ✗ | silently preserved on save |
 | `failsafe_duty` | ✗ | silently preserved |
 | `failsafe_after` | ✗ | silently preserved |
@@ -153,7 +153,7 @@ and the fail-safe-disabled warning) — requires hand-editing JSON. Deleting
 is available and is the wrong tool: it also gives up the tach mapping, the
 floor, and firmware control of the header.
 
-### F4 · High (bug) — no tach editor; a fan without a tach is silently unmonitored
+### F4 · High (bug, **fixed** §24) — no tach editor; a fan without a tach is silently unmonitored
 
 `app.guess_tach()` (`app.py:235-249`) maps `chip:pwmN → chip:fanN` **only
 when `sensors.d` labels both identically**. `save_assignment` writes tach
@@ -168,6 +168,13 @@ that fan**, with no warning anywhere. The Overview RPM column just shows `—`.
 
 Also: stale tach entries are never cleaned. Remove a fan from an assignment
 and its `tach` entry survives in the map.
+
+**Fixed (§24):** a tach table per picked fan with a picker modal (same-chip
+inputs first, sensors.d labels, "matches this header" flag, explicit
+*no tach*), `guess_tach` demoted to a pre-fill, stale entries dropped on
+save, and the fact made visible in three places — save notification, daemon
+warning, and `no tach` in the Overview RPM column (`status.json` now carries
+`tach` per fan).
 
 ### F5 · High — takeover refused → `force_takeover` is unreachable, and the picker hides ownership
 
@@ -425,7 +432,7 @@ F1 from coming back next time a knob is added — which, given §18→§21 added
 |---|---|---|---|
 | 1 ✅ | F2 clear-override, F3 enable toggle, F9 rename-confirm, F8 validate-before-save | `assign.py`, `app.save_config` | small, local |
 | 2 ✅ | F7 curve new/duplicate/delete/label + first point | `curves.py`, `base.py` (`ConfirmScreen`) | small |
-| 3 | F4 tach editor + no-tach warning + stale-entry cleanup | `assign.py`, `app.py` | medium (safety-relevant) |
+| 3 ✅ | F4 tach editor + no-tach warning + stale-entry cleanup | `assign.py`, `hwmon.py`, `daemon.py`, `overview.py` | medium (safety-relevant) |
 | 4 | F1 Settings screen + `SCHEMA` refactor of `validate()` **+ F14 (seed defaults once, don't re-merge on load)** | `config.py`, new `tui/screens/settings.py`, `base.py`, `app.py` | medium, mostly mechanical |
 | 5 | F5 ownership column + `force_takeover` control | `assign.py`, `hwmon.py` (read enable per channel) | medium |
 | 6 | F10 Overview upgrades, F11 config path, F12 input polish, F13 README | `overview.py`, screens, README | low |

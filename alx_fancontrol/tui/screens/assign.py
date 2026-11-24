@@ -8,15 +8,19 @@ confirmation; releasing hands the fans back to the firmware).
 Form: assignment name (also the rename path — renaming asks first, and
 renaming in place rather than leaving a second assignment behind),
 source Select (live °C in the labels), curve Select, fan picker as a
-click-to-toggle DataTable, an enabled Switch, and floor / ceiling / rate
-inputs. Blank floor/ceiling/rate means "no override: use the global
-default" and REMOVES the key, so an override is reversible from the GUI.
-Save → app.save_config() (which validates before writing).
+click-to-toggle DataTable, a **tach table** (click a row to choose which
+`chip:fanN` reports that header's RPM — pre-filled from matching sensors.d
+labels, explicitly settable, "no tach" selectable), an enabled Switch,
+and floor / ceiling / rate inputs. Blank floor/ceiling/rate means "no
+override: use the global default" and REMOVES the key, so an override is
+reversible from the GUI.
+Save → app.save_config() (which validates before writing), then warns
+about any picked fan left without a tach — no RPM means no stall detection.
 
 Keys this form does not manage (`failsafe`, `failsafe_duty`,
-`failsafe_after`, `force_takeover`, hand-set `tach` entries for fans that
-are still picked) are carried through untouched — safety settings edited
-in JSON survive an edit made here.
+`failsafe_after`, `force_takeover`) are carried through untouched — safety
+settings edited in JSON survive an edit made here. `tach` is managed here
+now: the tach table is what gets written.
 
 Note: channels already held in manual mode by another process are
 selectable here, but the daemon refuses to take them over at runtime
@@ -29,8 +33,9 @@ from collections.abc import Iterator
 
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import (Button, DataTable, Input, Select, Static,
-                             Switch)
+from textual.screen import ModalScreen
+from textual.widgets import (Button, DataTable, Input, Label, Select,
+                             Static, Switch)
 
 from textual.widgets._select import SelectOverlay
 
@@ -54,6 +59,80 @@ class ConfirmDeleteScreen(ConfirmScreen):
             ok_label="Delete", ok_variant="error", ok_id="confirm-del")
         # kept for tests/back-compat: the assignment this modal is about
         self.assignment_name = assignment_name
+
+
+class TachPickerModal(ModalScreen[str | None]):
+    """Which tach reports this header's RPM.
+
+    Dismisses with the chosen 'chip:fanN', with "" for an explicit "no tach"
+    (a header with no tach wire), or None when cancelled.
+
+    This screen exists because the mapping used to be invisible: it was
+    guessed from matching sensors.d labels and, where the labels did not pair,
+    the assignment ended up with NO tach at all. That reads as a blank RPM
+    cell on the Overview while the stall detector — which compares RPM against
+    commanded duty — quietly never fires for that header.
+    """
+
+    DEFAULT_CSS = """
+    TachPickerModal {
+        align: center middle;
+    }
+    TachPickerModal #tp-box {
+        width: 66;
+        height: auto;
+        max-height: 90%;
+        border: tall;
+        padding: 1 2;
+    }
+    TachPickerModal .tp-ctx {
+        color: $text-muted;
+    }
+    """
+    #: the list takes focus so ↑/↓/Enter work the moment it opens
+    AUTO_FOCUS = "#tp-list"
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    NONE_KEY = "__none__"
+
+    def __init__(self, fan: str, current: str | None, options):
+        super().__init__()
+        self.fan = fan
+        self.current = current
+        self.options = list(options)      # [(tach id, note)]
+
+    def compose(self):
+        with Vertical(id="tp-box"):
+            yield Label(f"RPM source for {self.fan}")
+            yield Label("current: " + (self.current or "(none)"),
+                        classes="tp-ctx")
+            yield DataTable(id="tp-list")
+            yield Label("↑/↓ choose · Enter use · Esc cancel",
+                        classes="tp-ctx")
+
+    def on_mount(self):
+        table = self.query_one("#tp-list", DataTable)
+        table.add_columns(("tach", "tt"), ("note", "tn"))
+        table.cursor_type = "row"
+        row_of = {}
+        for tach_id, note in self.options:
+            table.add_row(tach_id, note, key=tach_id)
+            row_of[tach_id] = table.row_count - 1
+        table.add_row("(no tach — no RPM, no stall detection)", "",
+                      key=self.NONE_KEY)
+        row_of[self.NONE_KEY] = table.row_count - 1
+        table.move_cursor(row=row_of.get(self.current or self.NONE_KEY, 0))
+
+    def on_data_table_row_selected(self, event):
+        key = getattr(event.row_key, "value", event.row_key)
+        if key is None:
+            self.dismiss(None)
+            return
+        key = str(key)
+        self.dismiss("" if key == self.NONE_KEY else key)
+
+    def action_cancel(self):
+        self.dismiss(None)
 
 
 class AssignScreen(BaseScreen):
@@ -100,6 +179,20 @@ class AssignScreen(BaseScreen):
     #enabled-row Switch {
         margin: 0 1 0 0;
     }
+    /* Both lists grow with their content but stay bounded: an unbounded fan
+       picker pushed the overrides, the enabled switch and Save below the fold
+       on a 50-row terminal (and the tach list would have followed it), so the
+       form became unreachable without scrolling — which this screen cannot
+       do, being a plain Vertical. Bounded tables scroll themselves. */
+    #fan-pick {
+        height: auto;
+        max-height: 10;
+    }
+    /* One row per picked fan. */
+    #tach-pick {
+        height: auto;
+        max-height: 8;
+    }
     """
 
     def _global_default(self, key: str) -> str:
@@ -131,6 +224,10 @@ class AssignScreen(BaseScreen):
             yield Static("fans — click a row to toggle (✓):",
                          classes="hint")
             yield DataTable(id="fan-pick")
+            yield Static("RPM source per fan — click a row to change it. "
+                         "No tach = no RPM reading, and the daemon cannot "
+                         "see that header stall.", classes="hint")
+            yield DataTable(id="tach-pick")
             with Horizontal():
                 yield Input(
                     placeholder=f"floor % (global "
@@ -138,7 +235,7 @@ class AssignScreen(BaseScreen):
                                 f"blank = use it)",
                     id="floor", restrict=r"[0-9]", max_length=3)
                 yield Input(
-                    placeholder=f"ceiling % (global 100, blank = use it)",
+                    placeholder="ceiling % (global 100, blank = use it)",
                     id="maxduty", restrict=r"[0-9]", max_length=3)
                 yield Input(
                     placeholder=f"rate %/poll (global "
@@ -154,6 +251,7 @@ class AssignScreen(BaseScreen):
 
     def on_mount(self):
         self._picked: set[str] = set()
+        self._tach_map: dict[str, str | None] = {}
         self._editing: str | None = None
         self._populate_source(self.app.live)
         self._populate_curves()
@@ -169,6 +267,11 @@ class AssignScreen(BaseScreen):
                           ("label", "flabel"), ("rpm", "frpm"))
         table.cursor_type = "row"  # row events need this
         self._refresh_fans()
+        tachs = self.query_one("#tach-pick", DataTable)
+        tachs.add_columns(("fan", "tf"), ("tach", "tt"),
+                          ("note", "tn"), ("rpm", "tr"))
+        tachs.cursor_type = "row"
+        self._refresh_tachs()
 
     # ---------------------------------------------------------- selects --
     def _source_options(self, data: dict) -> list[tuple[str, str]]:
@@ -289,6 +392,10 @@ class AssignScreen(BaseScreen):
             self.notify(f"curve '{crv_id}' missing — pick another",
                         severity="warning")
         self._picked = set(a.get("fans", []))
+        # explicit tach mappings of the assignment, one entry per picked fan
+        # (None where the config has none) — the table shows and edits these
+        saved_tach = a.get("tach") or {}
+        self._tach_map = {f: saved_tach.get(f) for f in self._picked}
         self.query_one("#floor", Input).value = (
             str(a["floor_duty"]) if a.get("floor_duty") is not None else "")
         self.query_one("#maxduty", Input).value = (
@@ -297,6 +404,7 @@ class AssignScreen(BaseScreen):
             str(a["max_rate"]) if a.get("max_rate") is not None else "")
         self.query_one("#enabled", Switch).value = bool(a.get("enabled", True))
         self._refresh_fans()
+        self._refresh_tachs()
         self.query_one("#form-title", Static).update(
             f"Editing '{name}' — saving overwrites it")
 
@@ -304,12 +412,14 @@ class AssignScreen(BaseScreen):
         """Back to 'new assignment': blank form, nothing picked."""
         self._editing = None
         self._picked.clear()
+        self._tach_map.clear()
         self.query_one("#name", Input).value = ""
         self.query_one("#floor", Input).value = ""
         self.query_one("#maxduty", Input).value = ""
         self.query_one("#rate", Input).value = ""
         self.query_one("#enabled", Switch).value = True
         self._refresh_fans()
+        self._refresh_tachs()
         self.query_one("#form-title", Static).update("New assignment")
 
     def _selected_list_name(self) -> str | None:
@@ -405,6 +515,73 @@ class AssignScreen(BaseScreen):
             )
         restore_table_cursor(table, prev_key, prev_hover)
 
+    # ---------------------------------------------------------------- tach
+    @staticmethod
+    def _tach_note(chip: str, idx: int, labels) -> str:
+        """The sensors.d label of a tach input, '' when it has none —
+        `sensor_label`'s generic 'fan1 (it8686)' fallback would only restate
+        the id already in the column beside it."""
+        return (labels or {}).get(chip, {}).get(f"fan{idx}") or ""
+
+    def _tach_candidates(self, fan: str) -> list[tuple[str, str]]:
+        """(tach id, note) options for one header — same-chip inputs first,
+        because a header's RPM almost always comes from the matching input on
+        the same SuperIO. The note is the sensors.d label, plus a flag when it
+        is the label THIS pwm carries (that pairing is what guess_tach used to
+        be the only way to rely on)."""
+        parsed = hwmon.parse_fan_id(fan)
+        chip = parsed[0] if parsed else None
+        fan_lab = self.app.fan_label(fan)
+        same: list[tuple[str, str]] = []
+        other: list[tuple[str, str]] = []
+        for tach_id, _d, idx in hwmon.list_tach_channels(self.app.chips):
+            t = hwmon.parse_tach_id(tach_id)
+            if t is None:
+                continue
+            note = self._tach_note(t[0], idx, self.app.labels)
+            if note and note == fan_lab:
+                note = f"{note} · matches this header"
+            (same if t[0] == chip else other).append((tach_id, note))
+        return same + other
+
+    def _refresh_tachs(self):
+        """One row per picked fan: what tach it will use, why that one, and
+        the RPM that tach is reading right now."""
+        app = self.app
+        table = self.query_one("#tach-pick", DataTable)
+        prev_key = table_cursor_key(table)
+        prev_hover = table_hover_key(table)
+        table.clear()
+        for fan in sorted(self._picked):
+            tach = self._tach_map.get(fan)
+            note = ""
+            rpm = "—"
+            if tach:
+                parsed = hwmon.parse_tach_id(tach)
+                if parsed:
+                    note = self._tach_note(parsed[0], parsed[1], app.labels)
+                res = hwmon.resolve_tach(tach, app.chips)
+                if res is not None:
+                    got = hwmon.read_rpm(*res)
+                    rpm = "—" if got is None else str(got)
+            else:
+                note = "no RPM — stall cannot be detected"
+            table.add_row(fan, tach or "(none)", note, rpm, key=fan)
+        restore_table_cursor(table, prev_key, prev_hover)
+
+    def _start_pick_tach(self, fan: str):
+        self.run_worker(self._pick_tach_flow(fan), exclusive=False)
+
+    async def _pick_tach_flow(self, fan: str):
+        choice = await self.app.push_screen_wait(
+            TachPickerModal(fan=fan,
+                            current=self._tach_map.get(fan),
+                            options=self._tach_candidates(fan)))
+        if choice is None:
+            return                      # cancelled: mapping untouched
+        self._tach_map[fan] = choice or None
+        self._refresh_tachs()
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected):
         # textual >= 1 API: RowSelected carries .data_table and .row_key.
         # There is no .table attribute — tests/test_tui_ux.py guards this.
@@ -421,14 +598,21 @@ class AssignScreen(BaseScreen):
         if table.id == "assign-list":
             self._load_assignment(key)
             return
-        # fan picker: toggle ✓
+        if table.id == "tach-pick":
+            self._start_pick_tach(key)
+            return
+        # fan picker: toggle ✓, and seed its tach with the label match so a
+        # normal header is mapped without another click (overridable below)
         fan = key
         if fan in self._picked:
             self._picked.discard(fan)
+            self._tach_map.pop(fan, None)
             table.update_cell(fan, "sel", "")
         else:
             self._picked.add(fan)
+            self._tach_map[fan] = self.app.guess_tach(fan)
             table.update_cell(fan, "sel", "✓")
+        self._refresh_tachs()
 
     def on_live_update(self, msg: LiveUpdate):
         data = msg.data
@@ -440,6 +624,9 @@ class AssignScreen(BaseScreen):
                 continue
             rpm = data.get("fans", {}).get(fan, {}).get("rpm")
             table.update_cell(fan, "frpm", "—" if rpm is None else str(rpm))
+        # RPM for what the form has MAPPED (not what the saved config maps),
+        # so picking a candidate shows whether it can be the right one
+        self._refresh_tachs()
         # live temps in the source picker labels
         self._populate_source(data)
 
@@ -548,9 +735,11 @@ class AssignScreen(BaseScreen):
           * keys this form does not manage (`failsafe`, `failsafe_duty`,
             `failsafe_after`, `force_takeover`, ...) are carried over, so
             hand-edited safety settings survive an edit made here.
-          * `tach` keeps explicit mappings for fans that are still picked (a
-            hand-set tach must not vanish on a save) and drops entries whose
-            fan is no longer in the assignment.
+          * `tach` comes from the tach table, which is authoritative: a
+            mapping the user left there (or that was pre-filled from the
+            matching sensors.d label) is written, unmapped fans get no entry
+            and are warned about below. Entries for fans that left the
+            assignment disappear with them.
         """
         app = self.app
         assignment = dict(base if base is not None
@@ -563,17 +752,12 @@ class AssignScreen(BaseScreen):
             else:
                 assignment[key] = form[key]
         fans = form["fans"]
-        tach = {f: t for f, t in (assignment.get("tach") or {}).items()
-                if f in fans}
-        for f in fans:
-            if f not in tach:
-                guess = app.guess_tach(f)
-                if guess:
-                    tach[f] = guess
+        tach = {f: t for f, t in self._tach_map.items() if f in fans and t}
         if tach:
             assignment["tach"] = tach
         else:
             assignment.pop("tach", None)
+        unmapped = [f for f in fans if not self._tach_map.get(f)]
         app.cfg.assignments[name] = assignment
         if drop and drop != name:
             app.cfg.assignments.pop(drop, None)
@@ -594,5 +778,15 @@ class AssignScreen(BaseScreen):
                     "Shared fan(s) are driven to the HIGHEST requested "
                     f"duty (also controlled by: {', '.join(shared)})",
                     severity="info")
+            if unmapped:
+                # not an error — some headers genuinely have no tach wire —
+                # but the daemon compares RPM against duty to see a stall, so
+                # an unmapped header is an unwatched one, and silence here is
+                # how §18/§20's failure stayed invisible
+                self.notify(
+                    f"No RPM source (tach) for: {', '.join(unmapped)} — "
+                    "those headers will read '—' and a stall on them cannot "
+                    "be detected. Click one in the tach list to map it.",
+                    severity="warning", timeout=12)
             self._reset_form()
             self._refresh_list()

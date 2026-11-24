@@ -175,6 +175,27 @@ def list_pwm_channels(chips=None, root=HWMON_ROOT) -> list[tuple[str, Path, int]
     return out
 
 
+def list_tach_channels(chips=None, root=HWMON_ROOT) -> list[tuple[str, Path, int]]:
+    """All ('prefix:fanN', chip_dir, N) RPM inputs, sorted.
+
+    The TUI offers these when mapping a header's tach. It matters because a
+    header WITHOUT a tach mapping reads no RPM at all, and the stall detector
+    compares RPM against duty — so it cannot fire for that fan. Mapping is
+    therefore not cosmetics: guessing wrong (or not at all) leaves a fan
+    unwatched."""
+    out: list[tuple[str, Path, int]] = []
+    for prefix, d in (chips if chips is not None else find_all_chips(root)):
+        try:
+            entries = [p.name for p in d.iterdir()]
+        except OSError:
+            continue
+        idxs = sorted({int(m.group(1)) for n in entries
+                       if (m := re.fullmatch(r"fan(\d+)_input", n))})
+        for i in idxs:
+            out.append((f"{prefix}:fan{i}", d, i))
+    return out
+
+
 # ---------------------------------------------------------- nvidia-smi ----
 
 def norm_bus(busid: str) -> str:

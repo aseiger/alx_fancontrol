@@ -978,3 +978,99 @@ in the picker options; Delete refuses a built-in curve without touching the
 file (F14).
 
 Suite: **213 passed** (205 + 8).
+
+## 24. Config↔GUI audit, step 3: the tach mapping stops being invisible (2026-11-24)
+
+F4 from `CONFIG_GUI_AUDIT.md`. The worst finding in the audit, and the only
+one that was an outright bug rather than a missing control: `tach` — which
+RPM input belongs to which PWM header — could only be written by
+`app.guess_tach()`, which maps `chip:pwmN → chip:fanN` **only when the
+sensors.d labels of both are identical**. Where they did not pair, the saved
+assignment had no `tach` key at all. Nothing said so. The Overview showed `—`
+in the RPM column, which reads as "fan stopped" or "sensor quiet", and the
+stall detector — §20/§21, the reason this project exists — compares RPM
+against commanded duty, so it **could never fire for that header**, however
+hot the card got. §18 and §20 were both found by a human noticing a fan; a
+header with no tach cannot be found that way.
+
+### What changed
+
+**`hwmon.list_tach_channels(chips, root)`** — enumerates every `fanN_input`
+as `("prefix:fanN", chip_dir, N)`, the sibling of `list_pwm_channels`. The
+TUI had no way to ask "what RPM inputs exist", which is why guessing was the
+only option it had.
+
+**Assign screen: a tach table (`#tach-pick`)** below the fan picker — one row
+per *picked* header: the mapping, what that input is called in sensors.d, and
+the RPM it reads right now (from the form's own mapping, not from the saved
+config, so trying a candidate immediately shows whether it can be the right
+one). Clicking a row opens `TachPickerModal`: same-chip inputs first (a
+header's tach is almost always the matching input on the same SuperIO), then
+the other chips, each with its label, plus the input whose label matches the
+header flagged **"matches this header"**, and finally an explicit
+**(no tach — no RPM, no stall detection)**. The cursor opens on the current
+mapping. `Esc` cancels without touching anything; choosing "(no tach)" is a
+real edit, not a no-op.
+
+Picking a header in the fan list pre-fills the guess (the common case stays
+one click); the table then shows what was assumed instead of hiding it.
+Loading an assignment seeds the map from its saved `tach`, so a hand-written
+mapping wins over the label guess and survives unrelated edits.
+
+**`_commit()` no longer guesses.** The tach table is authoritative: what is
+in it is written, unmapped fans get no entry, and entries for headers that
+left the assignment disappear with them (the audit's stale-entry half of F4).
+
+**Warnings where silence used to be.** Saving with a header unmapped notifies
+— names the headers, says a stall on them cannot be detected, says where to
+fix it. The daemon logs the same fact once per fan (then every 30 polls) at
+`warning`: `FAN … is driven with NO tach mapping`, plus a distinct message
+for a mapping that yields no reading (chip gone, or no `fanN_input` behind
+that number — a config line that looks correct). `status.json` fan entries
+gained `"tach"`, so a reader does not have to infer it from a blank RPM, and
+the Overview prints **`no tach`** instead of `—` for exactly that case.
+
+### Decisions
+
+- **Warn, don't block.** A header genuinely can have no tach wire — an empty
+  socket, or a 3-pin fan with no sense line. Refusing to save would make the
+  legitimate case impossible, and the operator who knows is the one person
+  who should be allowed to say "there is no tach here".
+- **Explicit "(no tach)" instead of just deleting the row.** Unmapping is a
+  real operation: a tach moved to another header reports *another fan's* RPM,
+  which is worse than no reading, because the stall detector will happily
+  watch the wrong fan and stay quiet about the right one.
+- **A modal rather than an inline `Select`.** The option set is per-header and
+  needs two columns of explanation (id + label); a `Select` inside a form row
+  that is already `1fr` shared with another `Select` would have been unreadable
+  — and the same widget now serves both chips.
+- **Guess stays, but only as a pre-fill.** Removing it entirely would make the
+  normal case two clicks per fan; keeping it as the *default of an editable
+  field* keeps the convenience and drops the lie.
+
+### Layout note
+
+The assign form is long, and `#content` is a plain `Vertical`: it does not
+scroll, so content below the fold is simply unreachable. `#fan-pick` is now
+capped at 10 rows and `#tach-pick` at 8 (both scroll internally), which keeps
+the Save button on screen at 50 rows even with every header picked — measured
+with a widget-region probe, not by eye. On a 40-row terminal the last line or
+two still fall below the fold; `s` saves and the footer says so. Swapping
+`#content` for `VerticalScroll` was tried and reverted: it changes the layout
+of all four screens at once (their tables are `1fr`) and did not measurably
+improve reachability, which makes it step 4's problem, not this step's.
+
+### Tests
+
+10 new tests (7 TUI, 3 daemon): picking a header shows the tach it guessed; an
+unmapped header saves with no `tach` **and** warns (both the table cell and
+the notification); the picker maps a header whose labels do not pair, and the
+mapping lands in the file; candidate ordering and notes (this chip first,
+labels beside each, "matches this header" on the matching one); "(no tach)"
+removes an existing mapping; a hand-set mapping beats the label guess across a
+later unrelated save; an input with no sensors.d label is listed with a blank
+note and is still mappable. Daemon: no tach → warning + `status.json`
+`tach: null` and `rpm: null`; mapped and live → quiet, RPM published; mapped
+but reading nothing → its own warning.
+
+Suite: **223 passed** (213 + 10).

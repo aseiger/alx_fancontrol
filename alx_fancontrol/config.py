@@ -64,6 +64,24 @@ DEFAULTS = {
         # ---- stalled-fan alarm: duty high but tach reads ~0 RPM --------
         "stall_min_duty": 20,
         "stall_after": 10,
+        # ---- a confirmed stall is also an order, not only a log line ------
+        # Escalation reaches a person; this reaches the header, and only the
+        # header. A fan reading 0 RPM is pinned to `stall_full_duty` — past
+        # the curve's ceiling and past the rate limiter, because the curve is
+        # what left it under-powered and a stalled fan needs no soft start.
+        # Then we try to restart it: a brief drop to 0 so a jammed blade can
+        # swing free, then full voltage, judged by the tach. Attempts per
+        # round are bounded and the rounds are spaced, so a seized winding
+        # does not cook itself (or the fan driver) on stall current; between
+        # rounds and after them the header stays pinned, never parked.
+        "stall_full_duty": 100,
+        "stall_kick": True,          # false = pin only, never pulse to 0
+        "stall_kick_attempts": 3,
+        "stall_kick_stop_s": 0.5,    # at 0 before each lunge
+        "stall_kick_run_s": 3.0,     # full duty before judging the tach
+        "stall_kick_backoff_s": 30,  # rest between rounds (fan + driver heat)
+        "stall_kick_cooldown_s": 60,  # spinning again: hold full, then hand
+                                      # the duty back to the curve
         # ---- escalation once a fan is confirmed not cooling -------------
         # A stalled blower is not something we can fix by writing duty, so the
         # alarm has to reach a person. Fans only: there is deliberately no
@@ -207,6 +225,12 @@ def validate(cfg: Config) -> tuple[list[str], list[str]]:
                         ("watchdog_seconds", 0, None),
                         ("stall_min_duty", 0, 100),
                         ("stall_after", 1, None),
+                        ("stall_full_duty", 0, 100),
+                        ("stall_kick_attempts", 0, None),
+                        ("stall_kick_stop_s", 0, None),
+                        ("stall_kick_run_s", 0, None),
+                        ("stall_kick_backoff_s", 0, None),
+                        ("stall_kick_cooldown_s", 0, None),
                         ("stall_alert_timeout_s", 0, None),
                         ("stall_alert_repeat_s", 0, None)):
         if key not in c:
@@ -222,6 +246,22 @@ def validate(cfg: Config) -> tuple[list[str], list[str]]:
     cmd = c.get("stall_alert_command", "")
     if cmd is not None and not isinstance(cmd, str):
         errors.append(f"config.stall_alert_command must be a string, got {cmd!r}")
+
+    kick = c.get("stall_kick", True)
+    if not isinstance(kick, bool):
+        errors.append(f"config.stall_kick must be true or false, got {kick!r}")
+
+    # Pinning a stalled fan BELOW the threshold that defines "we are asking
+    # for real duty" would disarm the very detector that started the episode:
+    # the fan would sit at, say, 10 %, un-alarmed and un-kicked, which is the
+    # failure this whole path exists to catch. Refuse the pairing outright.
+    full, mind = c.get("stall_full_duty"), c.get("stall_min_duty")
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool)
+           for v in (full, mind)) and full < mind:
+        errors.append(
+            f"config.stall_full_duty ({full}) must be >= stall_min_duty "
+            f"({mind}): pinning a stalled fan under the alarm threshold would "
+            "disarm the detector that pinned it")
 
     # (sources are not in the config anymore — they are discovered at
     # runtime; an assignment whose source is not detected is skipped with

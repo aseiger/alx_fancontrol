@@ -121,6 +121,10 @@ class Daemon:
         self._missing_count: dict[str, int] = {}
         self._refuse_count: dict[str, int] = {}
         self._stall_count: dict[str, int] = {}
+        # fan -> active stall-drive episode {phase, attempts, until, pulse}
+        self._kick: dict[str, dict] = {}
+        # fan -> duty % the episode commands right now; pass 2 defers to it
+        self._kick_duty: dict[str, int] = {}
         # fan -> monotonic time of the last escalation for the current episode
         self._stall_eps: dict[str, float] = {}
         self._lost_eps: dict[str, float] = {}
@@ -467,7 +471,12 @@ class Daemon:
                 self._takeover(fan)
                 if fan not in self._taken_over:
                     continue
-            new = curve.rate_limit(self._duty.get(fan), tgt, max_rate)
+            # A stall episode owns this header outright. The curve is what was
+            # asking for 80 % while the blower read 0 RPM, and a rate-limited
+            # crawl toward full duty costs seconds we do not have: pin it.
+            kd = self._kick_duty.get(fan)
+            new = int(kd) if kd is not None \
+                else curve.rate_limit(self._duty.get(fan), tgt, max_rate)
             if new != self._duty.get(fan):
                 self._write_fan(cfg, fan, new, t, src_id)
             # write-error and ownership-lost stay visible: they describe the
@@ -485,9 +494,13 @@ class Daemon:
         turning (stalled, tach pin unplugged, or a header the firmware took
         back). Commanded duty alone never proves that anything cools.
 
-        A confirmed stall escalates (`_escalate`): we cannot fix a stopped fan
-        by asking for more duty, so what is left is to reach a person and to
-        reduce the heat the fan is supposed to carry."""
+        A confirmed stall does two things. It escalates (`_escalate`), because
+        a stopped blower has to reach a person. And it acts, on the header and
+        nowhere else (`_stall_drive`): pin the channel to `stall_full_duty` and
+        try to restart the fan. "More duty cannot fix a fan that is not
+        turning" is true of a fan that is jammed and false of one that has
+        simply dropped out, and the only way to learn which we have is to ask
+        it at full voltage."""
         c = cfg.config
         try:
             min_duty = float(c.get("stall_min_duty", 20))
@@ -499,15 +512,24 @@ class Daemon:
             tres = hwmon.resolve_tach(tach, self._chips, self.root) if tach else None
             self._rpm[fan] = hwmon.read_rpm(*tres) if tres else None
             duty = self._duty.get(fan) or 0
-            if duty >= min_duty and self._rpm[fan] == 0:
+            # A kick of ours parks the header at 0 for a poll. That 0 RPM is
+            # something we did on purpose, so it must not raise the alarm we
+            # are pulsing to answer.
+            ours = (self._kick.get(fan) or {}).get("phase") == "stop"
+            # An episode keeps itself armed whatever the duty: un-arming because
+            # our own pin sits below stall_min_duty would stop us watching the
+            # one fan we are fighting for. Creating one still needs the full
+            # threshold, so a fan idling below it stays nobody's emergency.
+            if self._rpm[fan] == 0 and (duty >= min_duty or fan in self._kick):
                 n = self._stall_count.get(fan, 0) + 1
                 self._stall_count[fan] = n
                 if n >= after:
                     self._fan_state[fan] = "stalled"
-                    self._escalate(cfg, fan, "stalled",
-                                   f"tach {tach} reads 0 RPM at {duty}% duty "
-                                   f"for {n} polls", self._stall_eps)
-                if n == after or n % after == 0:
+                    if not ours:
+                        self._escalate(cfg, fan, "stalled",
+                                       f"tach {tach} reads 0 RPM at {duty}% "
+                                       f"duty for {n} polls", self._stall_eps)
+                if not ours and (n == after or n % after == 0):
                     self.log.error(
                         "FAN %s STALLED: commanding %d%% but tach %s reads "
                         "0 RPM for %d polls", fan, duty, tach, n)
@@ -519,6 +541,180 @@ class Daemon:
                     self._stall_eps.pop(fan, None)
                     self._alert(cfg, fan, "recovered",
                                 f"tach {tach} reads {self._rpm[fan]} RPM again")
+            if self._rpm[fan] is None:
+                seen = "unknown"
+            elif self._rpm[fan] > 0:
+                seen = "spinning"
+            elif ours:
+                seen = "pulsing"
+            else:
+                seen = "stopped"
+            self._stall_drive(cfg, fan, seen)
+
+    # ------------------------------------------------- stalled-fan action --
+
+    def _stall_full_duty(self, cfg) -> int:
+        """Duty a stalled fan's header is pinned to. Never below
+        `stall_min_duty`: pinning a fan under the alarm threshold would disarm
+        the detector that started the episode (validate() rejects that
+        pairing; this is the runtime belt)."""
+        return int(max(self._cfg_num(cfg, "stall_full_duty", 100.0),
+                       self._cfg_num(cfg, "stall_min_duty", 20.0)))
+
+    def _can_pulse(self, cfg, fan: str) -> bool:
+        """May we drop this header to 0 to wind up a kick?
+
+        The pulse is the one part of this feature that can cost cooling, so it
+        runs only where nothing else depends on that header and we actually
+        hold it:
+          * shared — another assignment wants air out of this fan right now;
+            dropping it to help a stalled card is not ours to decide;
+          * not ours — `pwmN_enable` is not 1, so every write here is ignored
+            and a pulse would be a lie with a 0 in it (`_lose_channel` owns
+            that fault, and reclaiming comes first).
+        """
+        if self._lost_count.get(fan):
+            return False
+        n = sum(1 for a in (cfg.assignments.values() if cfg else [])
+                if a.get("enabled", True) and fan in a.get("fans", []))
+        return n <= 1
+
+    def _stall_drive(self, cfg, fan: str, seen: str):
+        """Act on a stalled fan, inside the fan header and nowhere else.
+
+        PIN — hold the channel at `stall_full_duty` (default 100 %), past the
+        curve's ceiling and past the rate limiter. The curve is what was asking
+        a blower reading 0 RPM for 80 %; whatever it decided, the answer to a
+        stopped fan is never less than everything the header can give, and
+        ramping there at 6 %/poll spends ~15 s on the way.
+
+        KICK — try to restart it: `stall_kick_stop_s` at 0 so a jammed blade
+        can swing free, then `stall_kick_run_s` at full duty, judged by the
+        tach rather than by hope. `stall_kick_attempts` lunges per round, and
+        when a round runs out the header *stays* pinned and rests
+        `stall_kick_backoff_s` before the next round, so a seized winding does
+        not cook itself or the fan driver on stall current indefinitely. A
+        bearing that seizes hot often frees once it stops trying; that is what
+        the repeat is for. `stall_kick: false` keeps the pin and skips the
+        pulses.
+
+        Then stop. Restarting a fan is a fan-header action; what the box should
+        do with a GPU that has no air is still an operator decision in
+        `stall_alert_command`, and this daemon still has no path to a GPU at
+        all. Escalation is unchanged and keeps running underneath.
+
+        Nothing here sleeps: each phase lasts at least its configured time and
+        at most one poll longer, because this loop is what keeps every OTHER fan
+        alive — the same reasoning that bounds `stall_alert_command`'s timeout.
+
+        `seen` is what the tach said this poll: "spinning", "stopped", "pulsing"
+        (0 RPM we caused ourselves — the phase clock still advances, so a pulse
+        can never become a place the fan is left, and only the alarm stays
+        quiet), or "unknown" (no tach to judge by).
+        """
+        ep = self._kick.get(fan)
+        now = time.monotonic()
+
+        if seen == "unknown":
+            return          # no tach configured: nothing to judge by
+
+        kick_on = bool((cfg.config if cfg else {}).get("stall_kick", True))
+
+        if seen == "spinning":
+            if ep is None:
+                return
+            if ep["phase"] == "cooldown":
+                if now >= ep["until"]:
+                    self._end_stall_drive(cfg, fan)
+                return
+            # Turning again — mid-pulse included, which is why a pulse can
+            # never leave a spinning fan parked low: go to full and hold it
+            # there before the curve gets the wheel back.
+            cd = self._cfg_num(cfg, "stall_kick_cooldown_s", 60.0)
+            ep["phase"] = "cooldown"
+            ep["until"] = now + cd
+            self._kick_duty[fan] = self._stall_full_duty(cfg)
+            self.log.warning("FAN %s is turning again after %d kick attempt(s): "
+                             "holding %d%% for %.0fs before the curve takes "
+                             "over", fan, ep["attempts"], self._kick_duty[fan],
+                             cd)
+            return
+
+        # ------------------------------------------- seen == stopped/pulsing --
+        if ep is None:
+            if self._fan_state.get(fan) != "stalled":
+                return                    # not confirmed yet: the alarm decides
+            may = kick_on and self._can_pulse(cfg, fan)
+            ep = self._kick[fan] = {
+                "phase": "lunge", "attempts": 1, "pulse": may,
+                "until": now + self._cfg_num(cfg, "stall_kick_run_s", 3.0)}
+            self._kick_duty[fan] = self._stall_full_duty(cfg)
+            self.log.critical(
+                "DRIVING %s to %d%% (the curve asked for %s%%): a fan reading "
+                "0 RPM is not being asked for enough. %s", fan,
+                self._kick_duty[fan], self._duty.get(fan),
+                "Kicking: drop to 0 so a jammed blade can swing free, then full "
+                "voltage, and let the tach decide."
+                if may else
+                "No kick (header shared or not ours): holding full duty.")
+            return
+
+        if now < ep["until"]:
+            return                        # the current phase is still running
+
+        run_s = self._cfg_num(cfg, "stall_kick_run_s", 3.0)
+        tries = int(self._cfg_num(cfg, "stall_kick_attempts", 3))
+        full = self._stall_full_duty(cfg)
+        # Re-decided every transition, not remembered from the start: the
+        # firmware can take the header back mid-episode, and a pulse into a
+        # channel we no longer own is theatre with a 0 in it.
+        ep["pulse"] = kick_on and self._can_pulse(cfg, fan)
+
+        if ep["phase"] == "pin":
+            return                        # kicking is off: the pin IS the action
+
+        if ep["phase"] == "lunge":
+            if not ep["pulse"]:
+                ep["phase"] = "pin"
+                ep["until"] = now + 1e12
+                return
+            if ep["attempts"] >= tries:
+                backoff = self._cfg_num(cfg, "stall_kick_backoff_s", 30.0)
+                ep["phase"] = "backoff"
+                ep["until"] = now + backoff
+                ep["attempts"] = 0
+                self._kick_duty[fan] = full
+                self.log.warning(
+                    "KICK %s: %d attempts and still 0 RPM — holding %d%% and "
+                    "resting %.0fs before the next round. This fan needs a "
+                    "hand, not more voltage.", fan, tries, full, backoff)
+                return
+            stop_s = self._cfg_num(cfg, "stall_kick_stop_s", 0.5)
+            ep["phase"] = "stop"
+            ep["until"] = now + stop_s
+            self._kick_duty[fan] = 0
+            self.log.warning("KICK %s: attempt %d/%d — dropping to 0%% for "
+                             "%.1fs so a jammed blade can swing free",
+                             fan, ep["attempts"] + 1, tries, stop_s)
+            return
+
+        if ep["phase"] in ("stop", "backoff"):
+            ep["phase"] = "lunge"
+            ep["until"] = now + run_s
+            ep["attempts"] += 1
+            self._kick_duty[fan] = full
+            self.log.warning("KICK %s: attempt %d/%d — full duty for %.1fs, "
+                             "the tach decides", fan, ep["attempts"], tries,
+                             run_s)
+
+    def _end_stall_drive(self, cfg, fan: str):
+        """Hand the header back to the curve. `self._duty` is still full, so
+        it walks down at the normal rate rather than falling off a cliff."""
+        ep = self._kick.pop(fan, None)
+        self._kick_duty.pop(fan, None)
+        if ep is not None:
+            self.log.info("FAN %s: stall drive over — the curve takes its duty "
+                          "back from %d%%", fan, self._duty.get(fan) or 0)
 
     # ------------------------------------------- ownership re-verification --
 
@@ -599,6 +795,16 @@ class Daemon:
         self._duty.pop(fan, None)
         self._rpm.pop(fan, None)
         self._stall_count.pop(fan, None)
+        # A stall episode must not leave a 0 sitting in a header we just lost:
+        # the pulse is our decision, and ours to take back. Drop it, pin full,
+        # and let the reclaim finish before anything else is tried.
+        if self._kick.get(fan) is not None and (self._kick_duty.get(fan)
+                                                or 0) < self._stall_full_duty(
+                                                    cfg):
+            self._kick[fan]["phase"] = "backoff"
+            self._kick[fan]["until"] = time.monotonic() + self._cfg_num(
+                cfg, "stall_kick_backoff_s", 30.0)
+            self._kick_duty[fan] = self._stall_full_duty(cfg)
         self._takeover(fan, insist=True)
         # AFTER the takeover attempt: a successful one ends by setting "ok",
         # which would erase the fault we are reporting. A failed one keeps its
@@ -885,6 +1091,25 @@ class Daemon:
                            fan)
             return
         chip_dir, pwm = res
+        # Never hand back a header parked at 0 while its fan is the one we
+        # could not restart: this board parks headers the firmware owns, and an
+        # exiting daemon must not be what stopped the air. Compare the CHIP,
+        # not our own idea of the duty — a phase can advance in the same poll
+        # that wrote the pulse, and then the 0 is only in the chip.
+        ep = self._kick.get(fan)
+        full = self._stall_full_duty(self._cfg)
+        if ep is not None:
+            held = hwmon.read_duty_raw(chip_dir, pwm)
+            if held is not None and held < curve.pct_to_raw255(full):
+                try:
+                    hwmon.write_duty(chip_dir, pwm,
+                                     curve.pct_to_raw255(full))
+                    self.log.warning("leaving %s pinned at full duty on exit: "
+                                     "its fan was stalled at raw %d and a "
+                                     "parked header cools nothing", fan, held)
+                except OSError as e:
+                    self.log.error("could not leave %s at full duty on exit: %s",
+                                   fan, e)
         try:
             hwmon.set_enable(chip_dir, pwm, en)
         except OSError as e:
@@ -991,6 +1216,12 @@ class Daemon:
                 "orig_enable": self._orig_enable.get(fan),
                 "state": self._fan_state.get(fan, "idle"),
             }
+            ep = self._kick.get(fan)
+            if ep:
+                # an operator (and the TUI) should see that the daemon is
+                # actively fighting for this fan, not merely reporting on it
+                entry["kick"] = {"phase": ep["phase"],
+                                 "attempts": ep["attempts"]}
             res = hwmon.resolve_fan(fan, self._chips, self.root)
             if res is not None:
                 chip_dir, pwm = res

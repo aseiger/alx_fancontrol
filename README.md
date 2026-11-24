@@ -180,7 +180,14 @@ automatically on load — the TUI re-saves them as v2 on first open.
     "smi_timeout_s": 3.0,
     "watchdog_seconds": 30,
     "stall_min_duty": 20,
-    "stall_after": 10
+    "stall_after": 10,
+    "stall_full_duty": 100,
+    "stall_kick": true,
+    "stall_kick_attempts": 3,
+    "stall_kick_stop_s": 0.5,
+    "stall_kick_run_s": 3.0,
+    "stall_kick_backoff_s": 30,
+    "stall_kick_cooldown_s": 60
   },
   "curves": {
     "default":  { "label": "Default",     "points": [[40, 20], [55, 30], [65, 70], [75, 100]] },
@@ -220,7 +227,13 @@ automatically on load — the TUI re-saves them as v2 on first open.
 | `config.gpu_temp_min_valid_c` | **default 15** — a GPU reading below this is not a temperature (a card that dropped off the bus reports 0 °C), so it counts as "no reading" |
 | `config.smi_timeout_s` | nvidia-smi timeout in seconds (default 3, `0` = no timeout). A hung nvidia-smi is killed and NOT waited on; a short backoff keeps hung children from piling up |
 | `config.watchdog_seconds` | poll-loop watchdog (default 30, `0` = off). If no poll completes in time the daemon exits with status 70 so systemd restarts it — fans keep their last duty and are reclaimed on startup |
-| `config.stall_min_duty` / `config.stall_after` | stalled-fan alarm: tach reads ~0 RPM while we command ≥ this duty for this many polls (default 20 % / 10 polls) → `state: "stalled"` + log ERROR + `status.json` `errors`, then **escalates** (see [Escalation](#escalation-what-happens-when-a-fan-cannot-cool)) |
+| `config.stall_min_duty` / `config.stall_after` | stalled-fan alarm: tach reads ~0 RPM while we command ≥ this duty for this many polls (default 20 % / 10 polls) → `state: "stalled"` + log ERROR + `status.json` `errors`, then **drives the header** (see [Stalled: what the daemon does with the header](#stalled-what-the-daemon-does-with-the-header)) and **escalates** (see [Escalation](#escalation-what-happens-when-a-fan-cannot-cool)) |
+| `config.stall_full_duty` | duty a confirmed-stalled fan is pinned to (default 100). Past the curve's ceiling and past the rate limiter: the curve is what left a blower at 0 RPM being asked for too little. Must be ≥ `stall_min_duty`, or the pin would park the fan where the alarm can no longer see it |
+| `config.stall_kick` | try to restart a stalled fan (default `true`): a brief drop to 0 so a jammed blade can swing free, then full duty, judged by the tach. `false` keeps the pin and never pulses — the only setting here that can cost cooling is off |
+| `config.stall_kick_attempts` | lunges per round (default 3). When a round runs out the header stays pinned, rests `stall_kick_backoff_s`, and the next round starts — a bearing that seizes hot often frees once it stops drawing stall current |
+| `config.stall_kick_stop_s` / `config.stall_kick_run_s` | how long the header sits at 0 before a lunge, and how long it holds full duty before the tach decides (default 0.5 / 3.0). Both are minima: a phase ends on the next poll after its time is up, never by sleeping |
+| `config.stall_kick_backoff_s` | rest between rounds (default 30) so a seized winding does not cook itself, or the fan driver, on stall current |
+| `config.stall_kick_cooldown_s` | after the tach spins again, hold full duty this long (default 60) before the curve gets the wheel back — a bearing that just freed is not yet trustworthy, and the hand-back walks down at `max_rate` rather than falling off a cliff |
 | `config.stall_alert_command` | shell command run when a fan fault starts and again when it clears (default `""` = off). Event arrives in the environment: `ALX_FAN`, `ALX_STATE`, `ALX_DETAIL`, `ALX_DUTY_PCT`, `ALX_RPM`, `ALX_CONFIG` |
 | `config.stall_alert_timeout_s` | how long the alert command may run (default 5). Longer than that and it is killed with its process group — the loop that keeps the *other* fans alive is not negotiable |
 | `config.stall_alert_repeat_s` | re-alert every N seconds while a fault persists (default 300; `0` = once per episode) |
@@ -296,8 +309,12 @@ Behavior:
 - **A fan that cannot cool escalates** (see
   [Escalation](#escalation-what-happens-when-a-fan-cannot-cool)): a tach
   stall and an ownership loss both shout CRITICAL and reach the operator
-  hook, because more duty is not an available answer to either. Nothing more:
-  the daemon's reach ends at the fan header.
+  hook. A stall also *acts* (see
+  [Stalled: what the daemon does with the header](#stalled-what-the-daemon-does-with-the-header)):
+  pin the header to `stall_full_duty` and try to restart the fan, because
+  "more duty cannot fix a fan that is not turning" is true of a jammed fan
+  and false of one that has merely dropped out. Nothing more: the daemon's
+  reach ends at the fan header.
 - A GPU reading below `gpu_temp_min_valid_c` (default 15 °C) counts as "no
   reading", never as "ice cold": a card that dropped off the bus reports 0 °C.
 - Fan write fails → keep last duty, log first + every 10th failure,
@@ -328,7 +345,8 @@ Behavior:
 - **Stalled-fan alarm.** Commanding duty is not cooling: if a controlled
   fan's tach reads ~0 RPM while we ask for ≥ `stall_min_duty` for
   `stall_after` polls, it is reported as `state: "stalled"` with a log
-  ERROR and an entry in `status.json` `errors`.
+  ERROR and an entry in `status.json` `errors` — and the header is then
+  pinned to `stall_full_duty` and kicked, whatever the curve wanted.
 - **A bad config does not mean no fan control.** If the config fails to
   load or validate at startup, the daemon used to exit(2) before taking
   anything over (and `Restart=always` turned that into a flap loop with
@@ -349,10 +367,46 @@ Behavior:
   bounded by the winning assignment's `max_rate`; ties go to the lowest
   assignment id.
 
+### Stalled: what the daemon does with the header
+
+Detection was never the weak part. On 2026-11-23 a V100's blower went to 0 RPM
+at 12:00:19, the daemon escalated within ten seconds — correctly — and then
+spent nineteen minutes logging `FAN … STALLED` at a card it was asking for 80 %
+of, because asking was all it did. The card stopped answering `nvidia-smi` at
+~12:19 and the host went down with it.
+
+So a confirmed stall now also acts, on the fan header and nowhere else:
+
+| phase | what the header gets |
+|---|---|
+| **pin** | `stall_full_duty` (default 100 %), immediately — past the curve's ceiling and past the rate limiter. The curve is what was asking a stopped fan for too little; ramping to full at 6 %/poll spends ~15 s we do not have |
+| **kick** | `stall_kick_stop_s` at 0 so a jammed blade can swing free, then `stall_kick_run_s` at full duty, and the tach decides. `stall_kick_attempts` lunges per round, rounds spaced by `stall_kick_backoff_s` |
+| **cooldown** | tach spinning again: hold full for `stall_kick_cooldown_s`, then hand the duty back to the curve, walking down at `max_rate` rather than falling off a cliff |
+
+Three things this deliberately never does:
+
+- **it never leaves a fan parked.** A pulse is the one part that could strand a
+  card, so an exit landing inside one writes full duty first (comparing the
+  chip, not its own bookkeeping), and losing the header mid-pulse drops the
+  pulse rather than the air;
+- **it never pulses a shared header.** Two cards on one fan means dropping it to
+  0 steals air from the other one — helping a stalled card is not licence to
+  hurt a working one. A shared header, or one the firmware currently holds,
+  gets the pin only;
+- **it never sleeps.** Phases are advanced by the poll loop, so a kick costs the
+  other fans at most one poll — the same reasoning that bounds
+  `stall_alert_command`'s timeout.
+
+Escalation keeps running underneath all of this, unchanged. Restarting a fan is
+a fan-header action; what the box should do with a GPU that has no air is still
+your decision.
+
 ### Escalation: what happens when a fan cannot cool
 
-Two faults mean a card is heating with nothing moving its air, and neither
-is fixable by writing more duty:
+Two faults mean a card is heating with nothing moving its air. Both shout, and
+neither is fixable by writing duty *alone* — which is why a stall also gets the
+[kick](#stalled-what-the-daemon-does-with-the-header) above, and an ownership
+loss gets a reclaim:
 
 | fault | detected | ends when |
 |---|---|---|
@@ -396,7 +450,8 @@ Written by the daemon each poll; read by the TUI:
   "degraded": false,
   "sources": { "it8686:temp1": {"label": "System 1", "temp_c": 46.0, "stale": false} },
   "fans":    { "it8686:pwm3": {"label": "SYS_FAN2", "duty_pct": 27, "rpm": 3229,
-                                "orig_enable": 2, "state": "ok"} },
+                                "orig_enable": 2, "state": "ok",
+                                "kick": {"phase": "lunge", "attempts": 1}} },
   "errors": {} }
 ```
 

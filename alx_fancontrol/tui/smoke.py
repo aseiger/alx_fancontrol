@@ -1,4 +1,4 @@
-"""textual run_test pilot over all 4 screens.
+"""textual run_test pilot over all 5 screens.
 
 Run:  .venv/bin/python -m alx_fancontrol.tui.smoke
 
@@ -45,6 +45,7 @@ async def run_pilot(live: bool) -> None:
     from alx_fancontrol.tui.screens.assign import AssignScreen
     from alx_fancontrol.tui.screens.curves import CurveEditorScreen
     from alx_fancontrol.tui.screens.overview import OverviewScreen
+    from alx_fancontrol.tui.screens.settings import SettingsScreen
     from alx_fancontrol.tui.screens.sources import SourcesScreen
 
     tmp = Path(tempfile.mkdtemp(prefix="alx-fc-smoke-"))
@@ -58,7 +59,9 @@ async def run_pilot(live: bool) -> None:
                 f"expected OverviewScreen, got {app.screen!r}"
             print("ok: OverviewScreen mounted")
             for key, cls in [("2", AssignScreen), ("3", CurveEditorScreen),
-                             ("4", SourcesScreen), ("1", OverviewScreen)]:
+                             ("4", SourcesScreen),
+                             ("5", SettingsScreen),
+                             ("1", OverviewScreen)]:
                 await pilot.press(key)
                 await pilot.pause()
                 assert isinstance(app.screen, cls), \
@@ -88,6 +91,21 @@ async def run_pilot(live: bool) -> None:
             assert json.loads(cfg_path.read_text())["config"]["poll_seconds"] \
                 == 2.0
             print("ok: save round-trip + .bak on temp config")
+
+            # the Settings path end to end: pending edits live outside cfg
+            # until Save, so a save from another screen cannot publish them
+            await pilot.press("5")
+            await pilot.pause()
+            assert isinstance(app.screen, SettingsScreen)
+            app.settings_edits["poll_seconds"] = 1.5
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.click("#confirm-ok")
+            await pilot.pause()
+            assert json.loads(cfg_path.read_text())["config"][
+                "poll_seconds"] == 1.5
+            assert not app.settings_edits, app.settings_edits
+            print("ok: settings edit confirmed and written")
         print("SMOKE-OK" + (" (live data)" if live else " (no live reader)"))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

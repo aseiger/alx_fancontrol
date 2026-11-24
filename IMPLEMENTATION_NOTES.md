@@ -769,3 +769,655 @@ a virtual clock (each sleep advances `time.monotonic()` by `step`) instead of
 racing the runner — same hermetic contract as `test_safety_net.run_polls`.
 
 Suite: **192 passed** (177 + 15).
+
+---
+
+## 22. Config↔GUI audit, step 1: the four things the TUI got wrong (2026-11-23)
+
+An audit of every option the daemon honours against what the TUI can show and
+change (`CONFIG_GUI_AUDIT.md`) found the mapping side (source → curve → fans)
+in good shape and the policy side absent: **22 global `config.*` keys, none of
+them viewable or editable in the GUI** — the fail-safe, liveness, escalation
+and stall-drive knobs added by §18–§21 all landed JSON-only. Four of the
+findings were not taste but bugs, reproduced by driving the real TUI against
+the synthetic machine and reading the file back. This step fixes those four;
+the Settings screen (`config.*`) and the tach/ownership work are deliberately
+left for their own steps.
+
+### The four bugs
+
+1. **A blank override field did nothing.** `save_assignment` started from
+   `dict(existing)` and only ever *set* `floor_duty` / `max_duty` / `max_rate`
+   when the field was filled, so clearing the field left the old override in
+   the file: "follow the global default again" was not expressible, and typing
+   the global's number instead pins it per assignment — a different setting
+   that stops following the global.
+2. **`enabled` was displayed and never editable.** The list has had an on/off
+   column since the beginning and the save path carefully preserved it, but no
+   button or key ever changed it — so the action `config.py`'s own comments
+   recommend ("prefer deleting/disabling such an assignment") required hand
+   editing JSON, while the wrong tool (Delete) was the one on screen.
+3. **Renaming duplicated the assignment.** The name field is the key, so
+   loading `CPU`, retyping it as `CPU-box` and saving wrote a second entry:
+   both then drove `it8686:pwm1`, and the only signal was a generic "shared
+   fan" notice that never said the old one still existed.
+4. **Invalid configs were saved with a smile.** `save_config` never called
+   `config.validate()`. Delete every point of a curve, press save: notification
+   *"Curve 'default' saved"*, file now invalid, and because
+   `Daemon._maybe_reload` keeps the **previous** config on any error, nothing
+   at all happened — silently. For a tool that moves fans, "Saved" followed by
+   silence is the worst failure mode it can have.
+
+### Changed
+
+- `AssignScreen._commit(name, form, base=None, drop=None, message=None)` — the
+  single write path for the form, with the merge rules written down: a blank
+  floor/ceiling/rate **removes** the key; keys the form does not manage
+  (`failsafe`, `failsafe_duty`, `failsafe_after`, `force_takeover`) are carried
+  over; `tach` keeps explicit mappings for fans still picked and drops entries
+  whose fan left the assignment (they used to linger forever).
+- `AssignScreen._rename_flow` — a name change while editing asks (or, if the
+  target name is taken, asks about *overwriting*), then moves the entry
+  (`drop=old`) instead of adding one. Cancel leaves the config untouched.
+- `Switch(id="enabled")` in the form, plus an **Enable/disable** button and the
+  `e` binding acting on the selected list row. Disabling confirms — it hands
+  fans to the firmware mid-run; enabling does not, it only reclaims.
+- `FanControlApp.save_config` validates before touching the file and shows
+  `ConfigErrorsScreen` with the reasons. The screen that created the problem is
+  usually one keystroke away, so this replaces a round trip through
+  `status.json`.
+- `ConfirmScreen` — the delete confirmation generalised (title, body lines,
+  button label/variant/id, Enter/Escape); `ConfirmDeleteScreen` is now a thin
+  subclass so its tests and ids are unchanged.
+- Placeholders read the live globals (`floor % (global 5, blank = use it)`)
+  instead of hard-coding "default 5", which would start lying the first time
+  someone changed `config.floor_duty`.
+
+### Deliberate choices
+
+- **Validation blocks, including for global keys.** An out-of-range
+  `config.*` value can only be fixed in JSON until the Settings screen exists,
+  so there is a temptation to let assignment edits through. Not so: the daemon
+  rejects the *whole file* for any error, so saving "just my fan edit" would
+  write a file that changes nothing — exactly the lie this fix exists to stop.
+  The modal therefore names the offending key and points at the file.
+- **Blank means remove, not zero.** `floor_duty: 0` is a real setting (a fan
+  allowed to stop); an absent key means "inherit". Collapsing the two would
+  lose the distinction the daemon makes (`a.get("floor_duty", cfg.config…)`).
+- **Disable keeps everything.** Only `enabled` flips. That is the point of
+  offering it as the alternative to Delete: the curve, floor and tach mapping
+  are what make re-enabling safe later.
+- **Confirm one direction only.** Every confirm on this screen costs a
+  keystroke, so only the direction that gives up control (disable, delete) and
+  the one that can silently clobber another assignment (rename onto an existing
+  name) ask.
+
+### Tests
+
+13 new UX tests in `tests/test_tui_ux.py`, all driving widgets rather than
+internals: blank fields remove all three overrides and leave unmanaged keys
+alone; placeholders track the globals; the form switch writes
+`enabled=false` (list cell flips to `off`); `e` disables behind a confirm and
+enables without one; cancel keeps `enabled=true`; toggle with no selection
+warns; rename moves the entry (and preserves its floor), cancel keeps the old
+name, rename onto a taken name overwrites and removes the source; an invalid
+config blocks a fan edit with the reason and no "Saved" notice; an empty curve
+cannot be saved; a bad *global* blocks too and points at the config path.
+
+`wait_not_modal` now waits on `ModalScreen` generally instead of a hard-coded
+tuple of modal classes — it had to be taught about every new modal before.
+
+Suite: **205 passed** (192 + 13).
+
+---
+
+## 23. Config↔GUI audit, step 2: curves become manageable (2026-11-23)
+
+The curve was the one object the TUI could edit but not create, copy, rename
+or delete — and, as step 1 showed, it could be bricked in three keystrokes.
+
+### Why this mattered
+
+- **No New.** Adding a curve for new hardware meant editing JSON. Curves are
+  tuned by copying one and shifting it ("same as the V100 blower, 5 °C
+  later"), and that path did not exist in the GUI at all.
+- **No first point.** `action_add_point` demanded a *selected existing*
+  point, so an empty curve could never be filled — the dead end the audit
+  proved with `points: []` + `a` → "Select a point row first", the only
+  button on the screen being Save.
+- **No Delete, and no idea whether a curve was in use.** That missing
+  information is exactly what makes deletion dangerous: `_poll` skips an
+  assignment whose curve is gone (`fan_state = "curve-missing"`) and its
+  fans sit at their last duty. A delete button without a usage count would
+  have been worse than no button.
+
+### Changed
+
+- `NewCurveModal` asks for **id + label**. The id is asked rather than
+  invented because assignments reference curves by it, and an id already in
+  use is refused *in the modal* — silently overwriting a curve another fan
+  depends on is not an acceptable outcome of a typo. Allowed ids are
+  `[A-Za-z0-9_-]+` (they are config keys and Select values).
+- **New** seeds the built-in default shape
+  (`config.DEFAULTS["curves"]["default"]["points"]`) and saves immediately:
+  a curve with no points is invalid, so seeding keeps the config valid at
+  every moment, and it gives `a` something to insert between right away.
+- **Copy** duplicates the curve *as currently edited*, unsaved point moves
+  included — that is the point of copying. Suggested id `<id>-copy` (then
+  `-copy-2`, … via `_free_id`), label `<label> copy`.
+- **Delete** removes an unused curve after confirmation; a curve with users
+  is refused with the assignment names in the message. A new hint line
+  (`#curve-used`) shows `used by: CPU, System` / `not used by any
+  assignment` for the selected curve, so the rule is visible before anyone
+  reaches for the button. The two **built-in** curves are refused too — see
+  F14 below.
+- **Label** is now editable (`#curve-label`) and written by the same Save as
+  the points; the picker options are rebuilt afterwards, since they display
+  labels and a rename that did not appear there would look like it failed.
+- `a` on an **empty** curve opens the prompt for its first point (40 °C /
+  20 %) instead of refusing. The "Select a point row first" warning stays as
+  the fallback for the state where points exist but none is selected.
+- `_refresh_curve_options(keep=…)` replaces the inline option building in
+  `on_mount`, so create/copy/delete/save all rebuild the picker and re-assert
+  a selection that still exists (`set_options()` resets it to blank).
+- `ConfirmScreen` moved from `assign.py` to `base.py` — it is now used by two
+  screens, and screens importing each other is not a dependency worth
+  creating. `assign.py` re-imports it, so `ConfirmDeleteScreen` and every
+  existing import path are unchanged.
+
+### F14, found on the way: deleting a built-in curve cannot stick
+
+While testing Delete: `config.load()` does `_deep_merge(DEFAULTS, doc)`, so
+`default` and `gpu_v100` are injected into every config that does not carry
+them — a file with `{"curves": {"mine": …}}` loads as
+`[default, gpu_v100, mine]`, and the next save writes them back. Deleting one
+in the TUI would therefore vanish on the next load (daemon hot-reload or TUI
+restart): a button that quietly does nothing.
+
+Refusing it, with the reason, is the honest step-2 behaviour. The real fix
+belongs with step 4's schema work: `DEFAULTS` should seed a config **once**
+(`seed_if_missing`, which already does exactly that) instead of being merged
+on every load — at which point Delete can allow the built-ins. Changing the
+merge now was rejected: a hand-written config that references `default`
+without defining it works today (implicitly, and arguably wrongly), and under
+replace-semantics that assignment would start failing validation and be
+skipped at runtime — fans holding their last duty is not a regression to take
+for the sake of a tidier curve list.
+
+**Fixed in §25**, and that concern is answered rather than ignored: the fix
+seeds per *section*, so a file with no `curves` key at all still gets the
+stock pair (the case above keeps working); only a file that does write a
+`curves` section is taken as complete.
+
+### Deliberate choices
+
+- **Create writes immediately.** The alternative (a pending curve that only
+  exists in memory until Save) means the config and the screen disagree, and
+  a curve is harmless once seeded. Everything else on this screen still needs
+  an explicit Save, because points are an *edit*.
+- **Delete refuses instead of re-pointing.** "Delete and move its assignments
+  to another curve" sounds convenient but silently changes how several fans
+  cool at once. Re-pointing is one visible edit per assignment on the Assign
+  screen — which is the right cost for a change that moves air.
+- **Renaming an id is not offered.** A label rename is display-only; an id
+  rename would have to rewrite every assignment referencing it. That is a
+  different operation (and step 3's territory: it belongs next to the tach
+  and ownership edits), not a text field on a curve screen.
+- **The action row is its own line.** Sharing it with the picker collapsed the
+  Select to 1 cell (`width: 1fr` next to auto-width buttons does not behave as
+  one expects), so the picker kept its full-width row and New/Copy/Delete got
+  their own.
+
+### Tests
+
+9 new tests (net +8: `test_add_point_requires_selected_row` asserted the
+behaviour this step deliberately reverses, so it became the empty-curve
+prompt test): `a` on an empty curve prompts and the curve then
+saves; delete-every-point-then-rebuild end to end (the F7 regression);
+New creates, selects and persists with the seeded shape; a taken id is
+refused with the file untouched; Copy carries unsaved moves and leaves the
+original alone; Delete refuses an in-use curve by name (and the hint line
+says `used by: CPU`); Delete removes an unused one after confirmation and the
+picker lands on a curve that still exists; label rename persists and shows up
+in the picker options; Delete refuses a built-in curve without touching the
+file (F14).
+
+Suite: **213 passed** (205 + 8).
+
+## 24. Config↔GUI audit, step 3: the tach mapping stops being invisible (2026-11-24)
+
+F4 from `CONFIG_GUI_AUDIT.md`. The worst finding in the audit, and the only
+one that was an outright bug rather than a missing control: `tach` — which
+RPM input belongs to which PWM header — could only be written by
+`app.guess_tach()`, which maps `chip:pwmN → chip:fanN` **only when the
+sensors.d labels of both are identical**. Where they did not pair, the saved
+assignment had no `tach` key at all. Nothing said so. The Overview showed `—`
+in the RPM column, which reads as "fan stopped" or "sensor quiet", and the
+stall detector — §20/§21, the reason this project exists — compares RPM
+against commanded duty, so it **could never fire for that header**, however
+hot the card got. §18 and §20 were both found by a human noticing a fan; a
+header with no tach cannot be found that way.
+
+### What changed
+
+**`hwmon.list_tach_channels(chips, root)`** — enumerates every `fanN_input`
+as `("prefix:fanN", chip_dir, N)`, the sibling of `list_pwm_channels`. The
+TUI had no way to ask "what RPM inputs exist", which is why guessing was the
+only option it had.
+
+**Assign screen: a tach table (`#tach-pick`)** below the fan picker — one row
+per *picked* header: the mapping, what that input is called in sensors.d, and
+the RPM it reads right now (from the form's own mapping, not from the saved
+config, so trying a candidate immediately shows whether it can be the right
+one). Clicking a row opens `TachPickerModal`: same-chip inputs first (a
+header's tach is almost always the matching input on the same SuperIO), then
+the other chips, each with its label, plus the input whose label matches the
+header flagged **"matches this header"**, and finally an explicit
+**(no tach — no RPM, no stall detection)**. The cursor opens on the current
+mapping. `Esc` cancels without touching anything; choosing "(no tach)" is a
+real edit, not a no-op.
+
+Picking a header in the fan list pre-fills the guess (the common case stays
+one click); the table then shows what was assumed instead of hiding it.
+Loading an assignment seeds the map from its saved `tach`, so a hand-written
+mapping wins over the label guess and survives unrelated edits.
+
+**`_commit()` no longer guesses.** The tach table is authoritative: what is
+in it is written, unmapped fans get no entry, and entries for headers that
+left the assignment disappear with them (the audit's stale-entry half of F4).
+
+**Warnings where silence used to be.** Saving with a header unmapped notifies
+— names the headers, says a stall on them cannot be detected, says where to
+fix it. The daemon logs the same fact once per fan (then every 30 polls) at
+`warning`: `FAN … is driven with NO tach mapping`, plus a distinct message
+for a mapping that yields no reading (chip gone, or no `fanN_input` behind
+that number — a config line that looks correct). `status.json` fan entries
+gained `"tach"`, so a reader does not have to infer it from a blank RPM, and
+the Overview prints **`no tach`** instead of `—` for exactly that case.
+
+### Decisions
+
+- **Warn, don't block.** A header genuinely can have no tach wire — an empty
+  socket, or a 3-pin fan with no sense line. Refusing to save would make the
+  legitimate case impossible, and the operator who knows is the one person
+  who should be allowed to say "there is no tach here".
+- **Explicit "(no tach)" instead of just deleting the row.** Unmapping is a
+  real operation: a tach moved to another header reports *another fan's* RPM,
+  which is worse than no reading, because the stall detector will happily
+  watch the wrong fan and stay quiet about the right one.
+- **A modal rather than an inline `Select`.** The option set is per-header and
+  needs two columns of explanation (id + label); a `Select` inside a form row
+  that is already `1fr` shared with another `Select` would have been unreadable
+  — and the same widget now serves both chips.
+- **Guess stays, but only as a pre-fill.** Removing it entirely would make the
+  normal case two clicks per fan; keeping it as the *default of an editable
+  field* keeps the convenience and drops the lie.
+
+### Layout note
+
+The assign form is long, and `#content` is a plain `Vertical`: it does not
+scroll, so content below the fold is simply unreachable. `#fan-pick` is now
+capped at 10 rows and `#tach-pick` at 8 (both scroll internally), which keeps
+the Save button on screen at 50 rows even with every header picked — measured
+with a widget-region probe, not by eye. On a 40-row terminal the last line or
+two still fall below the fold; `s` saves and the footer says so. Swapping
+`#content` for `VerticalScroll` was tried and reverted: it changes the layout
+of all four screens at once (their tables are `1fr`) and did not measurably
+improve reachability, which makes it step 4's problem, not this step's.
+
+### Tests
+
+10 new tests (7 TUI, 3 daemon): picking a header shows the tach it guessed; an
+unmapped header saves with no `tach` **and** warns (both the table cell and
+the notification); the picker maps a header whose labels do not pair, and the
+mapping lands in the file; candidate ordering and notes (this chip first,
+labels beside each, "matches this header" on the matching one); "(no tach)"
+removes an existing mapping; a hand-set mapping beats the label guess across a
+later unrelated save; an input with no sensors.d label is listed with a blank
+note and is still mappable. Daemon: no tach → warning + `status.json`
+`tach: null` and `rpm: null`; mapped and live → quiet, RPM published; mapped
+but reading nothing → its own warning.
+
+Suite: **223 passed** (213 + 10).
+
+## 25. Config↔GUI audit, step 4: the global options get a screen, and defaults stop overruling the file (2026-11-25)
+
+F1 and F14 — the last two of the "you have to edit JSON" findings.
+
+F1 was the largest one in the audit by count: 22 options under `config`
+(poll interval, `max_rate`, floor, the fail-safe trio, GPU/watchdog
+timeouts, the whole stall-kick sequence, the alert command) that the daemon
+reads, that README describes, and that no screen could show or change. The
+reason it stayed that way was structural: the ranges lived inside
+`validate()` as a tuple of tuples, so a GUI form would have had to restate
+them — and a form that restates them drifts.
+
+### `CONFIG_FIELDS` — one description per option
+
+`config.py` now defines `CONFIG_FIELDS: tuple[Field, ...]` (key, label, kind,
+group, `lo`, `hi`, unit, help) plus `BY_KEY`. `validate()`'s numeric loop is
+generated from it — same order, same messages, same bounds — and the Settings
+screen builds its rows and its edit modal from the same objects. Two guards
+in `tests/test_config.py` pin it: every key in `DEFAULTS["config"]` must have
+a Field (so a knob cannot be added to the daemon and forgotten in the GUI,
+which *is* F1), with a kind matching the default's type and a default inside
+its own bounds; and every Field must carry a label, a group and a help line
+longer than 30 characters (an option the GUI can display but not explain is
+half an option).
+
+The bespoke checks stayed hand-written where they are genuinely bespoke: the
+string type of `stall_alert_command`, the bool type of `stall_kick`, and the
+pairing rule that `stall_full_duty >= stall_min_duty` (pinning a stalled fan
+under the alarm threshold would disarm the detector that pinned it).
+
+### F14: defaults fill in what the file does not say, they do not overrule it
+
+`load()` used to `_deep_merge(DEFAULTS, doc)` over the whole document. For
+`config.*` that is right: a release adding a knob must not require editing
+every existing file, and deleting a key means "use the built-in". For
+`curves`/`assignments` it was wrong — it made a curve un-deletable (§23),
+and it also invented labels: a curve written as `{"points": […]}` with no
+`label` silently inherited `"Default"` from the built-in entry of the same id.
+
+Now `_merge_defaults()` merges `config` per key and takes `curves` and
+`assignments` **as written when present**, seeding DEFAULTS only when the
+section is absent entirely. Consequences, checked:
+
+- a file with no `curves` key still gets `default` + `gpu_v100`, so the §23
+  worry (a hand-written config referencing `default` without defining it)
+  keeps working;
+- a file that writes `curves` but omits `default` no longer has it injected —
+  an assignment pointing at it gets the existing *warning* ("unknown curve …
+  skipped at runtime"), not a phantom curve;
+- deleting a built-in curve in the TUI now sticks, so step 2's refusal was
+  removed and its test inverted (delete `default` → gone from the file, gone
+  from a fresh `load()`, picker lands on `gpu_v100`).
+
+### Screen 5 · Settings
+
+Rows are generated from `CONFIG_FIELDS`, grouped (loop / fail-safe /
+liveness / stalled fan / escalation) with the group name in the first column
+of each group's first row — a DataTable has no section headers and five
+tables would each want a border, a cursor and their own scroll. Value and
+unit share one cell (`6 % per poll`); a value differing from the built-in is
+marked `*`; a pending edit shows `→ save`.
+
+Enter (or click) opens `SettingModal`: the option's help text, its bounds,
+its built-in default, what it is now, and an input — plus **Use default**,
+which removes the key. Out-of-range numbers are refused *in the modal*, with
+the reason inline, because those bounds are validate()'s own.
+
+**Edits stay on this screen until Save.** They are held in
+`app.settings_edits`, not written into `app.cfg` as they are typed: the
+shared config object is what every other screen saves, so typing a poll
+interval and then saving an assignment on screen 2 would otherwise publish a
+global change nobody saved. Living on the app rather than on the screen means
+a screen switch (which builds a new instance) does not silently drop them;
+Save applies, validates through `app.save_config`, and keeps them if the
+save is refused so they can be corrected. Save confirms first with the list
+of `key: old → new` — these are defaults for every fan at once.
+
+### Layout traps found (both real, both now pinned by tests or probes)
+
+- **textual's containers default to `height: 1fr`.** The modal's button row
+  swallowed every remaining line, so a 8-line form came out as a 27-row box
+  of empty air. Measured with widget regions (`box.children[*].region`), not
+  by eye — a pty screenshot had already shown the symptom without naming it.
+- **This screen takes table focus** (`AUTO_FOCUS = "#settings"`), unlike the
+  other four. They deliberately keep focus off tables so digits reach the
+  nav bindings; here the screen is one list and nothing else, so arrows move
+  the row cursor and Enter edits — without it a keyboard user could not reach
+  a row at all. Digits still switch screens (a DataTable binds no digits).
+- Width: the group column is paid for by every row, so group names are
+  shortened (`fail-safe`, `liveness`) and the default/unit columns folded
+  into the value cell — at 80 columns the values were previously clipped off
+  the right edge.
+
+### Tests
+
+14 new. Schema: coverage against `DEFAULTS` and documentation guards (2).
+F14 merge semantics: a deleted built-in stays deleted; no `curves` key still
+seeds the stock pair; an empty `curves` section means none; `config.*` still
+merges per key; curve fields are not filled from the built-in (4). Settings
+screen: every option listed with value and unit; edit → confirm → file; blank
+removes the key; an out-of-range number refused inside the modal; a
+self-contradictory pair refused by validation with the file untouched; no
+leak into another screen's save; Discard; the modal's help text (8). §23's
+built-in-refusal test was inverted into a deletion-sticks test rather than
+counted twice. Smoke nav now covers screen 5 by key and by sidebar button.
+
+Suite: **237 passed** (223 + 14).
+
+## 26. Config↔GUI audit, step 5: who holds this header, and how to take it anyway (2026-11-26)
+
+F5. The finding with the most history behind it: §18 and §20 are both about
+headers that somebody else was driving — the BIOS parking one at `enable 0`,
+`fancontrol`/EC holding another in manual mode. `daemon._takeover()` refuses
+exactly those two cases unless the assignment sets `force_takeover`. The TUI
+documented that in its own docstring and then offered no way to set it, and
+the fan picker's columns were `✓ / fan / label / rpm` — a foreign header looked
+identical to a free one. You found out afterwards, as the word
+`manual-conflict` in the Overview's state cell, while a card was hot.
+
+### What changed
+
+**Owner column on the fan picker** (`✓ / fan / label / owner / rpm`),
+refreshed with every live sweep because takeover flips `pwmN_enable` while the
+screen is open:
+
+| word | meaning | daemon behaviour |
+|---|---|---|
+| `firmware` | `enable=2`, nobody drives it | takes it, restores `2` on exit |
+| `ours` | `enable=1`, the running daemon holds it | already ours |
+| `left by us` | `enable=1`, marker says a run of ours died holding it | reclaims (§20) |
+| `other` | `enable=1`, someone else: fancontrol, EC, BIOS | **refused** without force |
+| `parked` | `enable=0` — cools nothing | **refused** without force |
+
+**Force takeover switch** on the form. Off **removes** the key rather than
+writing `false` — absent is how this file says no, matching step 1's rule for
+the numeric overrides.
+
+**Saving says which way it went.** Without the switch: *"The daemon will NOT
+control it8686:pwm3: held in manual mode by another process, or disabled. Turn
+on Force takeover to take them anyway, or free them first (systemctl stop
+fancontrol)."* With it on a foreign header: *"…expect the duty to be fought
+over until the other controller is stopped."* Neither blocks the save — the
+operator may know the other controller is gone for good, which is exactly when
+`force_takeover` exists.
+
+**The Overview says what happened** instead of echoing the daemon's internal
+state word: `refused: held by another controller`, `refused: header disabled
+(enable 0)`, `FAIL-SAFE: source unreadable, ramping up`, `STALLED: high duty,
+~0 RPM — pinned to full`, `write failed (pwm/pwmN_enable)`, `OWNERSHIP LOST
+(firmware took it back)`. Unknown states still pass through verbatim, so a
+state added later is never hidden.
+
+### Where the answer lives, and why not in the screen
+
+`status.claimed_channels()` (+ `boot_id`, `pid_alive`, moved out of
+`daemon.py`) reconciles the two ownership sources: `status.json` (what the
+running daemon holds) and `owned.json` (what a run of ours claimed and may not
+have restored, valid only for the same boot and only while no other
+alx_fancontrol is alive). `App.fan_owner()` reads that plus the live
+`enable`.
+
+It had to be one implementation. The GUI's owner column is not decoration — it
+is the promise *"the daemon will/won't take this header"*; a second
+implementation in the TUI would drift from `_takeover()` and the column would
+lie at exactly the moment someone relies on it. `Daemon._load_marker()` now
+calls the same function, and the test that patches liveness ("pretend that pid
+is one of ours") patches it where the decision is made.
+
+`fan_owner(fan, data)` takes the snapshot to read: a screen refreshing from a
+`LiveUpdate` message must render *that* message, not whatever the app stored
+last. Same reason `OverviewScreen._refresh()` now accepts the payload instead
+of re-reading `app.live` — in the running app they are the same object, but a
+screen that ignores the message it was sent cannot be tested with one.
+
+### Layout: the form stopped fitting
+
+Adding a switch row pushed Save below the fold on a 50-row terminal (measured:
+`#save` bottom 52 of 50), and this screen cannot scroll — `#content` is a plain
+`Vertical`. The fix buys height with width:
+
+- the fan picker and the tach table now sit **side by side** (`#pickers`), so
+  picking more fans no longer lengthens the form at all — Save's row became
+  independent of fan count (bottom 41 whether 0 or 8 headers are picked);
+- the tach table lost its label column (`sensors.d` names live in the picker
+  modal) and gained a `⚠` marker for "no tach: no RPM, no stall watch";
+- both switches share one row with short labels and a single hint line under
+  them; `#assign-list` is capped at 8 rows like the other tables.
+
+Verified with widget regions at 40/50/60 rows and with 0 and 8 fans picked,
+and in a real pty at 140×50 (owner column showing `ours` for the headers the
+live daemon holds, `firmware` for the free ones) and 80×30. Below ~42 rows the
+last line still falls off; `s` saves and the footer says so. Making this
+screen genuinely scrollable is still open (tried in §24, reverted: it changes
+all five screens' `1fr` tables at once).
+
+Tests now look columns up **by key** (`_col(table, "fown")`) rather than by
+index — these tables have each gained a column twice, and positional asserts
+break on every gain.
+
+### Tests
+
+6 new: the picker shows firmware/other/parked for a synthetic machine with
+`enable` overridden; the Force takeover switch writes `true` and then removes
+the key when switched back off (including through a load-edit-save round
+trip); saving a foreign header warns it will be refused and names the way
+out; force-on-a-foreign-header warns about the fight instead; a parked header
+is classified and listed by `needs_force_takeover`; the Overview renders
+`refused: held by another controller` from a `manual-conflict` status.
+
+Suite: **243 passed** (237 + 6).
+
+## 27. Config↔GUI audit, step 6a: "what happens if this source dies", per fan (2026-11-27)
+
+F6 and F12, both on the Assign form.
+
+F6 was the asymmetry that mattered: the global fail-safe had no screen either
+(F1, fixed in §25), so before this there was **no place at all** where "what
+happens when this source goes unreadable" could be read — while a hand-set
+`"failsafe": false` on one assignment is a one-character way to remove that
+safety net from one fan. `daemon._failsafe()` reads `failsafe`,
+`failsafe_duty`, `failsafe_after` **and** `failsafe_max_rate` per assignment,
+with the globals as fallback; the TUI showed none of them.
+
+### What changed
+
+- Three inputs — fail-safe duty %, after (polls), ramp %/poll — with the
+  **global value currently in effect** in each placeholder and blank meaning
+  "inherit" (key removed), which is the same rule step 1 established for
+  floor/ceiling/rate. The placeholders read `cfg.config`, so they cannot lie
+  after someone edits screen 5.
+- A **fail-safe on** switch. Off writes explicit `"failsafe": false`; on
+  removes the key. An absent key and `false` must not be ambiguous in a file
+  that decides whether fans ramp or hold.
+- **Turning it off is confirmed**, with the consequence spelled out ("these
+  fans HOLD their last duty … a source that dies while the fans are idling
+  leaves them idling — which is how a card cooked (§18)"). `validate()` already
+  warns about the state, but a warning in a modal nobody reads is not a
+  decision; asking at the switch is. Cancel writes nothing.
+- `failsafe_max_rate` was being read per assignment by the daemon but **not
+  validated** there — added to `config.validate()`, so a typo in the ramp a fan
+  takes when a sensor dies is caught before it reaches the hardware path.
+
+F12, the input polish: the numeric fields were `restrict="[0-9]" max_length=3`,
+so an int-only field was editing a float model — the live `/etc` config contains
+`floor_duty: 59.5`, which the form could not display without rounding it away.
+Now `[0-9.]`, max 5, parsed by one `_parse_num()` that keeps whole numbers as
+`int` (so the file stays free of `30.0`) and accepts fractions; a bad value is
+reported per field ("ceiling %: '1o0' is not a number") instead of being
+silently dropped.
+
+### The layout war, again — and a trap worth naming
+
+Adding a group pushed Save below the fold at 45 rows (`pilot.click("#save")`
+started raising `OutOfBound`, which is how the tests caught it). Reclaimed by
+putting all three switches on one row with short labels, dropping the group's
+own hint line (the placeholders already name each knob), trimming the closing
+hint to one line, and `#form-title` margin 2→1. Save bottom is now 44 of 45 at
+120 columns and independent of how many fans are picked.
+
+The trap: the new inputs rendered as **one full-width box** in a real terminal
+and the other two vanished off the right edge. Inputs default to `width: 100%`,
+and the existing CSS shared the row by id (`#floor, #maxduty, #rate`) — so the
+new ids silently got no rule. Tests passed; only the pty render showed it. The
+rule is now a class (`.num`), which a new field picks up by construction. Same
+class of bug as the two `id="switch-row"` collisions textual rejected at mount:
+anything addressed by id has to be remembered, and this screen has grown twice.
+
+### Tests
+
+8 new (7 TUI, 1 config): overrides load into the fields and save back; blank
+inherits (key removed); flipping the net off confirms and writes `false`;
+cancel writes nothing; switching it back on removes the key; fractional duty
+round-trips through the form (`59.5` in, `59.5` out — and `97.5` typed fresh);
+one existing test now asserts the confirmation appears for an assignment that
+already has `"failsafe": false`; `failsafe_max_rate` validated per assignment.
+
+Suite: **250 passed** (243 + 7, plus the config guard).
+
+## 28. Config↔GUI audit, step 6b: Overview tells the truth, and the sidebar says which file (2026-11-27)
+
+F10, F11, F13. The last of the audit's findings except cosmetic ones.
+
+### Overview was throwing away the daemon's own reporting
+
+`status.json` already carries `degraded`, a structured `errors` map, per-fan
+`kick: {phase, attempts}`, `duty_raw` and `orig_enable` — and the screen used
+none of it (F10). Three fixes, all of them "the data was already there":
+
+- **Degraded gets a banner.** `degraded: true` means the daemon is running with
+  a config it *rejected*, holding fans at fail-safe duty rather than following
+  curves — the single most important state on the box — and it was dropped on
+  the floor while the screen reported "daemon: running".
+- **Errors get one line each**, keyed (`stalled:it8686:pwm1: …`,
+  `duty-drift:it8686:pwm3: …`), capped at four with a pointer to the journal.
+  They used to be `" | ".join(...)` into the status line, which on a box with
+  four GPUs meant the line scrolled past and every entry but the first was
+  never read. Hidden entirely when clean — absence is information here, and a
+  permanent empty warning box trains people to ignore it.
+- **`kick` shows in the state cell** (`STALLED: … — kicking stop attempt 2`).
+  §21's code comment asks for exactly this: a daemon that is *fighting* for a
+  fan is a different situation from one that is *reporting* on it, and the
+  difference is visible nowhere else but the log.
+- **`duty_raw` shows when it disagrees** with the commanded duty
+  (`20 (raw 120!)`). §20's whole lesson is that commanded duty is not
+  ownership; showing a second number on every row would be noise, so it appears
+  only on drift. (`orig_enable` stays off the table — it matters for restoring,
+  not for reading the present, and it is in `status.json` when needed.)
+
+And the fan table now lists fans of **disabled** assignments, marked
+`CPU (disabled)` / `disabled — firmware holds it`. Listing only enabled ones
+made a header vanish from the screen at precisely the moment you disabled it to
+watch what the firmware does with it. Also deleted a dead duplicate loop in
+`_refresh_sources` (leftover that computed strings and discarded them).
+
+### Which config am I even editing (F11)
+
+The sidebar now ends with `config: ~/.config/alx_fancontrol/config.json` (or
+`/etc/...`) on every screen. Root edits `/etc`, a dev shell edits `$HOME`, and
+until now nothing said which — so a sudo-less session could produce a perfectly
+valid edit that changes nothing, discovered only by the fans not responding.
+The non-root banner says that out loud now instead of just "no fan control".
+
+### README lied about a removed section (F13)
+
+The config table still documented `sources.*.kind` / `.chip` / `.temp` /
+`.chip_index` / `.pci_bus` — keys deleted in §14 when sources became
+discovery-derived. Replaced with a `assignments.*.source` row plus a short
+"There is no `sources` section" note (ids like `k10temp[0]:temp1`,
+`gpu:47:00.0`; old files are migrated on load), and the troubleshooting bullet
+that told people to set `chip_index: 0/1` now describes the `[0]`/`[1]` id
+suffix that actually exists. `assignments.*.tach` and the fail-safe override
+row were updated to point at the screens that edit them.
+
+### Tests
+
+6 new: disabled assignment's fans listed and marked; degraded banner appears
+with its meaning; errors render one keyed line each and hide when clean; kick
+phase/attempt in the state cell; `_duty_cell` unit test (no marker on agreement,
+`(raw 120!)` on drift); sidebar shows the config path.
+
+Suite: **256 passed** (250 + 6).

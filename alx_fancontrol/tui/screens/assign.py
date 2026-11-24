@@ -2,13 +2,25 @@
 
 Top: a list of the assignments in the config — click a row to load it
 into the form (edit/overwrite by name), Delete button or `d` to remove
-one (with confirmation; the daemon then restores firmware control of
-its fans).
+one, Enable/disable button or `e` to release/reclaim its fans (both with
+confirmation; releasing hands the fans back to the firmware).
 
-Form: source Select (live °C in the labels), curve Select, fan picker
-as a click-to-toggle DataTable, optional floor/max, an assignment name,
-and Save → app.save_config(). Saving with an existing name overwrites it
-(the existing `enabled` state is preserved).
+Form: assignment name (also the rename path — renaming asks first, and
+renaming in place rather than leaving a second assignment behind),
+source Select (live °C in the labels), curve Select, fan picker as a
+click-to-toggle DataTable, a **tach table** (click a row to choose which
+`chip:fanN` reports that header's RPM — pre-filled from matching sensors.d
+labels, explicitly settable, "no tach" selectable), an enabled Switch,
+and floor / ceiling / rate inputs. Blank floor/ceiling/rate means "no
+override: use the global default" and REMOVES the key, so an override is
+reversible from the GUI.
+Save → app.save_config() (which validates before writing), then warns
+about any picked fan left without a tach — no RPM means no stall detection.
+
+Keys this form does not manage (`failsafe`, `failsafe_duty`,
+`failsafe_after`, `force_takeover`) are carried through untouched — safety
+settings edited in JSON survive an edit made here. `tach` is managed here
+now: the tach table is what gets written.
 
 Note: channels already held in manual mode by another process are
 selectable here, but the daemon refuses to take them over at runtime
@@ -22,56 +34,130 @@ from collections.abc import Iterator
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Input, Label, Select, Static
+from textual.widgets import (Button, DataTable, Input, Label, Select,
+                             Static, Switch)
 
 from textual.widgets._select import SelectOverlay
 
+from alx_fancontrol import config as config_mod
 from alx_fancontrol import hwmon
 from alx_fancontrol.tui.reader import LiveUpdate
-from alx_fancontrol.tui.screens.base import (BaseScreen, restore_table_cursor,
-                                             sel_value, table_cursor_key,
-                                             table_hover_key)
+from alx_fancontrol.tui.screens.base import (BaseScreen, ConfirmScreen,
+                                             restore_table_cursor, sel_value,
+                                             table_cursor_key, table_hover_key)
 
 
-class ConfirmDeleteScreen(ModalScreen[bool]):
+def _fmt_num(v) -> str:
+    """A stored number as it should appear in an input: 59.5 stays 59.5,
+    30 does not become '30.0'."""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _parse_num(text: str):
+    """(value, error) for a numeric field.
+
+    Floats are accepted — the model is float and the live config on this box
+    contains `59.5`, which the old int-only field could not even display —
+    while a whole number is stored as an int so the file stays free of 30.0
+    noise."""
+    text = text.strip()
+    if not text:
+        return None, None
+    try:
+        v = float(text)
+    except ValueError:
+        return None, f"{text!r} is not a number"
+    return (int(v) if v.is_integer() else v), None
+
+
+class ConfirmDeleteScreen(ConfirmScreen):
     """Delete-assignment confirmation — destructive: the daemon restores
     firmware (BIOS) control of the fans once the assignment is gone."""
 
-    DEFAULT_CSS = """
-    ConfirmDeleteScreen {
-        align: center middle;
-    }
-    ConfirmDeleteScreen #confirm-box {
-        width: 62;
-        height: auto;
-        border: tall $error;
-        padding: 1 2;
-    }
-    ConfirmDeleteScreen #confirm-box Button {
-        margin-top: 1;
-        margin-right: 1;
-        width: 16;
-    }
-    """
-
     def __init__(self, assignment_name: str):
-        super().__init__()
-        # 'name' collides with the read-only Widget.name property
+        super().__init__(
+            f"Delete assignment '{assignment_name}'?",
+            ("The daemon stops driving its fans and restores",
+             "firmware (BIOS) control of them."),
+            ok_label="Delete", ok_variant="error", ok_id="confirm-del")
+        # kept for tests/back-compat: the assignment this modal is about
         self.assignment_name = assignment_name
 
-    def compose(self):
-        with Vertical(id="confirm-box"):
-            yield Label(f"Delete assignment '{self.assignment_name}'?")
-            yield Label("The daemon stops driving its fans and restores")
-            yield Label("firmware (BIOS) control of them.")
-            yield Button("Cancel", id="confirm-cancel")
-            yield Button("Delete", id="confirm-del", variant="error")
 
-    def on_button_pressed(self, event):
-        if event.button.id == "confirm-cancel":
-            self.dismiss(False)
-        elif event.button.id == "confirm-del":
-            self.dismiss(True)
+class TachPickerModal(ModalScreen[str | None]):
+    """Which tach reports this header's RPM.
+
+    Dismisses with the chosen 'chip:fanN', with "" for an explicit "no tach"
+    (a header with no tach wire), or None when cancelled.
+
+    This screen exists because the mapping used to be invisible: it was
+    guessed from matching sensors.d labels and, where the labels did not pair,
+    the assignment ended up with NO tach at all. That reads as a blank RPM
+    cell on the Overview while the stall detector — which compares RPM against
+    commanded duty — quietly never fires for that header.
+    """
+
+    DEFAULT_CSS = """
+    TachPickerModal {
+        align: center middle;
+    }
+    TachPickerModal #tp-box {
+        width: 66;
+        height: auto;
+        max-height: 90%;
+        border: tall;
+        padding: 1 2;
+    }
+    TachPickerModal .tp-ctx {
+        color: $text-muted;
+    }
+    """
+    #: the list takes focus so ↑/↓/Enter work the moment it opens
+    AUTO_FOCUS = "#tp-list"
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    NONE_KEY = "__none__"
+
+    def __init__(self, fan: str, current: str | None, options):
+        super().__init__()
+        self.fan = fan
+        self.current = current
+        self.options = list(options)      # [(tach id, note)]
+
+    def compose(self):
+        with Vertical(id="tp-box"):
+            yield Label(f"RPM source for {self.fan}")
+            yield Label("current: " + (self.current or "(none)"),
+                        classes="tp-ctx")
+            yield DataTable(id="tp-list")
+            yield Label("↑/↓ choose · Enter use · Esc cancel",
+                        classes="tp-ctx")
+
+    def on_mount(self):
+        table = self.query_one("#tp-list", DataTable)
+        table.add_columns(("tach", "tt"), ("note", "tn"))
+        table.cursor_type = "row"
+        row_of = {}
+        for tach_id, note in self.options:
+            table.add_row(tach_id, note, key=tach_id)
+            row_of[tach_id] = table.row_count - 1
+        table.add_row("(no tach — no RPM, no stall detection)", "",
+                      key=self.NONE_KEY)
+        row_of[self.NONE_KEY] = table.row_count - 1
+        table.move_cursor(row=row_of.get(self.current or self.NONE_KEY, 0))
+
+    def on_data_table_row_selected(self, event):
+        key = getattr(event.row_key, "value", event.row_key)
+        if key is None:
+            self.dismiss(None)
+            return
+        key = str(key)
+        self.dismiss("" if key == self.NONE_KEY else key)
+
+    def action_cancel(self):
+        self.dismiss(None)
 
 
 class AssignScreen(BaseScreen):
@@ -79,6 +165,7 @@ class AssignScreen(BaseScreen):
     BINDINGS = [
         Binding("s", "save_assignment", "Save assignment"),
         Binding("d", "delete_assignment", "Delete assignment"),
+        Binding("e", "toggle_enabled", "Enable/disable"),
     ]
     CSS = """
     /* The container defaults are Horizontal/Vertical { height: 1fr } —
@@ -95,7 +182,7 @@ class AssignScreen(BaseScreen):
         margin-right: 1;
     }
     #form-title {
-        margin-top: 2;
+        margin-top: 1;
     }
     #assign-form {
         height: auto;
@@ -103,21 +190,67 @@ class AssignScreen(BaseScreen):
     #assign-form Horizontal {
         height: auto;
     }
-    /* Inputs default to width: 100% — side-by-side they'd push the
-       second one off-screen; share the row instead. */
-    #floor, #maxduty, #rate {
+    /* Inputs default to width: 100% — side by side they push each other
+       off-screen; a shared class makes them split the row (id rules here
+       would have silently dropped the fail-safe trio, which is exactly
+       what happened before this was a class). */
+    .num {
         width: 1fr;
     }
-    #floor, #maxduty {
+    .num {
         margin-right: 1;
     }
+    .switch-row {
+        height: auto;
+    }
+    #pickers {
+        height: auto;
+    }
+    #fan-pick, #tach-pick {
+        width: 1fr;
+    }
+    .switch-row Switch {
+        margin: 0 1 0 0;
+    }
+    .switch-row Static {
+        margin-right: 2;
+    }
+    /* Both lists grow with their content but stay bounded: an unbounded list
+       pushed the rest of the form below the fold on a short terminal, and the
+       screen cannot scroll (a plain Vertical). Bounded tables scroll
+       themselves. */
+    #assign-list {
+        height: auto;
+        max-height: 8;
+    }
+    #fan-pick {
+        height: auto;
+        max-height: 10;
+    }
+    /* One row per picked fan. */
+    #tach-pick {
+        height: auto;
+        max-height: 10;
+    }
     """
+
+    def _global_default(self, key: str) -> str:
+        """The value the global `config` block currently holds, for a
+        placeholder — hard-coding "(default 5)" would start lying the
+        moment the user changes the global."""
+        cfg = getattr(self.app, "cfg", None)
+        v = (cfg.config.get(key) if cfg is not None
+             else config_mod.DEFAULTS["config"][key])
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return str(v)
+        return f"{v:g}"
 
     def content(self) -> Iterator:
         yield Static("Assignments — click a row to edit it",
                      classes="title")
         with Horizontal(id="list-actions"):
             yield Button("New", id="new")
+            yield Button("Enable/disable", id="toggle-enabled")
             yield Button("Delete", id="delete", variant="error")
         yield DataTable(id="assign-list")
         yield Static("New assignment", id="form-title", classes="title")
@@ -127,20 +260,59 @@ class AssignScreen(BaseScreen):
             with Horizontal():
                 yield Select([], id="source", prompt="source")
                 yield Select([], id="curve", prompt="curve")
-            yield Static("fans — click a row to toggle (✓):",
+            yield Static("fans — click to toggle ✓ · RPM source — click to"
+                         " change (⚠ = no tach: no RPM, no stall watch)",
                          classes="hint")
-            yield DataTable(id="fan-pick")
+            # Side by side on purpose: stacked, the two lists plus the rest of
+            # the form pushed Save below the fold, and this screen cannot
+            # scroll (#content is a plain Vertical) — so "reachable" had to be
+            # bought with width instead. Each table scrolls itself when longer.
+            with Horizontal(id="pickers"):
+                yield DataTable(id="fan-pick")
+                yield DataTable(id="tach-pick")
             with Horizontal():
-                yield Input(placeholder="floor % (default 5)",
-                            id="floor", restrict=r"[0-9]", max_length=3)
-                yield Input(placeholder="ceiling % (default 100)",
-                            id="maxduty", restrict=r"[0-9]", max_length=3)
-                yield Input(placeholder="rate %/poll (default 6)",
-                            id="rate", restrict=r"[0-9]", max_length=3)
+                yield Input(
+                    placeholder=f"floor % (global "
+                                f"{self._global_default('floor_duty')}, "
+                                f"blank = use it)",
+                    id="floor", classes="num", restrict=r"[0-9.]", max_length=5)
+                yield Input(
+                    placeholder="ceiling % (global 100, blank = use it)",
+                    id="maxduty", classes="num", restrict=r"[0-9.]", max_length=5)
+                yield Input(
+                    placeholder=f"rate %/poll (global "
+                                f"{self._global_default('max_rate')}, "
+                                f"blank = use it)",
+                    id="rate", classes="num", restrict=r"[0-9.]", max_length=5)
+            with Horizontal():
+                yield Input(
+                    placeholder=f"fail-safe duty % (global "
+                                f"{self._global_default('failsafe_duty')})",
+                    id="fs-duty", classes="num", restrict=r"[0-9.]", max_length=5)
+                yield Input(
+                    placeholder=f"after (global "
+                                f"{self._global_default('failsafe_after')} "
+                                f"polls)",
+                    id="fs-after", classes="num", restrict=r"[0-9.]", max_length=5)
+                yield Input(
+                    placeholder=f"ramp %/poll (global "
+                                f"{self._global_default('failsafe_max_rate')})",
+                    id="fs-rate", classes="num", restrict=r"[0-9.]", max_length=5)
+            with Horizontal(classes="switch-row"):
+                yield Switch(value=True, id="enabled")
+                yield Static("enabled", classes="hint")
+                yield Switch(value=False, id="force-takeover")
+                yield Static("Force takeover", classes="hint")
+                yield Switch(value=True, id="failsafe")
+                yield Static("fail-safe on", classes="hint")
+            yield Static("off → firmware · force takeover → take a held or"
+                         " parked header · fail-safe off → hold last duty",
+                         classes="hint")
             yield Button("Save assignment", id="save", variant="primary")
 
     def on_mount(self):
         self._picked: set[str] = set()
+        self._tach_map: dict[str, str | None] = {}
         self._editing: str | None = None
         self._populate_source(self.app.live)
         self._populate_curves()
@@ -153,9 +325,15 @@ class AssignScreen(BaseScreen):
         self._refresh_list()
         table = self.query_one("#fan-pick", DataTable)
         table.add_columns(("✓", "sel"), ("fan", "fid"),
-                          ("label", "flabel"), ("rpm", "frpm"))
+                          ("label", "flabel"), ("owner", "fown"),
+                          ("rpm", "frpm"))
         table.cursor_type = "row"  # row events need this
         self._refresh_fans()
+        tachs = self.query_one("#tach-pick", DataTable)
+        tachs.add_columns(("fan", "tf"), ("tach", "tt"),
+                          ("rpm", "tr"), ("", "tw"))
+        tachs.cursor_type = "row"
+        self._refresh_tachs()
 
     # ---------------------------------------------------------- selects --
     def _source_options(self, data: dict) -> list[tuple[str, str]]:
@@ -252,7 +430,8 @@ class AssignScreen(BaseScreen):
 
     def _load_assignment(self, name: str):
         """Click-to-edit: load the named assignment into the form.
-        Saving with the same name overwrites it (enabled is preserved)."""
+        Saving with the same name overwrites it; saving under a different
+        name renames it (after asking — see `_rename_flow`)."""
         app = self.app
         a = app.cfg.assignments.get(name)
         if a is None:
@@ -275,13 +454,25 @@ class AssignScreen(BaseScreen):
             self.notify(f"curve '{crv_id}' missing — pick another",
                         severity="warning")
         self._picked = set(a.get("fans", []))
-        self.query_one("#floor", Input).value = (
-            str(a["floor_duty"]) if a.get("floor_duty") is not None else "")
-        self.query_one("#maxduty", Input).value = (
-            str(a["max_duty"]) if a.get("max_duty") is not None else "")
-        self.query_one("#rate", Input).value = (
-            str(a["max_rate"]) if a.get("max_rate") is not None else "")
+        # explicit tach mappings of the assignment, one entry per picked fan
+        # (None where the config has none) — the table shows and edits these
+        saved_tach = a.get("tach") or {}
+        self._tach_map = {f: saved_tach.get(f) for f in self._picked}
+        for wid, key in (("#floor", "floor_duty"),
+                         ("#maxduty", "max_duty"),
+                         ("#rate", "max_rate"),
+                         ("#fs-duty", "failsafe_duty"),
+                         ("#fs-after", "failsafe_after"),
+                         ("#fs-rate", "failsafe_max_rate")):
+            self.query_one(wid, Input).value = (
+                _fmt_num(a[key]) if a.get(key) is not None else "")
+        self.query_one("#enabled", Switch).value = bool(a.get("enabled", True))
+        self.query_one("#force-takeover", Switch).value = \
+            bool(a.get("force_takeover", False))
+        self.query_one("#failsafe", Switch).value = \
+            bool(a.get("failsafe", True))
         self._refresh_fans()
+        self._refresh_tachs()
         self.query_one("#form-title", Static).update(
             f"Editing '{name}' — saving overwrites it")
 
@@ -289,11 +480,19 @@ class AssignScreen(BaseScreen):
         """Back to 'new assignment': blank form, nothing picked."""
         self._editing = None
         self._picked.clear()
+        self._tach_map.clear()
         self.query_one("#name", Input).value = ""
         self.query_one("#floor", Input).value = ""
         self.query_one("#maxduty", Input).value = ""
         self.query_one("#rate", Input).value = ""
+        self.query_one("#fs-duty", Input).value = ""
+        self.query_one("#fs-after", Input).value = ""
+        self.query_one("#fs-rate", Input).value = ""
+        self.query_one("#enabled", Switch).value = True
+        self.query_one("#force-takeover", Switch).value = False
+        self.query_one("#failsafe", Switch).value = True
         self._refresh_fans()
+        self._refresh_tachs()
         self.query_one("#form-title", Static).update("New assignment")
 
     def _selected_list_name(self) -> str | None:
@@ -326,25 +525,137 @@ class AssignScreen(BaseScreen):
         # 'd' binding (mirrors Curves' d=delete)
         self._start_delete(self._selected_list_name())
 
+    # --------------------------------------------------- enable / disable --
+    def _start_toggle_enabled(self, name: str | None):
+        """Release a set of fans to the firmware, or take them back.
+        Disabling is the safe alternative to deleting (the curve, floor and
+        tach mapping survive), and it is what `config.py`'s own comments
+        recommend for an assignment whose source is gone for good."""
+        if name is None or name not in self.app.cfg.assignments:
+            self.notify("No assignment selected — click or arrow to a row "
+                        "first", severity="warning")
+            return
+        a = self.app.cfg.assignments[name]
+        if a.get("enabled", True):
+            # giving up control is the destructive direction → ask
+            self.run_worker(self._disable_flow(name), exclusive=False)
+        else:
+            self._apply_enabled(name, True)
+
+    async def _disable_flow(self, name: str):
+        fans = ", ".join(self.app.cfg.assignments[name].get("fans", []))
+        ok = await self.app.push_screen_wait(ConfirmScreen(
+            f"Disable assignment '{name}'?",
+            (f"The daemon releases {fans or '(no fans)'} to firmware",
+             "control: they stop following their curve until enabled."),
+            ok_label="Disable", ok_variant="error"))
+        if ok:
+            self._apply_enabled(name, False)
+
+    def _apply_enabled(self, name: str, on: bool):
+        app = self.app
+        a = dict(app.cfg.assignments[name])
+        a["enabled"] = on
+        app.cfg.assignments[name] = a
+        if self._editing == name:
+            self.query_one("#enabled", Switch).value = on
+        if on:
+            msg = (f"Assignment '{name}' enabled — the daemon takes its "
+                   "fans back within ~1 s")
+        else:
+            msg = (f"Assignment '{name}' disabled — the daemon restores "
+                   "firmware control of its fans")
+        if app.save_config(msg):
+            self._refresh_list()
+
     # --------------------------------------------------------------- fans
-    def _refresh_fans(self):
+    def _refresh_fans(self, data: dict | None = None):
         app = self.app
         table = self.query_one("#fan-pick", DataTable)
         prev_key = table_cursor_key(table)
         prev_hover = table_hover_key(table)
         table.clear()
-        data = app.live
+        data = data if data is not None else app.live
         for fan, _d, _pwm in hwmon.list_pwm_channels(app.chips):
             fd = data.get("fans", {}).get(fan, {})
             rpm = fd.get("rpm")
+            owner = app.fan_owner(fan, data)
             table.add_row(
                 "✓" if fan in self._picked else "",
                 fan,
                 app.fan_label(fan),
+                owner,
                 "—" if rpm is None else str(rpm),
                 key=fan,
             )
         restore_table_cursor(table, prev_key, prev_hover)
+
+    # ---------------------------------------------------------------- tach
+    @staticmethod
+    def _tach_note(chip: str, idx: int, labels) -> str:
+        """The sensors.d label of a tach input, '' when it has none —
+        `sensor_label`'s generic 'fan1 (it8686)' fallback would only restate
+        the id already in the column beside it."""
+        return (labels or {}).get(chip, {}).get(f"fan{idx}") or ""
+
+    def _tach_candidates(self, fan: str) -> list[tuple[str, str]]:
+        """(tach id, note) options for one header — same-chip inputs first,
+        because a header's RPM almost always comes from the matching input on
+        the same SuperIO. The note is the sensors.d label, plus a flag when it
+        is the label THIS pwm carries (that pairing is what guess_tach used to
+        be the only way to rely on)."""
+        parsed = hwmon.parse_fan_id(fan)
+        chip = parsed[0] if parsed else None
+        fan_lab = self.app.fan_label(fan)
+        same: list[tuple[str, str]] = []
+        other: list[tuple[str, str]] = []
+        for tach_id, _d, idx in hwmon.list_tach_channels(self.app.chips):
+            t = hwmon.parse_tach_id(tach_id)
+            if t is None:
+                continue
+            note = self._tach_note(t[0], idx, self.app.labels)
+            if note and note == fan_lab:
+                note = f"{note} · matches this header"
+            (same if t[0] == chip else other).append((tach_id, note))
+        return same + other
+
+    def _refresh_tachs(self):
+        """One row per picked fan: what tach it will use, the RPM that tach
+        reads right now, and ⚠ when there is none.
+
+        No label column here (the picker shows each input's sensors.d name):
+        the two tables sit side by side, and the one fact worth the width is
+        "this header has no RPM, so nothing can see it stall".
+        """
+        app = self.app
+        table = self.query_one("#tach-pick", DataTable)
+        prev_key = table_cursor_key(table)
+        prev_hover = table_hover_key(table)
+        table.clear()
+        for fan in sorted(self._picked):
+            tach = self._tach_map.get(fan)
+            rpm = "—"
+            if tach:
+                res = hwmon.resolve_tach(tach, app.chips)
+                if res is not None:
+                    got = hwmon.read_rpm(*res)
+                    rpm = "—" if got is None else str(got)
+            table.add_row(fan, tach or "(none)", rpm,
+                          "" if tach else "⚠", key=fan)
+        restore_table_cursor(table, prev_key, prev_hover)
+
+    def _start_pick_tach(self, fan: str):
+        self.run_worker(self._pick_tach_flow(fan), exclusive=False)
+
+    async def _pick_tach_flow(self, fan: str):
+        choice = await self.app.push_screen_wait(
+            TachPickerModal(fan=fan,
+                            current=self._tach_map.get(fan),
+                            options=self._tach_candidates(fan)))
+        if choice is None:
+            return                      # cancelled: mapping untouched
+        self._tach_map[fan] = choice or None
+        self._refresh_tachs()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected):
         # textual >= 1 API: RowSelected carries .data_table and .row_key.
@@ -362,18 +673,27 @@ class AssignScreen(BaseScreen):
         if table.id == "assign-list":
             self._load_assignment(key)
             return
-        # fan picker: toggle ✓
+        if table.id == "tach-pick":
+            self._start_pick_tach(key)
+            return
+        # fan picker: toggle ✓, and seed its tach with the label match so a
+        # normal header is mapped without another click (overridable below)
         fan = key
         if fan in self._picked:
             self._picked.discard(fan)
+            self._tach_map.pop(fan, None)
             table.update_cell(fan, "sel", "")
         else:
             self._picked.add(fan)
+            self._tach_map[fan] = self.app.guess_tach(fan)
             table.update_cell(fan, "sel", "✓")
+        self._refresh_tachs()
 
     def on_live_update(self, msg: LiveUpdate):
         data = msg.data
-        # live RPMs in place
+        # live RPMs in place, plus the owner column: takeover flips
+        # pwmN_enable, so "who holds this header" changes while the screen is
+        # open (firmware -> ours when the daemon takes it, back on release)
         table = self.query_one("#fan-pick", DataTable)
         for row in range(table.row_count):
             fan = table.get_cell_at((row, 1))
@@ -381,6 +701,10 @@ class AssignScreen(BaseScreen):
                 continue
             rpm = data.get("fans", {}).get(fan, {}).get("rpm")
             table.update_cell(fan, "frpm", "—" if rpm is None else str(rpm))
+            table.update_cell(fan, "fown", self.app.fan_owner(fan, data))
+        # RPM for what the form has MAPPED (not what the saved config maps),
+        # so picking a candidate shows whether it can be the right one
+        self._refresh_tachs()
         # live temps in the source picker labels
         self._populate_source(data)
 
@@ -396,6 +720,12 @@ class AssignScreen(BaseScreen):
             self._reset_form()
         elif event.button.id == "delete":
             self._start_delete(self._selected_list_name())
+        elif event.button.id == "toggle-enabled":
+            self._start_toggle_enabled(self._selected_list_name())
+
+    def action_toggle_enabled(self):
+        # 'e' binding
+        self._start_toggle_enabled(self._selected_list_name())
 
     def action_save_assignment(self):
         # 's' binding — the Save button sits at the bottom of a long form
@@ -419,18 +749,162 @@ class AssignScreen(BaseScreen):
         if not self._picked:
             self.notify("Pick at least one fan", severity="warning")
             return
-        floor_txt = self.query_one("#floor", Input).value.strip()
-        max_txt = self.query_one("#maxduty", Input).value.strip()
-        rate_txt = self.query_one("#rate", Input).value.strip()
-        floor = int(floor_txt) if floor_txt else None
-        maxd = int(max_txt) if max_txt else None
-        rate = int(rate_txt) if rate_txt else None
+        floor_txt = self.query_one("#floor", Input).value
+        max_txt = self.query_one("#maxduty", Input).value
+        rate_txt = self.query_one("#rate", Input).value
+        fs_duty_txt = self.query_one("#fs-duty", Input).value
+        fs_after_txt = self.query_one("#fs-after", Input).value
+        fs_rate_txt = self.query_one("#fs-rate", Input).value
+        parsed = []
+        for label, txt in (("floor %", floor_txt),
+                           ("ceiling %", max_txt),
+                           ("rate %/poll", rate_txt),
+                           ("fail-safe duty %", fs_duty_txt),
+                           ("fail-safe after (polls)", fs_after_txt),
+                           ("fail-safe ramp %/poll", fs_rate_txt)):
+            v, err = _parse_num(txt)
+            if err:
+                self.notify(f"{label}: {err}", severity="warning")
+                return
+            parsed.append(v)
+        floor, maxd, rate, fs_duty, fs_after, fs_rate = parsed
         if floor is not None and maxd is not None and floor > maxd:
             self.notify("floor % must be <= ceiling %", severity="warning")
             return
-        fans = sorted(self._picked)
-        # a fan may be controlled by several assignments: the daemon
-        # drives it to the HIGHEST requested duty — say so on save
+        form = {"source": src_id, "curve": curve_id,
+                "fans": sorted(self._picked),
+                "enabled": bool(self.query_one("#enabled", Switch).value),
+                "force_takeover": bool(
+                    self.query_one("#force-takeover", Switch).value),
+                "failsafe": bool(self.query_one("#failsafe", Switch).value),
+                "floor_duty": floor, "max_duty": maxd, "max_rate": rate,
+                "failsafe_duty": fs_duty, "failsafe_after": fs_after,
+                "failsafe_max_rate": fs_rate}
+        editing = self._editing
+        if not form["failsafe"]:
+            # turning the net off is the dangerous direction of a setting, and
+            # it is one switch away on a screen that has several: confirm, with
+            # what it means spelled out (validate() also warns about it, but a
+            # warning in a modal nobody reads is not a decision)
+            self.run_worker(self._no_failsafe_flow(name, form, editing),
+                            exclusive=False)
+            return
+        if editing and name != editing:
+            # The name field doubles as the rename path. Writing the form
+            # under the new key alone would leave the OLD assignment in the
+            # config driving the same fans, with nothing but a generic
+            # shared-fan notice to hint that anything happened — so renaming
+            # is confirmed, and MOVES the entry instead of duplicating it.
+            self.run_worker(self._rename_flow(editing, name, form),
+                            exclusive=False)
+            return
+        self._commit(name, form)
+
+    async def _no_failsafe_flow(self, name: str, form: dict,
+                                editing: str | None):
+        ok = await self.app.push_screen_wait(ConfirmScreen(
+            f"Turn the fail-safe OFF for '{name}'?",
+            ("If its source stops answering, these fans HOLD their last duty",
+             "instead of ramping up. A source that dies while the fans are",
+             "idling leaves them idling — which is how a card cooked (§18)."),
+            ok_label="Save without fail-safe", ok_variant="error"))
+        if not ok:
+            return
+        if editing and name != editing:
+            await self._rename_flow(editing, name, form)
+        else:
+            self._commit(name, form)
+
+    async def _rename_flow(self, old: str, new: str, form: dict):
+        exists = new in self.app.cfg.assignments
+        if exists:
+            ok = await self.app.push_screen_wait(ConfirmScreen(
+                f"'{new}' already exists — overwrite it with '{old}'?",
+                ("The edited settings replace what "
+                 f"'{new}' holds, and '{old}' is removed; its fans stay",
+                 "controlled by the result."),
+                ok_label="Overwrite", ok_variant="error"))
+            msg = (f"'{old}' written over '{new}' — daemon picks it up "
+                   "within ~1 s")
+        else:
+            ok = await self.app.push_screen_wait(ConfirmScreen(
+                f"Rename assignment '{old}' to '{new}'?",
+                ("The same source, curve, fans and overrides move under the",
+                 "new name — no second assignment is left driving them."),
+                ok_label="Rename", ok_variant="primary"))
+            msg = (f"Assignment '{old}' renamed to '{new}' — daemon picks it "
+                   "up within ~1 s")
+        if not ok:
+            return
+        # merge onto the entry being kept: the target when overwriting, the
+        # assignment being renamed otherwise
+        base = dict(self.app.cfg.assignments.get(new if exists else old, {}))
+        self._commit(new, form, base=base, drop=old, message=msg)
+
+    def _commit(self, name: str, form: dict, base: dict | None = None,
+                drop: str | None = None, message: str | None = None):
+        """Write the form into the config under `name` and save.
+
+        Merge rules, since these decide what a save really does:
+          * a form field left BLANK (floor / ceiling / rate) REMOVES the key.
+            That is how "back to the global default" is expressed — keeping
+            the previous value would make an override impossible to undo in
+            the GUI, and typing the global's number instead pins it per
+            assignment, which is a different thing.
+          * keys this form does not manage (`failsafe`, `failsafe_duty`,
+            `failsafe_after`, ...) are carried over, so hand-edited safety
+            settings survive an edit made here. `force_takeover` IS managed:
+            off removes the key rather than writing `false`, because absent
+            is how the file says "no" and a saved `false` would be noise.
+          * `tach` comes from the tach table, which is authoritative: a
+            mapping the user left there (or that was pre-filled from the
+            matching sensors.d label) is written, unmapped fans get no entry
+            and are warned about below. Entries for fans that left the
+            assignment disappear with them.
+        """
+        app = self.app
+        assignment = dict(base if base is not None
+                          else app.cfg.assignments.get(name, {}))
+        assignment.update({"source": form["source"], "curve": form["curve"],
+                           "fans": form["fans"], "enabled": form["enabled"]})
+        if form.get("force_takeover"):
+            assignment["force_takeover"] = True
+        else:
+            assignment.pop("force_takeover", None)
+        for key in ("floor_duty", "max_duty", "max_rate",
+                    "failsafe_duty", "failsafe_after", "failsafe_max_rate"):
+            if form[key] is None:
+                assignment.pop(key, None)   # blank = use the global default
+            else:
+                assignment[key] = form[key]
+        # `failsafe` off removes a safety net, so it is written explicitly
+        # rather than as an absent key: `false` is the statement, and leaving
+        # a stale true behind after someone flipped the switch off would be
+        # the dangerous reading of an ambiguous file.
+        if form.get("failsafe", True):
+            assignment.pop("failsafe", None)
+        else:
+            assignment["failsafe"] = False
+        fans = form["fans"]
+        tach = {f: t for f, t in self._tach_map.items() if f in fans and t}
+        if tach:
+            assignment["tach"] = tach
+        else:
+            assignment.pop("tach", None)
+        unmapped = [f for f in fans if not self._tach_map.get(f)]
+        # who holds the headers we are about to ask for: `daemon._takeover()`
+        # refuses these two cases unless force_takeover is set, and finding
+        # that out from the word `manual-conflict` on another screen — while a
+        # card is hot — is the F5 failure (§18/§20 are why it matters here)
+        force = bool(form.get("force_takeover"))
+        refused = [] if force else app.needs_force_takeover(fans)
+        fought = [f for f in fans if force
+                  and app.fan_owner(f) == app.OWNER_OTHER]
+        app.cfg.assignments[name] = assignment
+        if drop and drop != name:
+            app.cfg.assignments.pop(drop, None)
+        # a fan may be controlled by several assignments: the daemon drives
+        # it to the HIGHEST requested duty — say so on save
         shared: list[str] = []
         for other, oa in app.cfg.assignments.items():
             if other == name:
@@ -438,38 +912,36 @@ class AssignScreen(BaseScreen):
             common = sorted(set(fans) & set(oa.get("fans", [])))
             if common:
                 shared.append(f"'{other}' ({', '.join(common)})")
-        # overwriting an existing assignment keeps its enabled state — and
-        # any key this form does not manage (failsafe, failsafe_duty,
-        # force_takeover, ...): hand-edited safety settings must survive an
-        # edit made in the TUI
-        existing = app.cfg.assignments.get(name, {})
-        assignment: dict = dict(existing)
-        assignment.update({
-            "source": src_id,
-            "curve": curve_id,
-            "fans": fans,
-            "enabled": existing.get("enabled", True),
-        })
-        if floor is not None:
-            assignment["floor_duty"] = floor
-        if maxd is not None:
-            assignment["max_duty"] = maxd
-        if rate is not None:
-            assignment["max_rate"] = rate
-        tach = {}
-        for f in fans:
-            guess = app.guess_tach(f)
-            if guess:
-                tach[f] = guess
-        if tach:
-            assignment["tach"] = tach
-        app.cfg.assignments[name] = assignment
-        if app.save_config(f"Assignment '{name}' saved — daemon picks "
-                                 f"it up within ~1 s"):
+        if app.save_config(message
+                           or f"Assignment '{name}' saved — daemon picks "
+                              "it up within ~1 s"):
             if shared:
                 self.notify(
                     "Shared fan(s) are driven to the HIGHEST requested "
                     f"duty (also controlled by: {', '.join(shared)})",
                     severity="info")
+            if unmapped:
+                # not an error — some headers genuinely have no tach wire —
+                # but the daemon compares RPM against duty to see a stall, so
+                # an unmapped header is an unwatched one, and silence here is
+                # how §18/§20's failure stayed invisible
+                self.notify(
+                    f"No RPM source (tach) for: {', '.join(unmapped)} — "
+                    "those headers will read '—' and a stall on them cannot "
+                    "be detected. Click one in the tach list to map it.",
+                    severity="warning", timeout=12)
+            if refused:
+                self.notify(
+                    f"The daemon will NOT control {', '.join(refused)}: held "
+                    "in manual mode by another process, or disabled. Turn on "
+                    "Force takeover to take them anyway, or free them first "
+                    "(systemctl stop fancontrol).",
+                    severity="warning", timeout=15)
+            elif fought:
+                self.notify(
+                    f"Force takeover on {', '.join(fought)}: whoever held it "
+                    "may write that header too — expect the duty to be "
+                    "fought over until the other controller is stopped.",
+                    severity="warning", timeout=12)
             self._reset_form()
             self._refresh_list()

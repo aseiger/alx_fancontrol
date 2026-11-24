@@ -237,24 +237,31 @@ automatically on load — the TUI re-saves them as v2 on first open.
 | `config.stall_alert_command` | shell command run when a fan fault starts and again when it clears (default `""` = off). Event arrives in the environment: `ALX_FAN`, `ALX_STATE`, `ALX_DETAIL`, `ALX_DUTY_PCT`, `ALX_RPM`, `ALX_CONFIG` |
 | `config.stall_alert_timeout_s` | how long the alert command may run (default 5). Longer than that and it is killed with its process group — the loop that keeps the *other* fans alive is not negotiable |
 | `config.stall_alert_repeat_s` | re-alert every N seconds while a fault persists (default 300; `0` = once per episode) |
-| `sources.*.kind` | `hwmon` or `nvidia` |
-| `sources.*.chip` / `.temp` / `.chip_index` | hwmon source: chip **name prefix** (never `hwmonN` — indices reshuffle across reboots), temp index, and which instance of a duplicated prefix (two `k10temp` packages on this box → `chip_index` 0/1) |
-| `sources.*.pci_bus` | nvidia source: normalized PCI bus, e.g. `08:00.0` |
+| `assignments.*.source` | a source id string — **there is no `sources` section any more** (see the note below): ids come from runtime discovery, e.g. `k10temp[0]:temp1`, `it8686:temp5`, `gpu:47:00.0`. Screen 4 lists what exists right now; screen 2 offers them with live °C |
 | `curves.*.points` | `[temp_c, duty_pct]` pairs, ≥1, temps strictly increasing, duty 0–100. Eval clamps flat beyond the ends. |
 | `assignments.*.fans` | list of `chip:pwmN` — a fan **may** appear in several assignments; the daemon then drives it to the **highest** requested duty (validation warns) |
-| `assignments.*.tach` | optional `chip:pwmN → chip:fanN` RPM display map (the TUI auto-guesses it from sensors.d labels) |
+| `assignments.*.tach` | optional `chip:pwmN → chip:fanN` RPM source map. Screen 2 edits it per header (pre-filled from matching sensors.d labels, "(no tach)" selectable); a header with no entry reads no RPM, so **a stall on it cannot be detected** |
 | `assignments.*.floor_duty` / `.max_duty` / `.max_rate` | **per-fan** floor / ceiling / max duty change per poll — override the global fallbacks (floor ≤ max enforced) |
 | `assignments.*.failsafe` | `false` opts this assignment out of the fail-safe (it holds last duty instead of ramping). Validation warns — prefer disabling/deleting the assignment |
-| `assignments.*.failsafe_duty` / `.failsafe_after` | per-assignment fail-safe overrides |
+| `assignments.*.failsafe_duty` / `.failsafe_after` / `.failsafe_max_rate` | per-assignment fail-safe overrides; screen 2 edits all three, blank inherits the global |
 | `assignments.*.force_takeover` | `true` claims the channel even when `pwmN_enable` is 1 (manual, another owner) or 0 (disabled). Opt-in for headers the BIOS parks where they cannot cool anything; the value found there is still what gets restored on exit |
+
+**There is no `sources` section.** Sources are a property of the machine,
+not a setting: they are discovered at every daemon start (`sources.py`, from
+the hwmon tree plus one `nvidia-smi` call), and an assignment references one by
+its canonical id. A config that still carries `sources` is migrated on load —
+the ids are rewritten to what discovery produces (§14).
 
 **Writers:** only the TUI and humans (plain JSON by design). The daemon
 never writes the config; it hot-reloads on mtime change every poll
 (atomic replace on the writer side means it never reads a torn file; a
 bad edit keeps the old in-memory config and shows a red error in
-`status.json`). The TUI remembers the mtime it loaded and, if the file
-changed on disk, asks **Reload / Overwrite** before saving. Don't run
-two TUIs at once.
+`status.json`). Because *any* validation error makes the daemon keep its
+previous config, the TUI runs `config.validate()` **before** writing and
+refuses the save with the reason on screen — "Saved" for a file the daemon
+will ignore is worse than no save at all. The TUI remembers the mtime it
+loaded and, if the file changed on disk, asks **Reload / Overwrite** before
+saving. Don't run two TUIs at once.
 
 ## Daemon
 
@@ -472,7 +479,7 @@ get a pointer to `scripts/bootstrap_venv.sh`). The TUI is **read-only on
 hwmon** — safe to run while the daemon is live. Run without root and a
 red **non-root** banner sits in the sidebar on every screen: fans can't
 be controlled (pwm writes are root-only) and the config edited is the
-home one, not `/etc`. Keys `1–4` switch
+home one, not `/etc`. Keys `1–5` switch
 screens (footer shows them; sidebar buttons work too). The current
 screen is highlighted in the sidebar — nav items are never *focused*
 (focus would swallow the nav keys and leave a stray highlight on the
@@ -480,38 +487,101 @@ top item), so: **keys navigate, clicks focus** fields/tables.
 
 1. **Overview** — live tables: *Sources* (label, kind, chip/bus, °C,
    stale?) and *Fans* (assignment, label, source °C, live duty % from
-   `pwmN`, live RPM from the tach, state) + a daemon status line
+   `pwmN`, live RPM from the tach — or **`no tach`**, meaning nothing is
+   mapped to that header so a stall there cannot be detected —, and state in
+   words you can act on: `refused: held by another controller`,
+   `refused: header disabled (enable 0)`, `FAIL-SAFE: source unreadable,
+   ramping up`, `STALLED: high duty, ~0 RPM — pinned to full`,
+   `OWNERSHIP LOST (firmware took it back)`)
+   + a daemon status line
    (running / stale >3 s / absent, config mtime, last error from
    `status.json`).
 2. **Assign** — top: a list of the existing assignments (name, source,
    curve, fans, floor, max, rate, on/off). **Click a row to load it into the
    form below and edit it** (no need to remember names); saving with the
-   same name overwrites it in place (it keeps its `enabled` state).
-   **Delete** button or `d` removes the selected row after a
-   confirmation (the daemon then restores firmware control of its
-   fans); **New** resets the form. Form: source `Select` (rows show
-   live °C), curve `Select`, fan picker (click a row to toggle ✓ —
-   every channel is pickable; channels another process holds in manual
-   mode are refused by the *daemon* at takeover, not by the UI),
-   optional floor % / ceiling % / rate %/poll, name, **Save** (or `s`).
+   same name overwrites it in place. **Enable/disable** button or `e`
+   toggles the selected row: disabling releases its fans to firmware control
+   (it asks first — giving up control is the destructive direction; enabling
+   just reclaims them), and unlike deleting it keeps the curve, floor and
+   tach mapping for when the fan comes back. **Delete** button or `d` removes
+   the selected row after a confirmation (the daemon then restores firmware
+   control of its fans); **New** resets the form. Form: name — editing the
+   name of a loaded assignment **renames** it (confirmed; the entry moves,
+   rather than a second assignment being left behind driving the same fans),
+   source `Select` (rows show live °C), curve `Select`, fan picker (click a
+   row to toggle ✓, plus each header's **owner**: `firmware` (free), `ours`
+   (the daemon holds it), `left by us` (manual mode a dead run of ours left
+   behind — reclaimed on the next start), `other` (another controller:
+   fancontrol, the EC, the BIOS) or `parked` (`enable 0`, cooling nothing).
+   The daemon *refuses* `other` and `parked` headers unless the assignment
+   sets **Force takeover** — a switch on this form, off removes the key — and
+   saving says which way it went: "the daemon will NOT control …, turn on
+   Force takeover or free them first", or that two controllers will fight over
+   that header. Refusing is the *daemon's* decision at takeover, not a UI
+   filter: every channel stays pickable), **RPM source (tach) table** (one
+   row per picked fan: which `fanN`
+   reports its RPM, what that input is called in `sensors.d`, and the RPM it
+   reads now. Picking a header pre-fills the input whose label matches it;
+   **click a row to choose another** — including *“(no tach)”* for a header
+   with no tach wire. Saving with a header left unmapped warns: no RPM means
+   the stall detector (§20/§21) can never fire for that fan), floor % /
+   ceiling % / rate %/poll — **blank means "no override": the
+   global `config` value applies and the per-assignment key is removed**, and
+   the placeholders show the global values currently in effect (values may be
+   fractional — the model is float and the live config contains `59.5`),
+   **fail-safe overrides** for the same three globals (`fail-safe duty %`,
+   `after … polls`, `ramp %/poll` — blank inherits the global) plus a
+   **fail-safe on** switch, and **enabled** / **Force takeover** switches.
+   Turning the fail-safe **off** is confirmed — with what it means said out
+   loud: those fans then *hold their last duty* when the source dies instead
+   of ramping up, which is §18's failure shape. Off is stored as explicit
+   `"failsafe": false`; turning it back on removes the key.
 3. **Curves** — points table (cursor-selectable) + live text plot
    (curve as `█` columns, `◄` marker at the current temp of the
    selected preview source, every point marked `●` and the selected one
    `◆`). The curve knows nothing about floor/ceiling — those are
    per-fan settings (Assign screen: floor % / ceiling % / rate %/poll;
-   the daemon falls back to the global `config` values). Mouse: **drag a `●` point** to move it —
-   clicking empty plot area does nothing. Points are added only from
-   the table: `a` inserts a point **between the selected row and the
-   next** (prompt pre-filled at their midpoint; if the selected row is
-   last it tacks one on at last + 5 °C). Keys: `d` delete, `s` save,
-   `+`/`-` duty ±1, shift+←/→ temp ±1, shift+↑/↓ duty ±5. **Save** (button or `s` — the
-   button can fall below the fold on short terminals) writes the sorted
-   points. On the **Assign** screen `s` likewise saves.
+   the daemon falls back to the global `config` values). Mouse: **drag a
+   `●` point** to move it — clicking empty plot area does nothing. Points
+   are added only from the table: `a` inserts a point **between the
+   selected row and the next** (prompt pre-filled at their midpoint; if the
+   selected row is last it tacks one on at last + 5 °C; on an **empty**
+   curve it asks for the first point, so deleting every point no longer
+   bricks a curve). Keys: `d` delete, `s` save, `+`/`-` duty ±1,
+   shift+←/→ temp ±1, shift+↑/↓ duty ±5.
+   **Curve management** (buttons and keys): **New** (`n`) creates a curve —
+   the id is asked for (assignments reference curves by it, and a collision
+   is refused rather than silently overwriting one), seeded with the
+   built-in default shape so the config stays valid the moment it exists;
+   **Copy** (`c`) duplicates the selected curve *as currently edited*,
+   unsaved point moves included — the usual way to tune "same curve,
+   shifted 5 °C"; **Delete** (`shift+d`) removes an **unused** curve after
+   confirmation and refuses one that assignments still reference, naming
+   them: the daemon skips an assignment whose curve is missing (its fans
+   stay at their last duty), so deleting one in use would silently stop
+   those fans following their curve — re-point them on Assign first. The
+   line beside the label field shows `used by: …` for exactly that reason.
+   **Save** (button or `s` — the button can fall below the fold on short
+   terminals) writes the sorted points **and** the label every picker
+   displays. On the **Assign** screen `s` likewise saves.
 4. **Sources** — read-only live table of the temperature sources
    *detected at runtime* (id, label, kind, chip/bus detail, °C; GPU rows
    show the `nvidia-smi` model). Nothing to configure here: any of them
    is pickable in the Assign screen, and a hardware change is picked up
    on the next daemon start/reload or TUI restart.
+5. **Settings** — the global `config` block: every option the daemon reads
+   (poll interval, `max_rate`, floor, the fail-safe trio, GPU/`nvidia-smi`
+   and watchdog limits, the whole stall-kick sequence, the alert command),
+   grouped, with its current value, unit and built-in default; a value that
+   differs from the default is marked `*`. **Enter or click a row** opens it
+   with the explanation of what the knob does and the bounds the save will
+   enforce (the same table `validate()` uses — see
+   `IMPLEMENTATION_NOTES.md` §25), so `stall_kick_backoff_s` needs no source
+   reading. **Blank value = remove the key** = follow the built-in default.
+   Edits stay on this screen until **Save** (`s`), which shows what will
+   change and validates first; **Discard changes** (`r`) drops them. Pending
+   edits survive a screen switch (they are not written by another screen's
+   Save) but not a TUI restart.
 
 ## Running without installing (interim mode)
 
@@ -697,8 +767,10 @@ Additional rules honored everywhere:
   last duty; hwmon-driven fans keep moving. The failure is logged first
   + every 30th time.
 - **Two k10temp packages** — this box exposes the CPU temperature twice
-  (two packages/sockets). Use `chip_index: 0/1` on `k10temp` sources to
-  disambiguate (seeded as `cpu0`/`cpu1`).
+  (two packages/sockets). Discovery disambiguates duplicated chip prefixes
+  with a `[0]` / `[1]` suffix in the source id (`k10temp[0]:temp1`), so an
+  assignment says which package it reads even after a reboot reshuffles the
+  `hwmonN` numbering.
 - **TUI says "Config changed externally"** — someone/something edited
   the JSON since the TUI loaded it: Reload (discard in-TUI edits) or
   Overwrite. Don't run two TUIs at once.

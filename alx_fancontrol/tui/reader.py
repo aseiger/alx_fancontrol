@@ -123,4 +123,10 @@ class LiveReader:
             st = status_mod.read_status(
                 Path("/run/alx_fancontrol/status.json"))
         data["status"] = st
+        # Who claims these headers: the running daemon (status.json above) or
+        # a run of ours that died with them still in manual mode (the marker).
+        # Read every sweep so the Assign screen's owner column is current —
+        # it decides whether the daemon will accept a fan at all.
+        data["owned"] = status_mod.claimed_channels(
+            status_mod.owned_path_for(app.cfg_path))
         return data

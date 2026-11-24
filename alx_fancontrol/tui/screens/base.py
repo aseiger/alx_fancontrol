@@ -1,7 +1,7 @@
-"""Shared screen shell: Header + Footer + left sidebar (nav 1-4) + content.
+"""Shared screen shell: Header + Footer + left sidebar (nav 1-5) + content.
 
-Each of the four screens is a real textual Screen (so the app's key
-bindings 1-4 switch between them); the sidebar is re-composed by every
+Each screen is a real textual Screen (so the app's key
+bindings 1-5 switch between them); the sidebar is re-composed by every
 screen through this base class.
 
 Nav items are NON-FOCUSABLE on purpose: a focused button shows the
@@ -11,12 +11,15 @@ to "jump back to the top". The selection is shown by the `active`
 class instead (set on_mount by the screen that owns it)."""
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.coordinate import Coordinate
-from textual.screen import Screen
-from textual.widgets import Button, DataTable, Footer, Header, Select, Static
+from textual.screen import ModalScreen, Screen
+from textual.widgets import (Button, DataTable, Footer, Header, Label, Select,
+                             Static)
 
 
 def _row_key_at(table: DataTable, row: int):
@@ -78,6 +81,16 @@ def sel_value(widget: Select):
     return None if v is Select.NULL else v
 
 
+def _short_path(p) -> str:
+    """Config path with $HOME as ~ — the sidebar is 26 columns and
+    `/home/alex/.config/alx_fancontrol/config.json` does not fit."""
+    s = str(p)
+    home = os.path.expanduser("~")
+    if s.startswith(home):
+        s = "~" + s[len(home):]
+    return f"config: {s}"
+
+
 class NavButton(Button):
     """A sidebar nav item: clickable, but never takes keyboard focus —
     the current screen is shown with the `active` class, not a focus
@@ -86,12 +99,72 @@ class NavButton(Button):
     can_focus = False
 
 
+class ConfirmScreen(ModalScreen[bool]):
+    """Yes/no confirmation for one destructive change.
+
+    Every path that changes what the fans do while the daemon is live
+    (delete/disable an assignment, delete a curve) asks here, with the
+    consequence spelled out rather than a bare "are you sure" — and naming
+    what is about to happen is also what makes an accidental Enter on a
+    destructive button unlikely."""
+
+    DEFAULT_CSS = """
+    ConfirmScreen {
+        align: center middle;
+    }
+    ConfirmScreen #confirm-box {
+        width: 62;
+        height: auto;
+        border: tall $error;
+        padding: 1 2;
+    }
+    ConfirmScreen #confirm-box Button {
+        margin-top: 1;
+        margin-right: 1;
+        width: 18;
+    }
+    """
+    BINDINGS = [Binding("enter", "yes", "Confirm"),
+                Binding("escape", "no", "Cancel")]
+
+    def __init__(self, title: str, lines=(), ok_label: str = "OK",
+                 ok_variant: str = "error", ok_id: str = "confirm-ok"):
+        super().__init__()
+        # 'name' collides with the read-only Widget.name property
+        self.title_text = title
+        self.lines = tuple(lines)
+        self.ok_label = ok_label
+        self.ok_variant = ok_variant
+        self.ok_id = ok_id
+
+    def compose(self):
+        with Vertical(id="confirm-box"):
+            yield Label(self.title_text)
+            for line in self.lines:
+                yield Label(line)
+            yield Button("Cancel", id="confirm-cancel")
+            yield Button(self.ok_label, id=self.ok_id,
+                         variant=self.ok_variant)
+
+    def on_button_pressed(self, event):
+        if event.button.id == "confirm-cancel":
+            self.dismiss(False)
+        elif event.button.id == self.ok_id:
+            self.dismiss(True)
+
+    def action_yes(self):
+        self.dismiss(True)
+
+    def action_no(self):
+        self.dismiss(False)
+
+
 class BaseScreen(Screen):
     #: the sidebar button for this screen, e.g. "nav-1"
     NAV_ID: str | None = None
 
     #: No auto-focus on screen activation: a focused Input would swallow
-    #: the 1-4 navigation keys (typing "3" into the name field instead of
+    #: the 1-5 navigation keys (typing "3" into the name field instead of
     #: switching to Curves), and a focused table steals arrow keys. Keys
     #: navigate, clicks focus — focus is None until the user clicks.
     AUTO_FOCUS = ""
@@ -102,12 +175,23 @@ class BaseScreen(Screen):
         with Horizontal(id="shell"):
             with Vertical(id="sidebar"):
                 if not self.app.is_root:
-                    yield Static("⚠ non-root: no fan control — "
-                                 "use sudo alx-fancontrol", id="root-warn")
+                    # F11: it is not enough to say "no fan control". A
+                    # sudo-less session writes the HOME config, which the
+                    # running daemon (root, /etc) will never read — a
+                    # perfectly valid edit that changes nothing, discovered
+                    # only by the fans not responding.
+                    yield Static("⚠ non-root: no fan control — use sudo "
+                                 "alx-fancontrol. Saves below go to the file "
+                                 "shown here, which the running daemon does "
+                                 "not read.", id="root-warn")
                 yield NavButton("1 · Overview", id="nav-1")
                 yield NavButton("2 · Assign", id="nav-2")
                 yield NavButton("3 · Curves", id="nav-3")
                 yield NavButton("4 · Sources", id="nav-4")
+                yield NavButton("5 · Settings", id="nav-5")
+                # ...and which file every save in this session writes. Root
+                # edits /etc, a dev shell edits ~/.config (config.default_path).
+                yield Static(_short_path(self.app.cfg_path), id="cfg-path")
             with Vertical(id="content"):
                 yield from self.content()
 
@@ -123,6 +207,7 @@ class BaseScreen(Screen):
         actions = {"nav-1": "show_overview",
                    "nav-2": "show_assign",
                    "nav-3": "show_curves",
-                   "nav-4": "show_sources"}
+                   "nav-4": "show_sources",
+                   "nav-5": "show_settings"}
         if event.button.id in actions:
             getattr(self.app, actions[event.button.id])()

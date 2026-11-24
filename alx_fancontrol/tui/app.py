@@ -1,5 +1,5 @@
 """FanControlApp: textual shell — sidebar nav, live-refresh worker,
-single save path with stale-write guard.
+single save path with validation and a stale-write guard.
 
 The TUI never writes to hwmon (read-only); the only file it writes is the
 config (atomically, with .bak). `config_path` is injectable so tests use a
@@ -13,17 +13,19 @@ from pathlib import Path
 
 from textual.app import App
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label
 
 from alx_fancontrol import config as config_mod
 from alx_fancontrol import hwmon
 from alx_fancontrol import sources as sources_mod
+from alx_fancontrol import status as status_mod
 from alx_fancontrol.tui.reader import LiveData, LiveReader, LiveUpdate
 from alx_fancontrol.tui.screens.assign import AssignScreen
 from alx_fancontrol.tui.screens.curves import CurveEditorScreen
 from alx_fancontrol.tui.screens.overview import OverviewScreen
+from alx_fancontrol.tui.screens.settings import SettingsScreen
 from alx_fancontrol.tui.screens.sources import SourcesScreen
 
 
@@ -61,8 +63,63 @@ class StaleConfigScreen(ModalScreen[bool]):
             self.dismiss(True)
 
 
+class ConfigErrorsScreen(ModalScreen[None]):
+    """A save that would write a config the running daemon refuses is
+    blocked here, with the reason from `config.validate()` on screen.
+
+    Without this the file lands anyway, the daemon's hot reload rejects it,
+    keeps its previous config, and the only trace is one fragment of the
+    Overview status line — "Saved" followed by silence is the worst failure
+    mode a tool that drives fans can have."""
+
+    DEFAULT_CSS = """
+    ConfigErrorsScreen {
+        align: center middle;
+    }
+    ConfigErrorsScreen #cfgerr-box {
+        width: 76;
+        height: auto;
+        max-height: 85%;
+        border: tall red;
+        padding: 1 2;
+    }
+    ConfigErrorsScreen #cfgerr-box Button {
+        margin-top: 1;
+        width: 24;
+    }
+    """
+    BINDINGS = [Binding("enter", "close", "OK"),
+                Binding("escape", "close", "OK")]
+
+    def __init__(self, errors):
+        super().__init__()
+        self.errors = list(errors)
+
+    def compose(self):
+        with VerticalScroll(id="cfgerr-box"):
+            yield Label(f"Not saved — the daemon would refuse this config "
+                        f"({len(self.errors)} problem(s)):")
+            for e in self.errors[:15]:
+                yield Label(f"  • {e}")
+            if len(self.errors) > 15:
+                yield Label(f"  … and {len(self.errors) - 15} more "
+                            "(run: alx-fancontrol check)")
+            if any(e.startswith("config.") for e in self.errors):
+                yield Label("Global settings cannot be edited in the TUI "
+                            f"yet — fix them in {self.app.cfg_path} and save "
+                            "again (the previous file is kept as .bak).")
+            yield Button("Back to editing", id="cfgerr-ok", variant="primary")
+
+    def on_button_pressed(self, event):
+        if event.button.id == "cfgerr-ok":
+            self.dismiss(None)
+
+    def action_close(self):
+        self.dismiss(None)
+
+
 class FanControlApp(App):
-    """TUI shell. Keys 1-4 switch screens; a worker thread feeds live data
+    """TUI shell. Keys 1-5 switch screens; a worker thread feeds live data
     every ~1 s (live=False in tests for speed/hermeticity)."""
 
     TITLE = "alx_fancontrol"
@@ -71,6 +128,7 @@ class FanControlApp(App):
         Binding("2", "show_assign", "Assign"),
         Binding("3", "show_curves", "Curves"),
         Binding("4", "show_sources", "Sources"),
+        Binding("5", "show_settings", "Settings"),
     ]
     CSS = """
     #shell {
@@ -129,6 +187,21 @@ class FanControlApp(App):
         color: $text-muted;
         margin-bottom: 1;
     }
+    /* degradation and errors get their own styling: they mean "the fans are
+       not following your config", which is not a hint */
+    .alarm {
+        color: $error;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #errors-box {
+        color: $warning;
+        margin-bottom: 1;
+    }
+    #sidebar #cfg-path {
+        color: $text-muted;
+        margin-top: 1;
+    }
     """
 
     def __init__(self, config_path=None, live: bool = True):
@@ -141,6 +214,12 @@ class FanControlApp(App):
         self.is_root = os.geteuid() == 0
         self.cfg: config_mod.Config | None = None
         self._cfg_mtime: float | None = None
+        #: Settings screen's unsaved edits, held HERE rather than on the
+        #: screen: switching screens builds a new one, and numbers typed for
+        #: `stall_kick_backoff_s` must not evaporate because someone pressed
+        #: 2 to look at an assignment. Deliberately separate from `cfg`, so
+        #: nothing gets written until Save on that screen (see settings.py).
+        self.settings_edits: dict = {}
         self.labels = hwmon.load_sensorsd_labels()
         self.chips = hwmon.find_all_chips()
         # Sources are discovered at runtime (machine property, not config);
@@ -199,6 +278,9 @@ class FanControlApp(App):
     def show_sources(self):
         self.switch_screen(SourcesScreen())
 
+    def show_settings(self):
+        self.switch_screen(SettingsScreen())
+
     def action_show_overview(self):
         self.show_overview()
 
@@ -210,6 +292,24 @@ class FanControlApp(App):
 
     def action_show_sources(self):
         self.show_sources()
+
+    def action_show_settings(self):
+        self.show_settings()
+
+    # ------------------------------------------------------------- reload
+    def reload_from_disk(self) -> bool:
+        """Throw away in-memory edits and take the file back (Settings'
+        Revert, and the stale-config 'Reload' path). False with a notification
+        when the file cannot be read — the in-memory config is then left
+        alone, because there is nothing better to replace it with."""
+        try:
+            self.cfg = config_mod.load(self.cfg_path)
+        except (OSError, ValueError) as e:
+            self.notify(f"Reload failed: {e}", severity="error")
+            return False
+        self._refresh_mtime()
+        self.notify("Config reloaded from disk")
+        return True
 
     # --------------------------------------------------------------- live
     def on_live_data(self, msg: LiveData):
@@ -224,6 +324,59 @@ class FanControlApp(App):
         if parsed is None:
             return fan
         return hwmon.sensor_label(parsed[0], "pwm", parsed[1], self.labels)
+
+    # Owner states, shortest honest words that fit a table column. The point
+    # of showing them at pick time (audit F5) is that `force_takeover` is not
+    # a guess-able setting: whether the daemon will accept a header depends on
+    # who holds it NOW, and §18/§20 are what happens when that is invisible.
+    OWNER_FIRMWARE = "firmware"    # enable=2: free, takeover is clean
+    OWNER_MINE = "ours"            # enable=1 and the running daemon holds it
+    OWNER_STALE = "left by us"     # enable=1, marker says our dead run left it
+    OWNER_OTHER = "other"          # enable=1 held by someone else: fancontrol,
+                                   # EC, BIOS — it will keep taking the fan back
+    OWNER_PARKED = "parked"        # enable=0: disabled — cools nothing (§20)
+    OWNER_UNKNOWN = "?"
+
+    def fan_owner(self, fan: str, data: dict | None = None) -> str:
+        """Who holds `pwmN_enable` on this header right now.
+
+        Read from the live sweep (`enable`) plus the two ownership sources
+        `status.claimed_channels` reconciles. `data` takes the snapshot to
+        read (a screen refreshing itself from a LiveUpdate message must use
+        that message, not whatever the app happened to store last).
+
+        This is the same question `daemon._takeover()` asks before it writes:
+        `other` and `parked` are exactly the channels it REFUSES unless the
+        assignment sets `force_takeover`, so the screen can warn before a save
+        instead of one screen later showing the bare word `manual-conflict`.
+        """
+        live = data if data is not None else (self.live or {})
+        entry = (live.get("fans") or {}).get(fan) or {}
+        en = entry.get("enable")
+        if en is None:
+            return self.OWNER_UNKNOWN
+        if en == hwmon.ENABLE_FIRMWARE:
+            return self.OWNER_FIRMWARE
+        if en == hwmon.ENABLE_DISABLED:
+            return self.OWNER_PARKED
+        if en != hwmon.ENABLE_MANUAL:
+            return self.OWNER_UNKNOWN
+        # manual mode: ours (running daemon), ours-but-dead (reclaimable),
+        # or somebody else's
+        st = live.get("status") or {}
+        held = (st.get("fans") or {}) if status_mod.daemon_state(st) \
+            != "absent" else {}
+        if fan in held:
+            return self.OWNER_MINE
+        if fan in ((live.get("owned") or {}).get("stale") or []):
+            return self.OWNER_STALE
+        return self.OWNER_OTHER
+
+    def needs_force_takeover(self, fans, data: dict | None = None) -> list[str]:
+        """Picked headers the daemon will refuse to take over as configured."""
+        return [f for f in sorted(fans)
+                if self.fan_owner(f, data) in (self.OWNER_OTHER,
+                                               self.OWNER_PARKED)]
 
     def tach_for(self, fan: str) -> str | None:
         for a in self.cfg.assignments.values():
@@ -252,10 +405,25 @@ class FanControlApp(App):
             self,
             message: str = "Saved — running daemon reloads within ~1 s",
     ) -> bool:
-        """THE single save path: stale guard (mtime) → config.save()
-        (atomic + .bak) → notification. Returns False when a stale-write
-        modal is shown instead of saving directly (textual 8 requires
-        push_screen_wait to run in a worker, so the modal flow is one)."""
+        """THE single save path: validate → stale guard (mtime) →
+        config.save() (atomic + .bak) → notification. Returns False when
+        nothing was written — either a validation failure (modal with the
+        reason) or a stale-write modal is shown instead of saving directly
+        (textual 8 requires push_screen_wait to run in a worker, so the
+        modal flow is one).
+
+        Validating here matters because of how the daemon consumes the file:
+        ANY error makes its hot reload keep the previous config
+        (`daemon._maybe_reload`), so writing an invalid one is not "a save
+        that has not taken effect yet" — it is a save that does nothing,
+        silently, while the UI says Saved."""
+        errors, _warnings = config_mod.validate(self.cfg)
+        if errors:
+            # warnings are deliberately not shown here: they are conditions
+            # the daemon handles at runtime (unknown curve, shared fan) and
+            # the screens that create them already explain them
+            self.push_screen(ConfigErrorsScreen(errors))
+            return False
         try:
             m = self.cfg_path.stat().st_mtime
         except OSError:

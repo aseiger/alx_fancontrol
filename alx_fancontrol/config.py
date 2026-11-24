@@ -100,6 +100,133 @@ DEFAULTS = {
 }
 
 
+@dataclass(frozen=True)
+class Field:
+    """One `config.*` option, described once for validation *and* the GUI.
+
+    Before this the ranges lived inside `validate()` and nowhere else, so the
+    TUI could not say what a knob means, where its default comes from, or what
+    a legal value is without re-deriving all three — and did not, which is how
+    F1 (22 global options, no editor anywhere) survived this long.
+
+    `lo`/`hi` are the bounds validate() enforces (None = unbounded). `kind`
+    shapes the input widget only: numbers still accept int or float either
+    way, as they always have.
+    """
+
+    key: str
+    label: str
+    kind: str            # "number" | "bool" | "str"
+    group: str
+    lo: float | None = None
+    hi: float | None = None
+    unit: str = ""
+    help: str = ""
+
+
+# Order is the order the Settings screen shows them in; the numeric bounds
+# are applied in this order, which is the order validate() always used.
+CONFIG_FIELDS: tuple[Field, ...] = (
+    Field("poll_seconds", "Poll interval", "number", "Cooling loop",
+          lo=0.001, unit="s",
+          help="How often temperatures are read and duty recomputed."),
+    Field("max_rate", "Max duty change", "number", "Cooling loop",
+          lo=0, hi=100, unit="% per poll",
+          help="Limits how fast duty may move per poll, so a spike in one "
+               "reading cannot slam the fans. Per-assignment override: "
+               "max_rate on the Assign screen."),
+    Field("floor_duty", "Minimum duty", "number", "Cooling loop",
+          lo=0, hi=100, unit="%",
+          help="Duty never falls below this, whatever the curve says. The "
+               "default for assignments that do not set their own floor."),
+    Field("dead_temp_c", "Dead reading below", "number", "Cooling loop",
+          unit="\u00b0C",
+          help="A temperature at or below this counts as \"no reading\" "
+               "rather than as very cold, and starts the fail-safe count."),
+
+    Field("failsafe_duty", "Fail-safe duty", "number",
+          "Fail-safe (source unreadable)", lo=0, hi=100, unit="%",
+          help="Where a fan goes when its source stops answering: ramp to "
+               "this duty and stay. 100 = fans full on."),
+    Field("failsafe_after", "Fail-safe after", "number",
+          "Fail-safe (source unreadable)", lo=0, unit="polls",
+          help="Consecutive dead polls before the fail-safe engages \u2014 "
+               "one bad reading should not spin the fans up."),
+    Field("failsafe_max_rate", "Fail-safe ramp", "number",
+          "Fail-safe (source unreadable)", lo=0, hi=100, unit="% per poll",
+          help="How fast the fail-safe ramps, deliberately faster than "
+               "max_rate: a sensor that is gone is not a reason to be gentle."),
+
+    Field("gpu_temp_min_valid_c", "GPU reading valid above", "number",
+          "Readings and liveness", unit="\u00b0C",
+          help="A GPU reporting below this dropped off the bus; it counts as "
+               "no reading instead of as a cold card."),
+    Field("smi_timeout_s", "nvidia-smi timeout", "number",
+          "Readings and liveness", lo=0, unit="s",
+          help="Give up on an nvidia-smi call after this (0 = no timeout). "
+               "Nothing may block the poll loop \u2014 a hung call would stop "
+               "every fan being controlled."),
+    Field("watchdog_seconds", "Watchdog", "number", "Readings and liveness",
+          lo=0, unit="s",
+          help="If a poll takes longer than this the daemon exits, so "
+               "systemd restarts it (fans keep their last duty). 0 = off."),
+
+    Field("stall_min_duty", "Stall alarm above", "number", "Stalled fan",
+          lo=0, hi=100, unit="%",
+          help="Ask for at least this much duty before ~0 RPM counts as a "
+               "stall \u2014 below it, 0 RPM is just an idle fan."),
+    Field("stall_after", "Stall confirmed after", "number", "Stalled fan",
+          lo=1, unit="polls",
+          help="How long high duty with no RPM must last before the stall is "
+               "believed."),
+    Field("stall_full_duty", "Pin a stalled fan to", "number",
+          "Stalled fan", lo=0, hi=100, unit="%",
+          help="A stalled header is pinned here \u2014 past the curve's "
+               "ceiling and the rate limit, because the curve is what left it "
+               "under-powered. Must be >= stall_min_duty, or pinning would "
+               "silence the detector that pinned it."),
+    Field("stall_kick", "Try to restart it", "bool", "Stalled fan",
+          help="Off means: pin to full and leave it. On also pulses the "
+               "header to 0 so a jammed blade can swing free, then back to "
+               "full, judging the result by the tach."),
+    Field("stall_kick_attempts", "Kick attempts per round", "number",
+          "Stalled fan", lo=0,
+          help="How many stop-and-lunge tries in one round, so a seized "
+               "winding does not cook itself (or the fan driver) on stall "
+               "current."),
+    Field("stall_kick_stop_s", "Hold at 0 for", "number", "Stalled fan",
+          lo=0, unit="s",
+          help="Time parked at 0 duty before each lunge, so the blade can "
+               "swing free."),
+    Field("stall_kick_run_s", "Run at full for", "number", "Stalled fan",
+          lo=0, unit="s",
+          help="Time at full duty before judging whether it restarted."),
+    Field("stall_kick_backoff_s", "Rest between rounds", "number",
+          "Stalled fan", lo=0, unit="s",
+          help="Rest between rounds of attempts \u2014 the fan and the driver "
+               "both heat up on stall current."),
+    Field("stall_kick_cooldown_s", "Hold after restart", "number",
+          "Stalled fan", lo=0, unit="s",
+          help="Once it is spinning again: hold full duty this long, then "
+               "hand control back to the curve."),
+
+    Field("stall_alert_command", "Alert command", "str", "Escalation",
+          help="Shell command run when a fan is confirmed stalled \u2014 the "
+               "part that reaches a person. Empty = no alert. See README "
+               "\"Escalation\"."),
+    Field("stall_alert_timeout_s", "Alert timeout", "number", "Escalation",
+          lo=0, unit="s",
+          help="Kill the alert command after this; an alert must never be "
+               "what blocks the poll loop."),
+    Field("stall_alert_repeat_s", "Repeat alert every", "number",
+          "Escalation", lo=0, unit="s",
+          help="Keep re-alerting while the stall lasts (0 = alert once)."),
+)
+
+#: key -> Field, for the GUI and for error messages
+BY_KEY: dict[str, Field] = {f.key: f for f in CONFIG_FIELDS}
+
+
 SYSTEM_CONFIG_DIR = Path("/etc/alx_fancontrol")
 
 
@@ -183,22 +310,52 @@ def _migrate_v1(doc: dict) -> dict:
     return out
 
 
+def _merge_defaults(doc: dict) -> dict:
+    """Fill in what the file does not say, without overruling what it does.
+
+    Two different meanings of "absent", treated differently on purpose:
+
+      * **`config.*` keys merge one by one.** A release that adds a knob must
+        not require every existing config file to be edited, and deleting a
+        key from the file genuinely means "use the built-in default" — which
+        is exactly what the GUI writes for a blank field.
+      * **`curves` and `assignments` are taken as written when present.**
+        Merging them entry by entry made a curve un-deletable: DEFAULTS
+        re-injected `default` and `gpu_v100` on every load, so the operator's
+        Delete did not stick, the TUI showed the curve again after a reload,
+        and the daemon kept resolving assignments against a curve nobody had
+        asked for (F14). A file with NO `curves` key at all still gets the
+        stock pair — that is a minimal or freshly migrated file, not a
+        decision to have no curves.
+    """
+    merged = {"config": _deep_merge(DEFAULTS["config"],
+                                     doc.get("config") or {})}
+    for section in ("curves", "assignments"):
+        merged[section] = copy.deepcopy(
+            doc[section] if section in doc else DEFAULTS[section])
+    return merged
+
+
 def load(path) -> Config:
-    """Parse (+ migrate v1 -> v2) + merge over DEFAULTS. Raises
+    """Parse (+ migrate v1 -> v2) + fill in defaults. Raises
     OSError/ValueError on unreadable or invalid JSON (callers decide:
     daemon start -> exit 2, hot reload -> keep old config, `check` ->
-    exit 1). Does NOT validate — call validate() for that."""
+    exit 1). Does NOT validate — call validate() for that.
+
+    See `_merge_defaults` for what counts as absent: per-key for `config`,
+    per-section for curves and assignments.
+    """
     with open(path) as f:
         doc = json.load(f)
     if not isinstance(doc, dict):
         raise ValueError(f"{path}: config root must be a JSON object")
     if int(doc.get("version", 1)) < CONFIG_VERSION:
         doc = _migrate_v1(doc)
-    merged = _deep_merge(DEFAULTS, doc)
+    merged = _merge_defaults(doc)
     return Config(
-        config=merged.get("config", {}),
-        curves=merged.get("curves", {}),
-        assignments=merged.get("assignments", {}),
+        config=merged["config"],
+        curves=merged["curves"],
+        assignments=merged["assignments"],
     )
 
 
@@ -213,35 +370,19 @@ def validate(cfg: Config) -> tuple[list[str], list[str]]:
     warnings: list[str] = []
 
     c = cfg.config
-    for key, lo, hi in (("poll_seconds", 0.001, None),
-                        ("max_rate", 0, None),
-                        ("floor_duty", 0, 100),
-                        ("dead_temp_c", None, None),
-                        ("failsafe_duty", 0, 100),
-                        ("failsafe_after", 0, None),
-                        ("failsafe_max_rate", 0, None),
-                        ("gpu_temp_min_valid_c", None, None),
-                        ("smi_timeout_s", 0, None),
-                        ("watchdog_seconds", 0, None),
-                        ("stall_min_duty", 0, 100),
-                        ("stall_after", 1, None),
-                        ("stall_full_duty", 0, 100),
-                        ("stall_kick_attempts", 0, None),
-                        ("stall_kick_stop_s", 0, None),
-                        ("stall_kick_run_s", 0, None),
-                        ("stall_kick_backoff_s", 0, None),
-                        ("stall_kick_cooldown_s", 0, None),
-                        ("stall_alert_timeout_s", 0, None),
-                        ("stall_alert_repeat_s", 0, None)):
+    for f in CONFIG_FIELDS:
+        if f.kind != "number":
+            continue          # str/bool checked on their own below
+        key = f.key
         if key not in c:
             continue          # absent = the DEFAULTS value applies (load merges)
         v = c.get(key)
         if not isinstance(v, (int, float)) or isinstance(v, bool):
             errors.append(f"config.{key} must be a number, got {v!r}")
-        elif lo is not None and v < lo:
-            errors.append(f"config.{key} must be >= {lo}")
-        elif hi is not None and v > hi:
-            errors.append(f"config.{key} must be <= {hi}")
+        elif f.lo is not None and v < f.lo:
+            errors.append(f"config.{key} must be >= {f.lo}")
+        elif f.hi is not None and v > f.hi:
+            errors.append(f"config.{key} must be <= {f.hi}")
 
     cmd = c.get("stall_alert_command", "")
     if cmd is not None and not isinstance(cmd, str):
@@ -342,8 +483,12 @@ def validate(cfg: Config) -> tuple[list[str], list[str]]:
         fs = a.get("failsafe")
         if fs is not None and not isinstance(fs, bool):
             errors.append(f"assignment {aid}: 'failsafe' must be true/false")
+        # `failsafe_max_rate` is read per assignment too (daemon._failsafe
+        # falls back to the global), so it is validated here as well — a
+        # typo in it used to reach the daemon unchecked.
         for name, lo, hi in (("failsafe_duty", 0, 100),
-                             ("failsafe_after", 0, None)):
+                             ("failsafe_after", 0, None),
+                             ("failsafe_max_rate", 0, None)):
             v = a.get(name)
             if v is not None and (not isinstance(v, (int, float))
                                   or isinstance(v, bool)):

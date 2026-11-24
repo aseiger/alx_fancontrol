@@ -24,21 +24,28 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import time
 import os
 import traceback
 
 import pytest
 from textual.coordinate import Coordinate
-from textual.widgets import DataTable, Input, Select, Static
+from textual.screen import ModalScreen
+from textual.widgets import DataTable, Input, Label, Select, Static, Switch
 
 from alx_fancontrol import config as config_mod
 from alx_fancontrol import hwmon
-from alx_fancontrol.tui.app import FanControlApp
+from alx_fancontrol.tui.app import ConfigErrorsScreen, FanControlApp
+from alx_fancontrol.tui.screens.settings import (ConfirmSettingsScreen,
+                                                SettingModal)
 from alx_fancontrol.tui.reader import LiveUpdate
 from alx_fancontrol.tui.screens.assign import (AssignScreen,
-                                               ConfirmDeleteScreen)
+                                               ConfirmDeleteScreen,
+                                               ConfirmScreen,
+                                               TachPickerModal)
 from alx_fancontrol.tui.screens.base import sel_value
 from alx_fancontrol.tui.screens.curves import (CurveEditorScreen,
+                                               NewCurveModal,
                                                PointPromptModal)
 from alx_fancontrol.tui.screens.overview import OverviewScreen
 from alx_fancontrol.tui.screens.sources import SourcesScreen
@@ -139,6 +146,14 @@ def post_row_highlighted(pilot, table: DataTable, row: int):
     return pilot.pause()
 
 
+async def edit_assignment_row(pilot, scr, row: int = 0):
+    """Click-to-edit: post the RowSelected a real click on the assignment
+    list posts (returns the table so callers can assert on it)."""
+    lst = scr.query_one("#assign-list", DataTable)
+    await post_row_selected(pilot, lst, row)
+    return lst
+
+
 def read_cfg(path) -> dict:
     return json.loads(path.read_text())
 
@@ -149,7 +164,7 @@ async def wait_not_modal(pilot, what: str = "modal") -> None:
     after dismiss, so a few idle cycles are enough."""
     for _ in range(50):
         await pilot.pause()
-        if not isinstance(pilot.app.screen, (PointPromptModal,)):
+        if not isinstance(pilot.app.screen, ModalScreen):
             return
     raise AssertionError(f"{what} still open after 50 idle cycles")
 
@@ -487,9 +502,17 @@ def test_live_update_fills_rpm_and_source_labels(temp_config, machine):
             await pilot.pause()
             fans = machine.fan_ids()
             table = scr.query_one("#fan-pick", DataTable)
-            assert table.get_cell_at((fans.index("it8686:pwm1"), 3)) == "1650"
-            assert table.get_cell_at((fans.index("it8686:pwm3"), 3)) == "4680"
-            assert table.get_cell_at((fans.index("it8686:pwm2"), 3)) == "—"
+            # by column id, not index: this table has gained columns twice
+            # now and a positional assert breaks silently each time
+            rpm = _col(table, "frpm")
+            own = _col(table, "fown")
+            assert table.get_cell_at((fans.index("it8686:pwm1"), rpm)) == "1650"
+            assert table.get_cell_at((fans.index("it8686:pwm3"), rpm)) == "4680"
+            assert table.get_cell_at((fans.index("it8686:pwm2"), rpm)) == "—"
+            # owner column (F5): the fake machine leaves headers in firmware
+            # mode, which is what a free header reads as
+            assert table.get_cell_at((fans.index("it8686:pwm1"), own)) \
+                == "firmware"
             opts = {v: l for l, v in select_options(
                 scr.query_one("#source", Select))}
             assert "55.0 °C" in str(opts["k10temp:temp1"])
@@ -1466,13 +1489,15 @@ def test_add_point_at_end_tacks_on(temp_config, machine):
     asyncio.run(run())
 
 
-def test_add_point_requires_selected_row(temp_config, machine, notices):
-    """'a' with an empty curve (nothing selected) warns instead of
-    opening a prompt."""
-    from alx_fancontrol import config as _cfg_mod
-    cfg = _cfg_mod.load(temp_config)
+def test_add_point_on_an_empty_curve_asks_for_the_first_point(temp_config,
+                                                              machine):
+    """'a' on an EMPTY curve opens the prompt instead of refusing. Deleting
+    every point of a curve used to be a dead end: 'a' demanded a selected
+    row and there was no way to create a curve, so the only repair path was
+    editing JSON."""
+    cfg = config_mod.load(temp_config)
     cfg.curves["empty"] = {"label": "Empty", "points": []}
-    _cfg_mod.save(cfg, temp_config)
+    config_mod.save(cfg, temp_config)
 
     async def run():
         async with FanControlApp(config_path=temp_config,
@@ -1486,10 +1511,220 @@ def test_add_point_requires_selected_row(temp_config, machine, notices):
             await pilot.pause()
             assert editor.pts == []
             await pilot.press("a")
+            modal = await wait_modal(pilot, PointPromptModal)
+            assert modal.defaults == (40.0, 20)
+            await pilot.click("#pp-ok")
+            await wait_not_modal(pilot)
+            assert editor.pts == [[40.0, 20]], editor.pts
+            # and the curve is recoverable all the way to a valid save
+            editor.save_curve()
             await pilot.pause()
-            assert isinstance(pilot.app.screen, CurveEditorScreen)
-            assert any("select a point" in m.lower()
-                       for _s, m in notices), notices
+            assert read_cfg(temp_config)["curves"]["empty"]["points"] == \
+                [[40.0, 20]]
+
+    asyncio.run(run())
+
+
+def test_delete_every_point_then_rebuild_the_curve(temp_config, machine):
+    """The F7 dead end, end to end: delete every point of a live curve and
+    it is still recoverable in the GUI — 'a' offers the first point and the
+    curve saves again. (Deleting a point from a NON-empty curve re-selects a
+    row, so this is the only state with nothing to insert between.)"""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            editor = await _goto_curves(pilot)
+            while editor.pts:
+                editor.action_delete_point()
+                await pilot.pause()
+            assert editor.pts == [] and editor._sel_point is None
+            await pilot.press("a")
+            await wait_modal(pilot, PointPromptModal)
+            await pilot.click("#pp-ok")
+            await wait_not_modal(pilot)
+            editor.save_curve()
+            await pilot.pause()
+            assert read_cfg(temp_config)["curves"]["default"]["points"] == \
+                [[40.0, 20]]
+
+    asyncio.run(run())
+
+
+# ------------------------------------------------------------ curve CRUD --
+
+def _goto_curves(pilot):
+    async def _go():
+        await pilot.press("3")
+        await pilot.pause()
+        return pilot.app.screen
+    return _go()
+
+
+def _goto_assign(pilot):
+    async def _go():
+        await pilot.press("2")
+        await pilot.pause()
+        return pilot.app.screen
+    return _go()
+
+
+def test_new_curve_creates_selects_and_persists_it(temp_config, machine):
+    """`n` / New: a curve that did not exist before — the id is asked for
+    (assignments reference it), and it lands in the config immediately."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_curves(pilot)
+            await pilot.click("#new-curve")
+            modal = await wait_modal(pilot, NewCurveModal)
+            modal.query_one("#nc-id", Input).value = "case-fans"
+            modal.query_one("#nc-label", Input).value = "Case fans"
+            await pilot.click("#nc-ok")
+            await wait_not_modal(pilot)
+            doc = read_cfg(temp_config)
+            assert "case-fans" in doc["curves"]
+            assert doc["curves"]["case-fans"]["label"] == "Case fans"
+            # seeded from the built-in default shape, so it is valid at once
+            assert doc["curves"]["case-fans"]["points"] == \
+                config_mod.DEFAULTS["curves"]["default"]["points"]
+            assert sel_value(scr.query_one("#curve-pick", Select)) == \
+                "case-fans"
+            assert len(scr.pts) == 4
+
+    asyncio.run(run())
+
+
+def test_new_curve_refuses_an_id_that_is_taken(temp_config, machine, notices):
+    """Overwriting an existing curve by typo-ing its id would silently move
+    another fan's cooling — the modal refuses and stays open."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await _goto_curves(pilot)
+            await pilot.click("#new-curve")
+            modal = await wait_modal(pilot, NewCurveModal)
+            modal.query_one("#nc-id", Input).value = "default"
+            before = read_cfg(temp_config)
+            await pilot.click("#nc-ok")
+            await pilot.pause()
+            assert isinstance(pilot.app.screen, NewCurveModal)
+            assert any("already exists" in m.lower() for _s, m in notices)
+            assert read_cfg(temp_config) == before
+            await pilot.click("#nc-cancel")
+            await wait_not_modal(pilot)
+
+    asyncio.run(run())
+
+
+def test_copy_duplicates_the_curve_as_currently_edited(temp_config, machine):
+    """`c` / Copy is the normal way to tune: same curve, shifted — including
+    point moves that have not been saved yet."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_curves(pilot)
+            scr.action_nudge_duty_up5()      # unsaved edit
+            nudge = list(scr.pts[0])
+            await pilot.click("#dup-curve")
+            modal = await wait_modal(pilot, NewCurveModal)
+            assert modal.suggested_id == "default-copy"
+            await pilot.click("#nc-ok")
+            await wait_not_modal(pilot)
+            doc = read_cfg(temp_config)
+            assert "default-copy" in doc["curves"]
+            assert doc["curves"]["default-copy"]["points"][0] == nudge
+            # the original was NOT changed by the copy
+            assert doc["curves"]["default"]["points"][0] != nudge
+
+    asyncio.run(run())
+
+
+def test_delete_curve_refuses_one_that_assignments_use(temp_config, machine,
+                                                       notices):
+    """Deleting a curve in use leaves those assignments with no curve — the
+    daemon skips them and their fans stay at their last duty. Refused, and
+    the assignments are named."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_curves(pilot)
+            assert "used by: CPU" in str(
+                scr.query_one("#curve-used", Static).render())
+            await pilot.click("#del-curve")
+            await pilot.pause()
+            assert not isinstance(pilot.app.screen, ConfirmScreen)
+            assert any("used by 1 assignment" in m.lower()
+                       and "cpu" in m.lower() for _s, m in notices), notices
+            assert "default" in read_cfg(temp_config)["curves"]
+
+    asyncio.run(run())
+
+
+def test_delete_unused_curve_after_confirm(temp_config, machine):
+    cfg = config_mod.load(temp_config)
+    cfg.curves["spare"] = {"label": "Spare", "points": [[50, 30]]}
+    config_mod.save(cfg, temp_config)
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_curves(pilot)
+            sel = scr.query_one("#curve-pick", Select)
+            sel.value = "spare"
+            await pilot.pause()
+            assert "not used by any assignment" in str(
+                scr.query_one("#curve-used", Static).render())
+            await pilot.click("#del-curve")
+            modal = await wait_modal(pilot, ConfirmScreen)
+            assert "Spare" in modal.title_text
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert "spare" not in read_cfg(temp_config)["curves"]
+            # the picker moved to a curve that still exists
+            assert sel_value(scr.query_one("#curve-pick", Select)) != "spare"
+
+    asyncio.run(run())
+
+
+def test_curve_label_rename_shows_up_in_the_pickers(temp_config, machine):
+    """The label is what every picker displays, so it is part of the same
+    Save as the points."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_curves(pilot)
+            assert scr.query_one("#curve-label", Input).value == "Default"
+            scr.query_one("#curve-label", Input).value = "CPU ramp"
+            scr.save_curve()
+            await pilot.pause()
+            assert read_cfg(temp_config)["curves"]["default"]["label"] == \
+                "CPU ramp"
+            labels = [lab for lab, _v in select_options(
+                scr.query_one("#curve-pick", Select))]
+            assert any("CPU ramp" in str(lab) for lab in labels)
 
     asyncio.run(run())
 
@@ -1526,5 +1761,1356 @@ def test_root_tui_has_no_warning(temp_config, machine, monkeypatch):
             await pilot.pause()
             assert pilot.app.is_root is True
             assert len(pilot.app.screen.query("#root-warn")) == 0
+
+    asyncio.run(run())
+
+
+# --------------------------------------------- overrides, enable, rename -
+
+def test_blank_floor_ceiling_rate_clears_the_override(temp_config, machine):
+    """A blank field means "no override" — saving must REMOVE the key so the
+    assignment follows the global default again. Typing the global's number
+    instead would pin it per assignment, which is a different setting (and
+    stops tracking the global when it changes)."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True,
+                           "floor_duty": 30, "max_duty": 90, "max_rate": 4})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            scr = pilot.app.screen
+            await edit_assignment_row(pilot, scr)
+            assert scr.query_one("#floor", Input).value == "30"
+            for wid in ("#floor", "#maxduty", "#rate"):
+                scr.query_one(wid, Input).value = ""
+            scr.save_assignment()
+            await pilot.pause()
+            saved = read_cfg(temp_config)["assignments"]["CPU"]
+            for key in ("floor_duty", "max_duty", "max_rate"):
+                assert key not in saved, f"{key}={saved[key]!r} still set"
+            # and the keys the form did have are untouched
+            assert saved["source"] == "k10temp:temp1"
+            assert saved["fans"] == ["it8686:pwm1"]
+
+    asyncio.run(run())
+
+
+def test_blank_fields_keep_unmanaged_keys(temp_config, machine):
+    """Clearing the overrides must not touch what the form does not manage
+    (here: a hand-set fail-safe opt-out and a tach mapping)."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True,
+                           "floor_duty": 30, "failsafe": False,
+                           "tach": {"it8686:pwm1": "it8686:fan1"}})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            scr = pilot.app.screen
+            await edit_assignment_row(pilot, scr)
+            scr.query_one("#floor", Input).value = ""
+            scr.save_assignment()
+            await pilot.pause()
+            # the assignment has `failsafe: false` — saving it asks first,
+            # because that switch is one flip away from removing a safety net
+            confirm = await wait_modal(pilot, ConfirmScreen)
+            assert "fail-safe" in confirm.title_text
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            saved = read_cfg(temp_config)["assignments"]["CPU"]
+            assert "floor_duty" not in saved
+            assert saved["failsafe"] is False
+            assert saved["tach"] == {"it8686:pwm1": "it8686:fan1"}
+
+    asyncio.run(run())
+
+
+def test_placeholders_show_the_live_global_default(temp_config, machine):
+    """'(default 5)' written into the widget would start lying as soon as
+    the global changes — the placeholder reads the config."""
+    cfg = config_mod.load(temp_config)
+    cfg.config["floor_duty"] = 17
+    cfg.config["max_rate"] = 2.5
+    config_mod.save(cfg, temp_config)
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            scr = pilot.app.screen
+            assert "17" in scr.query_one("#floor", Input).placeholder
+            assert "2.5" in scr.query_one("#rate", Input).placeholder
+
+    asyncio.run(run())
+
+
+def test_enabled_switch_releases_fans(temp_config, machine, notices):
+    """The list shows on/off, so the form must be able to change it: off
+    writes enabled=false (the daemon restores firmware control)."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            scr = pilot.app.screen
+            await edit_assignment_row(pilot, scr)
+            assert scr.query_one("#enabled", Switch).value is True
+            scr.query_one("#enabled", Switch).value = False
+            scr.save_assignment()
+            await pilot.pause()
+            assert read_cfg(temp_config)["assignments"]["CPU"]["enabled"] \
+                is False
+            lst = scr.query_one("#assign-list", DataTable)
+            assert lst.get_cell_at((0, 7)) == "off"
+
+    asyncio.run(run())
+
+
+def test_e_key_disables_after_confirm_then_enables_directly(temp_config,
+                                                            machine):
+    """`e` on a selected row is the quick path. Releasing fans to the
+    firmware is the destructive direction, so it asks; taking them back
+    does not."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            scr = pilot.app.screen
+            lst = scr.query_one("#assign-list", DataTable)
+            lst.focus()
+            await post_row_selected(pilot, lst, 0)
+            await pilot.press("e")
+            modal = await wait_modal(pilot, ConfirmScreen)
+            assert "Disable" in modal.title_text
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert read_cfg(temp_config)["assignments"]["CPU"]["enabled"] \
+                is False
+            assert lst.get_cell_at((0, 7)) == "off"
+            # enabling again: no confirmation, it only restores control
+            await pilot.press("e")
+            await pilot.pause()
+            assert not isinstance(pilot.app.screen, ConfirmScreen)
+            assert read_cfg(temp_config)["assignments"]["CPU"]["enabled"] \
+                is True
+
+    asyncio.run(run())
+
+
+def test_disable_cancel_keeps_assignment_enabled(temp_config, machine):
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            scr = pilot.app.screen
+            lst = scr.query_one("#assign-list", DataTable)
+            lst.focus()
+            await post_row_selected(pilot, lst, 0)
+            await pilot.press("e")
+            await wait_modal(pilot, ConfirmScreen)
+            await pilot.click("#confirm-cancel")
+            await wait_not_modal(pilot)
+            assert read_cfg(temp_config)["assignments"]["CPU"]["enabled"] \
+                is True
+
+    asyncio.run(run())
+
+
+def test_toggle_button_without_selection_warns(temp_config, machine, notices):
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            scr = pilot.app.screen
+            lst = scr.query_one("#assign-list", DataTable)
+            assert lst.row_count == 0
+            await pilot.click("#toggle-enabled")
+            await pilot.pause()
+            assert any("no assignment selected" in m.lower()
+                       for _s, m in notices), notices
+
+    asyncio.run(run())
+
+
+def test_rename_moves_assignment_instead_of_duplicating(temp_config, machine):
+    """Editing the name of a loaded assignment is a RENAME. Silently writing
+    a second key left both driving the same fan, with nothing but a generic
+    shared-fan notice to hint that anything had happened."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True,
+                           "floor_duty": 20})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            scr = pilot.app.screen
+            await edit_assignment_row(pilot, scr)
+            scr.query_one("#name", Input).value = "CPU-box"
+            scr.save_assignment()
+            modal = await wait_modal(pilot, ConfirmScreen)
+            assert "Rename" in modal.title_text
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            saved = read_cfg(temp_config)["assignments"]
+            assert set(saved) == {"CPU-box"}, saved
+            assert saved["CPU-box"]["floor_duty"] == 20
+            assert scr.query_one("#assign-list", DataTable).row_count == 1
+
+    asyncio.run(run())
+
+
+def test_rename_cancel_keeps_the_original_name(temp_config, machine):
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            scr = pilot.app.screen
+            await edit_assignment_row(pilot, scr)
+            scr.query_one("#name", Input).value = "CPU-box"
+            scr.save_assignment()
+            await wait_modal(pilot, ConfirmScreen)
+            await pilot.click("#confirm-cancel")
+            await wait_not_modal(pilot)
+            assert set(read_cfg(temp_config)["assignments"]) == {"CPU"}
+
+    asyncio.run(run())
+
+
+def test_rename_onto_an_existing_name_overwrites_after_confirm(temp_config,
+                                                               machine):
+    """Renaming onto a name that is taken replaces THAT assignment (and
+    removes the source of the rename) rather than leaving three entries."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True},
+                      System={"source": "it8686:temp1", "curve": "default",
+                              "fans": ["it8686:pwm2"], "enabled": True})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            scr = pilot.app.screen
+            await edit_assignment_row(pilot, scr)
+            scr.query_one("#name", Input).value = "System"
+            scr.save_assignment()
+            modal = await wait_modal(pilot, ConfirmScreen)
+            assert "overwrite" in modal.title_text.lower()
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            saved = read_cfg(temp_config)["assignments"]
+            assert set(saved) == {"System"}, saved
+            assert saved["System"]["fans"] == ["it8686:pwm1"]
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------- validate before saving --
+
+def test_save_blocked_when_config_is_invalid(temp_config, machine, notices):
+    """The daemon keeps its PREVIOUS config when validation fails, so a save
+    that writes an invalid file does nothing at all — the TUI must say so
+    instead of reporting Saved."""
+    cfg = _seed_assignments(temp_config,
+                            CPU={"source": "k10temp:temp1",
+                                 "curve": "default",
+                                 "fans": ["it8686:pwm1"], "enabled": True})
+    cfg.curves["default"]["points"] = []      # validate(): needs >= 1 point
+    config_mod.save(cfg, temp_config)
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            scr = pilot.app.screen
+            await edit_assignment_row(pilot, scr)
+            scr.query_one("#floor", Input).value = "12"
+            scr.save_assignment()
+            modal = await wait_modal(pilot, ConfigErrorsScreen)
+            assert any("needs >= 1 point" in e for e in modal.errors)
+            await pilot.press("escape")
+            await wait_not_modal(pilot)
+            # nothing was written, and no "Saved" lie was told
+            assert "floor_duty" not in \
+                read_cfg(temp_config)["assignments"]["CPU"]
+            assert not any("saved" in m.lower() for _s, m in notices), notices
+
+    asyncio.run(run())
+
+
+def test_curve_with_no_points_cannot_be_saved(temp_config, machine, notices):
+    """Deleting every point and saving used to write an invalid curve with a
+    cheerful "Curve saved"; the daemon then silently ignored the file."""
+    original = copy.deepcopy(
+        config_mod.load(temp_config).curves["default"]["points"])
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await pilot.press("3")
+            await pilot.pause()
+            scr = pilot.app.screen
+            while scr.pts:
+                scr.action_delete_point()
+                await pilot.pause()
+            scr.save_curve()
+            await wait_modal(pilot, ConfigErrorsScreen)
+            await pilot.press("escape")
+            await wait_not_modal(pilot)
+            on_disk = read_cfg(temp_config)["curves"]["default"]["points"]
+            assert on_disk == original
+            assert not any("saved" in m.lower() for _s, m in notices), notices
+
+    asyncio.run(run())
+
+
+def test_global_config_error_blocks_and_says_where_to_fix_it(temp_config,
+                                                             machine):
+    """A bad global value cannot be fixed in the TUI yet, so the error modal
+    has to point at the file instead of leaving the user stuck."""
+    cfg = config_mod.load(temp_config)
+    cfg.config["floor_duty"] = 140        # out of range (0-100)
+    config_mod.save(cfg, temp_config)
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            scr = pilot.app.screen
+            scr.query_one("#name", Input).value = "later"
+            scr.query_one("#source", Select).value = "k10temp:temp1"
+            scr.query_one("#curve", Select).value = "default"
+            table = scr.query_one("#fan-pick", DataTable)
+            await post_row_selected(pilot, table,
+                                    machine.fan_ids().index("it8686:pwm5"))
+            scr.save_assignment()
+            modal = await wait_modal(pilot, ConfigErrorsScreen)
+            text = " ".join(str(l.render()) for l in modal.query(Label))
+            assert "floor_duty" in text
+            assert str(temp_config) in text
+            await pilot.press("escape")
+            await wait_not_modal(pilot)
+
+    asyncio.run(run())
+
+
+def test_deleting_a_builtin_curve_sticks(temp_config, machine):
+    """F14. `default` used to be un-deletable: config.load() merged DEFAULTS
+    back in, so the file lost the curve while every reader (daemon hot-reload,
+    TUI restart) kept seeing it — a Delete button that did nothing. What the
+    file says is what loads now."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_curves(pilot)
+            assert sel_value(scr.query_one("#curve-pick", Select)) == "default"
+            await pilot.click("#del-curve")
+            await pilot.pause()
+            confirm = pilot.app.screen
+            assert isinstance(confirm, ConfirmScreen)
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert "default" not in read_cfg(temp_config)["curves"]
+            # and a fresh load does not resurrect it
+            assert "default" not in config_mod.load(temp_config).curves
+            assert "gpu_v100" in read_cfg(temp_config)["curves"]
+            assert sel_value(scr.query_one("#curve-pick", Select)) == "gpu_v100"
+
+    asyncio.run(run())
+
+
+# ------------------------------------------------------------- tach mapping --
+
+def _pick_fan(pilot, scr, fan):
+    """Click a row of the fan picker (the click-to-toggle entry point)."""
+    table = scr.query_one("#fan-pick", DataTable)
+    rows = {table.get_cell_at((r, 1)): r for r in range(table.row_count)}
+    return post_row_selected(pilot, table, rows[fan])
+
+
+def _col(table: DataTable, key: str) -> int:
+    """Index of a column by the key given to add_columns — positional
+    asserts on these tables rot every time one is added."""
+    try:
+        return table.get_column_index(key)
+    except Exception:
+        raise AssertionError(f"no column {key!r} in {table.id}")
+
+
+def _cell(table: DataTable, row_key, col: int):
+    """Cell of the row whose key is `row_key` (keys are RowKey wrappers that
+    compare equal to the plain str we passed to add_row)."""
+    for r in range(table.row_count):
+        if table.coordinate_to_cell_key((r, 0))[0] == row_key:
+            return table.get_cell_at((r, col))
+    raise AssertionError(f"no row {row_key!s} in {table.id}")
+
+
+def test_picking_a_fan_shows_the_tach_it_guessed(temp_config, machine):
+    """The tach table pre-fills from matching sensors.d labels (pwm5 label ==
+    fan5 label), which is the common case and must not need a click."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await _pick_fan(pilot, scr, "it8686:pwm5")
+            tachs = scr.query_one("#tach-pick", DataTable)
+            assert tachs.row_count == 1
+            assert _cell(tachs, "it8686:pwm5", 1) == "it8686:fan5"
+
+    asyncio.run(run())
+
+
+def test_unmapped_header_saves_without_tach_and_warns(temp_config, machine,
+                                                     notices):
+    """Where the labels do not pair there is no guess: the row says so, and
+    saving warns that a stall on that header cannot be detected (F4 — before
+    this, an unmapped fan was simply unwatched, with no signal anywhere)."""
+    machine.labels["it8686"].pop("fan5", None)
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await _pick_fan(pilot, scr, "it8686:pwm5")
+            tachs = scr.query_one("#tach-pick", DataTable)
+            assert _cell(tachs, "it8686:pwm5", 1) == "(none)"
+            assert _cell(tachs, "it8686:pwm5", 3) == "⚠"
+            scr.query_one("#name", Input).value = "unwatched"
+            scr.query_one("#source", Select).value = "k10temp:temp1"
+            scr.query_one("#curve", Select).value = "default"
+            scr.save_assignment()
+            await pilot.pause()
+            saved = read_cfg(temp_config)["assignments"]["unwatched"]
+            assert "tach" not in saved, saved
+            assert any("cannot be detected" in m.lower() and "pwm5" in m
+                       for _s, m in notices), notices
+
+    asyncio.run(run())
+
+
+def test_tach_picker_maps_a_header_the_guess_missed(temp_config, machine,
+                                                   notices):
+    """The fix for F4: with no label match the user can still say 'this fanN
+    is its RPM source', and that lands in the config."""
+    machine.labels["it8686"].pop("fan5", None)
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await _pick_fan(pilot, scr, "it8686:pwm5")
+            tachs = scr.query_one("#tach-pick", DataTable)
+            await post_row_selected(pilot, tachs, 0)
+            modal = await wait_modal(pilot, TachPickerModal)
+            # the cursor opens on the current mapping (here: no tach), so
+            # move to the first candidate and select it
+            table = modal.query_one("#tp-list", DataTable)
+            await post_row_selected(pilot, table, 0)
+            await wait_not_modal(pilot)
+            assert _cell(tachs, "it8686:pwm5", 1) == "it8686:fan1"
+            scr.query_one("#name", Input).value = "mapped"
+            scr.query_one("#source", Select).value = "k10temp:temp1"
+            scr.query_one("#curve", Select).value = "default"
+            scr.save_assignment()
+            await pilot.pause()
+            assert read_cfg(temp_config)["assignments"]["mapped"]["tach"] \
+                == {"it8686:pwm5": "it8686:fan1"}
+
+    asyncio.run(run())
+
+
+def test_tach_picker_lists_same_chip_inputs_first_with_their_labels(
+        temp_config, machine):
+    """Ordering and notes are how a human identifies the right tach: this
+    chip's inputs first, the sensors.d label beside each, and a flag on the
+    one whose label matches the header being mapped."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            opts = scr._tach_candidates("it8686:pwm1")
+            ids = [t for t, _n in opts]
+            # the machine exposes fan1/3/4 on it8686 and fan1/3 on it8792:
+            # this chip's inputs come first, then the other chip's
+            assert ids == ["it8686:fan1", "it8686:fan3", "it8686:fan4",
+                           "it8792:fan1", "it8792:fan3"]
+            notes = dict(opts)
+            assert "matches this header" in notes["it8686:fan1"]
+            assert notes["it8686:fan3"] == "SYS_FAN2"
+            assert notes["it8792:fan1"] == "SYS_FAN5_PUMP"
+
+    asyncio.run(run())
+
+
+def test_no_tach_choice_removes_an_existing_mapping(temp_config, machine):
+    """Explicitly unmapping must be possible (a tach wire that was moved to
+    another header is worse than no reading at all: it lies)."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True,
+                           "tach": {"it8686:pwm1": "it8686:fan1"}})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, scr)
+            tachs = scr.query_one("#tach-pick", DataTable)
+            assert _cell(tachs, "it8686:pwm1", 1) == "it8686:fan1"
+            await post_row_selected(pilot, tachs, 0)
+            modal = await wait_modal(pilot, TachPickerModal)
+            table = modal.query_one("#tp-list", DataTable)
+            await post_row_selected(pilot, table, table.row_count - 1)
+            await wait_not_modal(pilot)
+            assert _cell(tachs, "it8686:pwm1", 1) == "(none)"
+            scr.save_assignment()
+            await pilot.pause()
+            assert "tach" not in \
+                read_cfg(temp_config)["assignments"]["CPU"]
+
+    asyncio.run(run())
+
+
+def test_manual_tach_choice_beats_the_label_guess_on_later_saves(
+        temp_config, machine):
+    """A hand-set mapping must not be re-guessed away by an unrelated edit."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm5"], "enabled": True,
+                           "tach": {"it8686:pwm5": "it8686:fan2"}})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, scr)
+            # guess_tach would say it8686:fan5 (the labels pair); the config
+            # says fan2 and that is what the form must show and keep
+            assert app_guess(scr, "it8686:pwm5") == "it8686:fan5"
+            assert scr._tach_map["it8686:pwm5"] == "it8686:fan2"
+            scr.query_one("#floor", Input).value = "15"
+            scr.save_assignment()
+            await pilot.pause()
+            assert read_cfg(temp_config)["assignments"]["CPU"]["tach"] == \
+                {"it8686:pwm5": "it8686:fan2"}
+
+    asyncio.run(run())
+
+
+def app_guess(scr, fan):
+    return scr.app.guess_tach(fan)
+
+
+def test_unlabeled_tach_is_listed_without_a_redundant_note(temp_config,
+                                                           machine):
+    """sensors.d has no label for every input. The generic 'fan3 (it8686)'
+    fallback would only restate the id in the column beside it, so the note
+    stays blank — and an unlabeled input must still be mappable."""
+    machine.labels["it8686"].pop("fan4")
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            notes = dict(scr._tach_candidates("it8686:pwm1"))
+            assert notes["it8686:fan4"] == ""
+            assert notes["it8686:fan3"] == "SYS_FAN2"
+            # and it can actually be chosen
+            await _pick_fan(pilot, scr, "it8686:pwm5")
+            tachs = scr.query_one("#tach-pick", DataTable)
+            await post_row_selected(pilot, tachs, 0)
+            modal = await wait_modal(pilot, TachPickerModal)
+            table = modal.query_one("#tp-list", DataTable)
+            rows = {table.get_cell_at((r, 0)): r
+                    for r in range(table.row_count)}
+            await post_row_selected(pilot, table, rows["it8686:fan4"])
+            await wait_not_modal(pilot)
+            assert _cell(tachs, "it8686:pwm5", 1) == "it8686:fan4"
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------- settings --
+
+def _goto_settings(pilot):
+    async def _go():
+        await pilot.press("5")
+        await pilot.pause()
+        return pilot.app.screen
+    return _go()
+
+
+def _settings_row(table: DataTable, key: str) -> int:
+    for r in range(table.row_count):
+        if row_key(table, r) == key:
+            return r
+    raise AssertionError(f"no setting row {key}")
+
+
+def _setting_cell(table: DataTable, key: str, col: int):
+    return table.get_cell_at((_settings_row(table, key), col))
+
+
+async def _edit_setting(pilot, scr, key, value):
+    """Click a setting row, type into the modal, press Set."""
+    table = scr.query_one("#settings", DataTable)
+    await post_row_selected(pilot, table, _settings_row(table, key))
+    modal = await wait_modal(pilot, SettingModal)
+    inp = modal.query_one("#set-input", Input)
+    inp.value = str(value)
+    await pilot.click("#set-ok")
+    await wait_not_modal(pilot)
+    return modal
+
+
+def test_settings_screen_lists_every_option(temp_config, machine):
+    """F1: the 22 global options were readable only in config.py. Now every
+    one is listed with its current value, unit and built-in default — and the
+    list is generated from the same table validate() uses, so a knob cannot be
+    added to the daemon and forgotten here."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            table = scr.query_one("#settings", DataTable)
+            keys = {row_key(table, r) for r in range(table.row_count)}
+            assert keys == set(config_mod.BY_KEY)
+            assert _setting_cell(table, "poll_seconds", 2) == "1 s"
+            assert _setting_cell(table, "max_rate", 2) == "6 % per poll"
+            # a value that differs from the default is marked as such
+            assert _setting_cell(table, "stall_alert_command", 2) == "(empty)"
+
+    asyncio.run(run())
+
+
+def test_settings_edit_saves_after_confirmation(temp_config, machine):
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            await _edit_setting(pilot, scr, "poll_seconds", "2.5")
+            table = scr.query_one("#settings", DataTable)
+            assert _setting_cell(table, "poll_seconds", 2) == "2.5 s  *"
+            assert _setting_cell(table, "poll_seconds", 3) == "→ save"
+            # nothing written yet
+            assert read_cfg(temp_config)["config"]["poll_seconds"] == 1.0
+            await pilot.click("#save-settings")
+            confirm = await wait_modal(pilot, ConfirmSettingsScreen)
+            assert any("poll_seconds: 1 → 2.5" in l
+                       for l in confirm.lines), confirm.lines
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert read_cfg(temp_config)["config"]["poll_seconds"] == 2.5
+
+    asyncio.run(run())
+
+
+def test_settings_blank_value_removes_the_key(temp_config, machine):
+    """Blank = 'I never set this': the key leaves the file, which is what the
+    built-in default means on disk (load() merges config.* per key)."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            await _edit_setting(pilot, scr, "max_rate", "9")
+            await pilot.click("#save-settings")
+            await wait_modal(pilot, ConfirmSettingsScreen)
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert read_cfg(temp_config)["config"]["max_rate"] == 9
+            await _edit_setting(pilot, scr, "max_rate", "")
+            table = scr.query_one("#settings", DataTable)
+            assert _setting_cell(table, "max_rate", 3) == "→ save"
+            await pilot.click("#save-settings")
+            await wait_modal(pilot, ConfirmSettingsScreen)
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert "max_rate" not in read_cfg(temp_config)["config"]
+            # and a reload still behaves: the default applies
+            assert config_mod.load(temp_config).config["max_rate"] == 6
+
+    asyncio.run(run())
+
+
+def test_settings_refuses_an_out_of_range_number(temp_config, machine):
+    """The modal's bounds are validate()'s bounds, so a mistake is caught
+    where it was typed instead of at save time."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            table = scr.query_one("#settings", DataTable)
+            await post_row_selected(pilot, table,
+                                    _settings_row(table, "floor_duty"))
+            modal = await wait_modal(pilot, SettingModal)
+            modal.query_one("#set-input", Input).value = "150"
+            await pilot.click("#set-ok")
+            await pilot.pause()
+            assert isinstance(pilot.app.screen, SettingModal), \
+                "out-of-range value must not close the modal"
+            assert "must be <= 100" in str(
+                modal.query_one("#set-err", Static).render())
+            assert "floor_duty" not in scr._edits
+            await pilot.click("#set-cancel")
+            await wait_not_modal(pilot)
+            assert read_cfg(temp_config)["config"]["floor_duty"] == 5
+
+    asyncio.run(run())
+
+
+def test_settings_save_refuses_a_self_contradictory_pair(temp_config, machine):
+    """stall_full_duty below stall_min_duty would disarm the stall detector
+    that pins the fan — validate() rejects the pairing and the save is
+    refused with the reason rather than written and ignored."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            await _edit_setting(pilot, scr, "stall_full_duty", "5")
+            await pilot.click("#save-settings")
+            await wait_modal(pilot, ConfirmSettingsScreen)
+            await pilot.click("#confirm-ok")
+            errs = await wait_modal(pilot, ConfigErrorsScreen)
+            assert any("stall_full_duty" in e and "stall_min_duty" in e
+                       for e in errs.errors), errs.errors
+            # the file is untouched
+            assert read_cfg(temp_config)["config"]["stall_full_duty"] == 100
+
+    asyncio.run(run())
+
+
+def test_unsaved_settings_do_not_leak_into_another_screens_save(
+        temp_config, machine):
+    """Edits live on this screen until Save. If they were written into the
+    shared config object as they were typed, saving an assignment on screen 2
+    would also publish a poll interval the user never saved."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            await _edit_setting(pilot, scr, "poll_seconds", "7")
+            assign = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, assign)
+            assign.save_assignment()
+            await pilot.pause()
+            saved = read_cfg(temp_config)
+            assert saved["config"]["poll_seconds"] == 1.0, saved["config"]
+            assert saved["assignments"], saved
+            # and coming back, the pending edit is still there, unsaved
+            back = await _goto_settings(pilot)
+            table = back.query_one("#settings", DataTable)
+            assert _setting_cell(table, "poll_seconds", 3) == "→ save"
+
+    asyncio.run(run())
+
+
+def test_settings_discard_changes(temp_config, machine):
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            await _edit_setting(pilot, scr, "watchdog_seconds", "0")
+            table = scr.query_one("#settings", DataTable)
+            assert _setting_cell(table, "watchdog_seconds", 3) == "→ save"
+            await pilot.click("#revert-settings")
+            confirm = await wait_modal(pilot, ConfirmScreen)
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert "watchdog_seconds" not in scr._edits
+            assert _setting_cell(table, "watchdog_seconds", 2) == "30 s"
+            assert read_cfg(temp_config)["config"]["watchdog_seconds"] == 30
+
+    asyncio.run(run())
+
+
+def test_settings_modal_explains_the_option(temp_config, machine):
+    """The reason this is a modal and not 22 bare inputs: nobody should have
+    to read daemon.py to know what `stall_kick_backoff_s` is for."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            table = scr.query_one("#settings", DataTable)
+            await post_row_selected(pilot, table,
+                                    _settings_row(table,
+                                                  "stall_kick_backoff_s"))
+            modal = await wait_modal(pilot, SettingModal)
+            help_text = str(modal.query_one("#set-help", Static).render())
+            assert "rounds" in help_text and "heat" in help_text.lower()
+            labels = [str(l.render()) for l in modal.query(Label)]
+            assert any("built-in default: 30" in t for t in labels), labels
+
+    asyncio.run(run())
+
+
+# ------------------------------------------------------- ownership (F5) ----
+
+def _live_with_owners(machine, **owners):
+    """A live payload where named headers read a given pwmN_enable:
+    `pwm1=1` etc. — how a test says 'another process holds this header'."""
+    data = machine.live_payload()
+    for fan, en in owners.items():
+        data["fans"][fan]["enable"] = en
+    return data
+
+
+def test_fan_picker_shows_who_holds_each_header(temp_config, machine):
+    """F5: the picker used to be ✓/fan/label/rpm, so a header held by
+    fancontrol or parked at enable 0 looked exactly like a free one — and the
+    refusal only appeared later, as the bare word `manual-conflict`."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            app = pilot.app
+            app.live = _live_with_owners(machine, **{"it8686:pwm3": 1,
+                                                     "it8686:pwm4": 0})
+            scr._refresh_fans()
+            table = scr.query_one("#fan-pick", DataTable)
+            own = _col(table, "fown")
+            fans = machine.fan_ids()
+
+            def owner_of(fan):
+                return table.get_cell_at((fans.index(fan), own))
+
+            assert owner_of("it8686:pwm1") == "firmware"
+            assert owner_of("it8686:pwm3") == "other"
+            assert owner_of("it8686:pwm4") == "parked"
+
+    asyncio.run(run())
+
+
+async def _save_named_assignment(pilot, scr, name):
+    scr.query_one("#name", Input).value = name
+    scr.query_one("#source", Select).value = "k10temp:temp1"
+    scr.query_one("#curve", Select).value = "default"
+    scr.save_assignment()
+    await pilot.pause()
+
+
+def test_force_takeover_switch_writes_and_clears_the_key(temp_config, machine):
+    """Off REMOVES the key rather than writing `false`: absent is how this file
+    says no, and a saved false is noise that makes the entry harder to read."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await _pick_fan(pilot, scr, "it8686:pwm3")
+            scr.query_one("#force-takeover", Switch).value = True
+            await _save_named_assignment(pilot, scr, "hot")
+            saved = read_cfg(temp_config)["assignments"]["hot"]
+            assert saved["force_takeover"] is True
+
+            # edit it back off: the key must disappear, not become false
+            assign = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, assign)
+            assert assign.query_one("#force-takeover", Switch).value is True
+            assign.query_one("#force-takeover", Switch).value = False
+            assign.save_assignment()
+            await pilot.pause()
+            assert "force_takeover" not in \
+                read_cfg(temp_config)["assignments"]["hot"]
+
+    asyncio.run(run())
+
+
+def test_saving_a_foreign_header_warns_it_will_be_refused(temp_config, machine,
+                                                          notices):
+    """The refusal is a daemon decision the GUI cannot prevent — but it can
+    say so at the moment of saving, with the way out."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            pilot.app.live = _live_with_owners(machine, **{"it8686:pwm3": 1})
+            await _pick_fan(pilot, scr, "it8686:pwm3")
+            await _save_named_assignment(pilot, scr, "fight")
+            assert read_cfg(temp_config)["assignments"]["fight"]["fans"] == \
+                ["it8686:pwm3"]
+            assert any("will NOT control" in m and "it8686:pwm3" in m
+                       and "Force takeover" in m for _s, m in notices), notices
+
+    asyncio.run(run())
+
+
+def test_force_takeover_on_a_foreign_header_warns_about_the_fight(
+        temp_config, machine, notices):
+    """Taking a header someone else holds is allowed and sometimes right (a
+    fancontrol that is gone for good) — but two controllers then write the same
+    register, and the duty the Overview shows stops being explainable."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            pilot.app.live = _live_with_owners(machine, **{"it8686:pwm3": 1})
+            await _pick_fan(pilot, scr, "it8686:pwm3")
+            scr.query_one("#force-takeover", Switch).value = True
+            await _save_named_assignment(pilot, scr, "insist")
+            msgs = [m for _s, m in notices]
+            assert not any("will NOT control" in m for m in msgs), msgs
+            assert any("fought" in m and "it8686:pwm3" in m
+                       for m in msgs), msgs
+
+    asyncio.run(run())
+
+
+def test_parked_header_is_flagged_as_refused(temp_config, machine):
+    """enable=0 is §18/§20's shape: a header nobody drives, cooling nothing.
+    The daemon refuses it without force_takeover, so the picker says 'parked'
+    and the save says it will be refused."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            pilot.app.live = _live_with_owners(machine, **{"it8686:pwm4": 0})
+            assert pilot.app.fan_owner("it8686:pwm4") == "parked"
+            assert pilot.app.needs_force_takeover(["it8686:pwm4"]) == \
+                ["it8686:pwm4"]
+            assert pilot.app.needs_force_takeover(["it8686:pwm1"]) == []
+
+    asyncio.run(run())
+
+
+def test_overview_says_why_a_fan_is_not_being_controlled(temp_config, machine):
+    """The state cell used to show the daemon's internal word verbatim. Same
+    information, but phrased as what happened and what to do about it."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = pilot.app.screen
+            data = _live_with_owners(machine, **{"it8686:pwm1": 1})
+            data["status"] = {"ts": time.time(),
+                              "fans": {"it8686:pwm1": {"state":
+                                                       "manual-conflict"}}}
+            scr.post_message(LiveUpdate(data))
+            await pilot.pause()
+            table = scr.query_one("#fan-table", DataTable)
+            ncols = len(table.columns)
+            cells = [str(table.get_cell_at((r, c)))
+                     for r in range(table.row_count)
+                     for c in range(ncols)]
+            assert any("refused: held by another controller" in c
+                       for c in cells), cells
+
+    asyncio.run(run())
+
+
+# ------------------------------------------- per-assignment fail-safe (F6) --
+
+def test_failsafe_overrides_are_shown_and_edited(temp_config, machine):
+    """F6: `failsafe`, `failsafe_duty`, `failsafe_after` were read by the
+    daemon and validated, but no screen could show them — so 'what happens if
+    this source dies' could not be read on screen for a single fan, including
+    the answer 'nothing, it holds its last duty'."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True,
+                           "failsafe_duty": 80, "failsafe_after": 2})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, scr)
+            assert scr.query_one("#fs-duty", Input).value == "80"
+            assert scr.query_one("#fs-after", Input).value == "2"
+            assert scr.query_one("#fs-rate", Input).value == ""   # global 25
+            assert scr.query_one("#failsafe", Switch).value is True
+            scr.query_one("#fs-duty", Input).value = "70"
+            scr.query_one("#fs-rate", Input).value = "40"
+            scr.save_assignment()
+            await pilot.pause()
+            saved = read_cfg(temp_config)["assignments"]["CPU"]
+            assert saved["failsafe_duty"] == 70
+            assert saved["failsafe_after"] == 2
+            assert saved["failsafe_max_rate"] == 40
+
+    asyncio.run(run())
+
+
+def test_blank_failsafe_fields_inherit_the_global(temp_config, machine):
+    """Blank = no override, same rule as floor/ceiling/rate: the key leaves
+    the file so the global (editable on screen 5) applies again."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True,
+                           "failsafe_duty": 80})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, scr)
+            scr.query_one("#fs-duty", Input).value = ""
+            scr.save_assignment()
+            await pilot.pause()
+            assert "failsafe_duty" not in \
+                read_cfg(temp_config)["assignments"]["CPU"]
+
+    asyncio.run(run())
+
+
+def test_turning_the_failsafe_off_asks_then_writes_false(temp_config, machine):
+    """The opt-out is a one-switch way to remove a safety net from one fan
+    (§18 is what that looks like on this board), so it is confirmed and stored
+    explicitly as false rather than as an absent key."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await _pick_fan(pilot, scr, "it8686:pwm3")
+            scr.query_one("#failsafe", Switch).value = False
+            await _save_named_assignment(pilot, scr, "no-net")
+            confirm = await wait_modal(pilot, ConfirmScreen)
+            assert "HOLD their last duty" in " ".join(confirm.lines)
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert read_cfg(temp_config)["assignments"]["no-net"][
+                "failsafe"] is False
+
+    asyncio.run(run())
+
+
+def test_cancelling_keeps_the_failsafe_alone(temp_config, machine):
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await _pick_fan(pilot, scr, "it8686:pwm3")
+            scr.query_one("#failsafe", Switch).value = False
+            await _save_named_assignment(pilot, scr, "no-net")
+            await wait_modal(pilot, ConfirmScreen)
+            await pilot.click("#confirm-cancel")
+            await wait_not_modal(pilot)
+            assert "no-net" not in read_cfg(temp_config)["assignments"]
+
+    asyncio.run(run())
+
+
+def test_turning_it_back_on_removes_the_key(temp_config, machine):
+    """On means inherit: the explicit false must not linger in the file."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True,
+                           "failsafe": False})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, scr)
+            assert scr.query_one("#failsafe", Switch).value is False
+            scr.query_one("#failsafe", Switch).value = True
+            scr.save_assignment()
+            await pilot.pause()
+            assert "failsafe" not in \
+                read_cfg(temp_config)["assignments"]["CPU"]
+
+    asyncio.run(run())
+
+
+def test_fractional_duty_survives_the_form(temp_config, machine):
+    """F12: the fields used to be int-only with max_length=3, so a config
+    containing 59.5 (which the live one does) could not even be displayed
+    without rounding it away."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True,
+                           "floor_duty": 59.5})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, scr)
+            assert scr.query_one("#floor", Input).value == "59.5"
+            scr.query_one("#maxduty", Input).value = "97.5"
+            scr.save_assignment()
+            await pilot.pause()
+            saved = read_cfg(temp_config)["assignments"]["CPU"]
+            assert saved["floor_duty"] == 59.5
+            assert saved["max_duty"] == 97.5
+
+    asyncio.run(run())
+
+
+# ------------------------------------------------- Overview depth (F10/F11) --
+
+def _fan_row_cells(table, fan):
+    for r in range(table.row_count):
+        if row_key(table, r) == fan:
+            return [str(table.get_cell_at((r, c)))
+                    for c in range(len(table.columns))]
+    raise AssertionError(f"no fan row {fan}")
+
+
+def test_overview_lists_a_disabled_assignments_fans(temp_config, machine):
+    """Disabling is the recommended safe action, and listing only enabled
+    assignments made the header vanish at exactly the moment you wanted to
+    watch it hand control back."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": False})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = pilot.app.screen
+            scr._refresh(machine.live_payload())
+            table = scr.query_one("#fan-table", DataTable)
+            cells = _fan_row_cells(table, "it8686:pwm1")
+            assert any("CPU (disabled)" in c for c in cells), cells
+            assert any("disabled — firmware holds it" in c
+                       for c in cells), cells
+
+    asyncio.run(run())
+
+
+def test_overview_shows_the_degraded_flag_as_a_banner(temp_config, machine):
+    """`degraded: true` means the daemon is holding fans at fail-safe duty
+    because its config was rejected — the most important state on the box, and
+    it used to be dropped on the floor."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = pilot.app.screen
+            data = machine.live_payload()
+            data["status"] = {"ts": time.time(), "degraded": True,
+                              "errors": {"startup_config": "bad json"}}
+            scr._refresh(data)
+            line = scr.query_one("#degraded-line", Static)
+            assert "DEGRADED" in str(line.render())
+            assert line.display
+            # errors get their own lines, keyed
+            errs = str(scr.query_one("#errors-box", Static).render())
+            assert "startup_config: bad json" in errs
+
+    asyncio.run(run())
+
+
+def test_overview_error_lines_are_separate_and_hidden_when_clean(
+        temp_config, machine):
+    """One joined line scrolled past unreadable on a box with four GPUs; each
+    problem now gets a line, and nothing shows when there are none."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = pilot.app.screen
+            data = machine.live_payload()
+            data["status"] = {"ts": time.time(), "errors": {
+                "nvidia_smi": "3 consecutive failure(s)",
+                "stalled:it8686:pwm1": "commanding 80% but 0 RPM",
+                "duty-drift:it8686:pwm3": "register says 12, we asked 60"}}
+            scr._refresh(data)
+            errs = str(scr.query_one("#errors-box", Static).render())
+            for frag in ("nvidia_smi:", "stalled:it8686:pwm1:",
+                         "duty-drift:it8686:pwm3:"):
+                assert frag in errs, errs
+            assert "\n" in errs
+            # clean status hides it again
+            data["status"] = {"ts": time.time(), "errors": {}}
+            scr._refresh(data)
+            assert not scr.query_one("#errors-box", Static).display
+
+    asyncio.run(run())
+
+
+def test_overview_state_shows_the_kick_the_daemon_is_running(
+        temp_config, machine):
+    """§21's comment asks for exactly this on screen: fighting for a fan is
+    not the same as reporting that it is stalled."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = pilot.app.screen
+            data = machine.live_payload()
+            data["status"] = {"ts": time.time(), "fans": {
+                "it8686:pwm1": {"state": "stalled",
+                                "kick": {"phase": "stop", "attempts": 2}}}}
+            scr._refresh(data)
+            cells = _fan_row_cells(scr.query_one("#fan-table", DataTable),
+                                   "it8686:pwm1")
+            assert any("STALLED" in c and "kicking stop attempt 2" in c
+                       for c in cells), cells
+
+    asyncio.run(run())
+
+
+def test_duty_cell_shows_the_register_when_it_disagrees():
+    """§20: commanded duty is not ownership. The raw value is published on
+    every row; showing it only on drift keeps the table readable."""
+    from alx_fancontrol.tui.screens.overview import OverviewScreen as O
+
+    assert O._duty_cell({"duty_pct": 20, "duty_raw": 51}) == "20"
+    assert O._duty_cell({"duty_pct": 20, "duty_raw": 120}) == "20 (raw 120!)"
+    assert O._duty_cell({}) == "—"
+
+
+def test_sidebar_says_which_config_this_session_edits(temp_config, machine):
+    """F11: root edits /etc and a dev shell edits ~/.config; until now the
+    TUI never said which one it was writing, so a sudo-less session could
+    produce a valid config that changes nothing."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            text = str(pilot.app.screen.query_one("#cfg-path",
+                                                  Static).render())
+            assert "config:" in text and "config.json" in text, text
 
     asyncio.run(run())

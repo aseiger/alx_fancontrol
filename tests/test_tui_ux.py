@@ -35,6 +35,8 @@ from textual.widgets import DataTable, Input, Label, Select, Static, Switch
 from alx_fancontrol import config as config_mod
 from alx_fancontrol import hwmon
 from alx_fancontrol.tui.app import ConfigErrorsScreen, FanControlApp
+from alx_fancontrol.tui.screens.settings import (ConfirmSettingsScreen,
+                                                SettingModal)
 from alx_fancontrol.tui.reader import LiveUpdate
 from alx_fancontrol.tui.screens.assign import (AssignScreen,
                                                ConfirmDeleteScreen,
@@ -2137,11 +2139,11 @@ def test_global_config_error_blocks_and_says_where_to_fix_it(temp_config,
     asyncio.run(run())
 
 
-def test_delete_refuses_a_builtin_curve(temp_config, machine, notices):
-    """config.load() deep-merges DEFAULTS, so 'default' / 'gpu_v100' come
-    back on the next load whether the file has them or not (F14). A Delete
-    button that does not stick is worse than none, so it refuses and says
-    why instead of writing a file that changes nothing."""
+def test_deleting_a_builtin_curve_sticks(temp_config, machine):
+    """F14. `default` used to be un-deletable: config.load() merged DEFAULTS
+    back in, so the file lost the curve while every reader (daemon hot-reload,
+    TUI restart) kept seeing it — a Delete button that did nothing. What the
+    file says is what loads now."""
 
     async def run():
         async with FanControlApp(config_path=temp_config,
@@ -2150,14 +2152,17 @@ def test_delete_refuses_a_builtin_curve(temp_config, machine, notices):
             await pilot.pause()
             scr = await _goto_curves(pilot)
             assert sel_value(scr.query_one("#curve-pick", Select)) == "default"
-            before = read_cfg(temp_config)
             await pilot.click("#del-curve")
             await pilot.pause()
-            assert not isinstance(pilot.app.screen, ConfirmScreen)
-            assert any("built-in curve" in m.lower()
-                       and "would not stick" in m.lower()
-                       for _s, m in notices), notices
-            assert read_cfg(temp_config) == before
+            confirm = pilot.app.screen
+            assert isinstance(confirm, ConfirmScreen)
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert "default" not in read_cfg(temp_config)["curves"]
+            # and a fresh load does not resurrect it
+            assert "default" not in config_mod.load(temp_config).curves
+            assert "gpu_v100" in read_cfg(temp_config)["curves"]
+            assert sel_value(scr.query_one("#curve-pick", Select)) == "gpu_v100"
 
     asyncio.run(run())
 
@@ -2377,5 +2382,243 @@ def test_unlabeled_tach_is_listed_without_a_redundant_note(temp_config,
             await post_row_selected(pilot, table, rows["it8686:fan4"])
             await wait_not_modal(pilot)
             assert _cell(tachs, "it8686:pwm5", 1) == "it8686:fan4"
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------- settings --
+
+def _goto_settings(pilot):
+    async def _go():
+        await pilot.press("5")
+        await pilot.pause()
+        return pilot.app.screen
+    return _go()
+
+
+def _settings_row(table: DataTable, key: str) -> int:
+    for r in range(table.row_count):
+        if row_key(table, r) == key:
+            return r
+    raise AssertionError(f"no setting row {key}")
+
+
+def _setting_cell(table: DataTable, key: str, col: int):
+    return table.get_cell_at((_settings_row(table, key), col))
+
+
+async def _edit_setting(pilot, scr, key, value):
+    """Click a setting row, type into the modal, press Set."""
+    table = scr.query_one("#settings", DataTable)
+    await post_row_selected(pilot, table, _settings_row(table, key))
+    modal = await wait_modal(pilot, SettingModal)
+    inp = modal.query_one("#set-input", Input)
+    inp.value = str(value)
+    await pilot.click("#set-ok")
+    await wait_not_modal(pilot)
+    return modal
+
+
+def test_settings_screen_lists_every_option(temp_config, machine):
+    """F1: the 22 global options were readable only in config.py. Now every
+    one is listed with its current value, unit and built-in default — and the
+    list is generated from the same table validate() uses, so a knob cannot be
+    added to the daemon and forgotten here."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            table = scr.query_one("#settings", DataTable)
+            keys = {row_key(table, r) for r in range(table.row_count)}
+            assert keys == set(config_mod.BY_KEY)
+            assert _setting_cell(table, "poll_seconds", 2) == "1 s"
+            assert _setting_cell(table, "max_rate", 2) == "6 % per poll"
+            # a value that differs from the default is marked as such
+            assert _setting_cell(table, "stall_alert_command", 2) == "(empty)"
+
+    asyncio.run(run())
+
+
+def test_settings_edit_saves_after_confirmation(temp_config, machine):
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            await _edit_setting(pilot, scr, "poll_seconds", "2.5")
+            table = scr.query_one("#settings", DataTable)
+            assert _setting_cell(table, "poll_seconds", 2) == "2.5 s  *"
+            assert _setting_cell(table, "poll_seconds", 3) == "→ save"
+            # nothing written yet
+            assert read_cfg(temp_config)["config"]["poll_seconds"] == 1.0
+            await pilot.click("#save-settings")
+            confirm = await wait_modal(pilot, ConfirmSettingsScreen)
+            assert any("poll_seconds: 1 → 2.5" in l
+                       for l in confirm.lines), confirm.lines
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert read_cfg(temp_config)["config"]["poll_seconds"] == 2.5
+
+    asyncio.run(run())
+
+
+def test_settings_blank_value_removes_the_key(temp_config, machine):
+    """Blank = 'I never set this': the key leaves the file, which is what the
+    built-in default means on disk (load() merges config.* per key)."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            await _edit_setting(pilot, scr, "max_rate", "9")
+            await pilot.click("#save-settings")
+            await wait_modal(pilot, ConfirmSettingsScreen)
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert read_cfg(temp_config)["config"]["max_rate"] == 9
+            await _edit_setting(pilot, scr, "max_rate", "")
+            table = scr.query_one("#settings", DataTable)
+            assert _setting_cell(table, "max_rate", 3) == "→ save"
+            await pilot.click("#save-settings")
+            await wait_modal(pilot, ConfirmSettingsScreen)
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert "max_rate" not in read_cfg(temp_config)["config"]
+            # and a reload still behaves: the default applies
+            assert config_mod.load(temp_config).config["max_rate"] == 6
+
+    asyncio.run(run())
+
+
+def test_settings_refuses_an_out_of_range_number(temp_config, machine):
+    """The modal's bounds are validate()'s bounds, so a mistake is caught
+    where it was typed instead of at save time."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            table = scr.query_one("#settings", DataTable)
+            await post_row_selected(pilot, table,
+                                    _settings_row(table, "floor_duty"))
+            modal = await wait_modal(pilot, SettingModal)
+            modal.query_one("#set-input", Input).value = "150"
+            await pilot.click("#set-ok")
+            await pilot.pause()
+            assert isinstance(pilot.app.screen, SettingModal), \
+                "out-of-range value must not close the modal"
+            assert "must be <= 100" in str(
+                modal.query_one("#set-err", Static).render())
+            assert "floor_duty" not in scr._edits
+            await pilot.click("#set-cancel")
+            await wait_not_modal(pilot)
+            assert read_cfg(temp_config)["config"]["floor_duty"] == 5
+
+    asyncio.run(run())
+
+
+def test_settings_save_refuses_a_self_contradictory_pair(temp_config, machine):
+    """stall_full_duty below stall_min_duty would disarm the stall detector
+    that pins the fan — validate() rejects the pairing and the save is
+    refused with the reason rather than written and ignored."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            await _edit_setting(pilot, scr, "stall_full_duty", "5")
+            await pilot.click("#save-settings")
+            await wait_modal(pilot, ConfirmSettingsScreen)
+            await pilot.click("#confirm-ok")
+            errs = await wait_modal(pilot, ConfigErrorsScreen)
+            assert any("stall_full_duty" in e and "stall_min_duty" in e
+                       for e in errs.errors), errs.errors
+            # the file is untouched
+            assert read_cfg(temp_config)["config"]["stall_full_duty"] == 100
+
+    asyncio.run(run())
+
+
+def test_unsaved_settings_do_not_leak_into_another_screens_save(
+        temp_config, machine):
+    """Edits live on this screen until Save. If they were written into the
+    shared config object as they were typed, saving an assignment on screen 2
+    would also publish a poll interval the user never saved."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            await _edit_setting(pilot, scr, "poll_seconds", "7")
+            assign = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, assign)
+            assign.save_assignment()
+            await pilot.pause()
+            saved = read_cfg(temp_config)
+            assert saved["config"]["poll_seconds"] == 1.0, saved["config"]
+            assert saved["assignments"], saved
+            # and coming back, the pending edit is still there, unsaved
+            back = await _goto_settings(pilot)
+            table = back.query_one("#settings", DataTable)
+            assert _setting_cell(table, "poll_seconds", 3) == "→ save"
+
+    asyncio.run(run())
+
+
+def test_settings_discard_changes(temp_config, machine):
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            await _edit_setting(pilot, scr, "watchdog_seconds", "0")
+            table = scr.query_one("#settings", DataTable)
+            assert _setting_cell(table, "watchdog_seconds", 3) == "→ save"
+            await pilot.click("#revert-settings")
+            confirm = await wait_modal(pilot, ConfirmScreen)
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert "watchdog_seconds" not in scr._edits
+            assert _setting_cell(table, "watchdog_seconds", 2) == "30 s"
+            assert read_cfg(temp_config)["config"]["watchdog_seconds"] == 30
+
+    asyncio.run(run())
+
+
+def test_settings_modal_explains_the_option(temp_config, machine):
+    """The reason this is a modal and not 22 bare inputs: nobody should have
+    to read daemon.py to know what `stall_kick_backoff_s` is for."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_settings(pilot)
+            table = scr.query_one("#settings", DataTable)
+            await post_row_selected(pilot, table,
+                                    _settings_row(table,
+                                                  "stall_kick_backoff_s"))
+            modal = await wait_modal(pilot, SettingModal)
+            help_text = str(modal.query_one("#set-help", Static).render())
+            assert "rounds" in help_text and "heat" in help_text.lower()
+            labels = [str(l.render()) for l in modal.query(Label)]
+            assert any("built-in default: 30" in t for t in labels), labels
 
     asyncio.run(run())

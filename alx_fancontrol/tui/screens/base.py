@@ -1,7 +1,7 @@
-"""Shared screen shell: Header + Footer + left sidebar (nav 1-4) + content.
+"""Shared screen shell: Header + Footer + left sidebar (nav 1-5) + content.
 
-Each of the four screens is a real textual Screen (so the app's key
-bindings 1-4 switch between them); the sidebar is re-composed by every
+Each screen is a real textual Screen (so the app's key
+bindings 1-5 switch between them); the sidebar is re-composed by every
 screen through this base class.
 
 Nav items are NON-FOCUSABLE on purpose: a focused button shows the
@@ -153,7 +153,7 @@ class BaseScreen(Screen):
     NAV_ID: str | None = None
 
     #: No auto-focus on screen activation: a focused Input would swallow
-    #: the 1-4 navigation keys (typing "3" into the name field instead of
+    #: the 1-5 navigation keys (typing "3" into the name field instead of
     #: switching to Curves), and a focused table steals arrow keys. Keys
     #: navigate, clicks focus — focus is None until the user clicks.
     AUTO_FOCUS = ""
@@ -170,6 +170,7 @@ class BaseScreen(Screen):
                 yield NavButton("2 · Assign", id="nav-2")
                 yield NavButton("3 · Curves", id="nav-3")
                 yield NavButton("4 · Sources", id="nav-4")
+                yield NavButton("5 · Settings", id="nav-5")
             with Vertical(id="content"):
                 yield from self.content()
 
@@ -185,6 +186,7 @@ class BaseScreen(Screen):
         actions = {"nav-1": "show_overview",
                    "nav-2": "show_assign",
                    "nav-3": "show_curves",
-                   "nav-4": "show_sources"}
+                   "nav-4": "show_sources",
+                   "nav-5": "show_settings"}
         if event.button.id in actions:
             getattr(self.app, actions[event.button.id])()

@@ -2,7 +2,7 @@
 
 Run:  .venv/bin/python -m alx_fancontrol.tui.smoke
 
-Mounts Overview, navigates 1-4 across all screens, and exercises one save
+Mounts Overview, navigates 1-5 across all screens, and exercises one save
 round-trip against a THROWAWAY temp config (seeded from a tiny fake hwmon
 tree — the real user config is never touched). Uses live data by default
 (read-only hwmon/nvidia reads); pass --no-live for a hermetic pilot.

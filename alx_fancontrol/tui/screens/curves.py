@@ -24,9 +24,10 @@ Curve management (buttons, and `n` / `c` / `shift+d`):
     assignments still reference is refused with the list of them named:
     deleting it would leave those assignments without one (the daemon skips
     them and their fans sit at their last duty), so re-point them on the
-    Assign screen first. The two built-in curves are refused as well —
-    `config.load()` merges DEFAULTS back in, so deleting one would not
-    survive the next load (audit finding F14).
+    Assign screen first. The two built-in curves can be deleted too — what
+    the file says is what loads (`config._merge_defaults`); they are seeded
+    into a file that has no `curves` section at all, not re-injected into one
+    that does.
 A hint line shows which assignments use the selected curve for exactly that
 reason.
 
@@ -529,18 +530,6 @@ class CurveEditorScreen(BaseScreen):
             self.notify(f"Curve '{cid}' is used by {len(used)} assignment(s): "
                         f"{', '.join(used)} — re-point them on the Assign "
                         "screen (2) first", severity="error", timeout=12)
-            return
-        if cid in config_mod.DEFAULTS["curves"]:
-            # config.load() deep-merges DEFAULTS, so a curve the file no
-            # longer has comes back on the next load (daemon hot-reload or
-            # TUI restart). Offering Delete for those two would be a button
-            # that does nothing — the honest answer until the defaults merge
-            # is reworked (audit F14) is to say so.
-            self.notify(f"'{cid}' is a built-in curve: config.load() merges "
-                        "the defaults back in, so deleting it would not "
-                        "stick. It controls nothing on its own — rename its "
-                        "label if it misleads here.",
-                        severity="warning", timeout=12)
             return
         self.run_worker(self._delete_curve_flow(cid), exclusive=False)
 

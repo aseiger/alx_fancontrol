@@ -475,7 +475,7 @@ get a pointer to `scripts/bootstrap_venv.sh`). The TUI is **read-only on
 hwmon** — safe to run while the daemon is live. Run without root and a
 red **non-root** banner sits in the sidebar on every screen: fans can't
 be controlled (pwm writes are root-only) and the config edited is the
-home one, not `/etc`. Keys `1–4` switch
+home one, not `/etc`. Keys `1–5` switch
 screens (footer shows them; sidebar buttons work too). The current
 screen is highlighted in the sidebar — nav items are never *focused*
 (focus would swallow the nav keys and leave a stray highlight on the
@@ -548,6 +548,19 @@ top item), so: **keys navigate, clicks focus** fields/tables.
    show the `nvidia-smi` model). Nothing to configure here: any of them
    is pickable in the Assign screen, and a hardware change is picked up
    on the next daemon start/reload or TUI restart.
+5. **Settings** — the global `config` block: every option the daemon reads
+   (poll interval, `max_rate`, floor, the fail-safe trio, GPU/`nvidia-smi`
+   and watchdog limits, the whole stall-kick sequence, the alert command),
+   grouped, with its current value, unit and built-in default; a value that
+   differs from the default is marked `*`. **Enter or click a row** opens it
+   with the explanation of what the knob does and the bounds the save will
+   enforce (the same table `validate()` uses — see
+   `IMPLEMENTATION_NOTES.md` §25), so `stall_kick_backoff_s` needs no source
+   reading. **Blank value = remove the key** = follow the built-in default.
+   Edits stay on this screen until **Save** (`s`), which shows what will
+   change and validates first; **Discard changes** (`r`) drops them. Pending
+   edits survive a screen switch (they are not written by another screen's
+   Save) but not a TUI restart.
 
 ## Running without installing (interim mode)
 

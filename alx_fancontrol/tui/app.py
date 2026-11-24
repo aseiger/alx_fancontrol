@@ -24,6 +24,7 @@ from alx_fancontrol.tui.reader import LiveData, LiveReader, LiveUpdate
 from alx_fancontrol.tui.screens.assign import AssignScreen
 from alx_fancontrol.tui.screens.curves import CurveEditorScreen
 from alx_fancontrol.tui.screens.overview import OverviewScreen
+from alx_fancontrol.tui.screens.settings import SettingsScreen
 from alx_fancontrol.tui.screens.sources import SourcesScreen
 
 
@@ -117,7 +118,7 @@ class ConfigErrorsScreen(ModalScreen[None]):
 
 
 class FanControlApp(App):
-    """TUI shell. Keys 1-4 switch screens; a worker thread feeds live data
+    """TUI shell. Keys 1-5 switch screens; a worker thread feeds live data
     every ~1 s (live=False in tests for speed/hermeticity)."""
 
     TITLE = "alx_fancontrol"
@@ -126,6 +127,7 @@ class FanControlApp(App):
         Binding("2", "show_assign", "Assign"),
         Binding("3", "show_curves", "Curves"),
         Binding("4", "show_sources", "Sources"),
+        Binding("5", "show_settings", "Settings"),
     ]
     CSS = """
     #shell {
@@ -196,6 +198,12 @@ class FanControlApp(App):
         self.is_root = os.geteuid() == 0
         self.cfg: config_mod.Config | None = None
         self._cfg_mtime: float | None = None
+        #: Settings screen's unsaved edits, held HERE rather than on the
+        #: screen: switching screens builds a new one, and numbers typed for
+        #: `stall_kick_backoff_s` must not evaporate because someone pressed
+        #: 2 to look at an assignment. Deliberately separate from `cfg`, so
+        #: nothing gets written until Save on that screen (see settings.py).
+        self.settings_edits: dict = {}
         self.labels = hwmon.load_sensorsd_labels()
         self.chips = hwmon.find_all_chips()
         # Sources are discovered at runtime (machine property, not config);
@@ -254,6 +262,9 @@ class FanControlApp(App):
     def show_sources(self):
         self.switch_screen(SourcesScreen())
 
+    def show_settings(self):
+        self.switch_screen(SettingsScreen())
+
     def action_show_overview(self):
         self.show_overview()
 
@@ -265,6 +276,24 @@ class FanControlApp(App):
 
     def action_show_sources(self):
         self.show_sources()
+
+    def action_show_settings(self):
+        self.show_settings()
+
+    # ------------------------------------------------------------- reload
+    def reload_from_disk(self) -> bool:
+        """Throw away in-memory edits and take the file back (Settings'
+        Revert, and the stale-config 'Reload' path). False with a notification
+        when the file cannot be read — the in-memory config is then left
+        alone, because there is nothing better to replace it with."""
+        try:
+            self.cfg = config_mod.load(self.cfg_path)
+        except (OSError, ValueError) as e:
+            self.notify(f"Reload failed: {e}", severity="error")
+            return False
+        self._refresh_mtime()
+        self.notify("Config reloaded from disk")
+        return True
 
     # --------------------------------------------------------------- live
     def on_live_data(self, msg: LiveData):

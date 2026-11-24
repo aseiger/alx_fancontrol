@@ -387,3 +387,87 @@ def test_assignment_max_rate_validation():
     })
     errors, _ = C.validate(cfg)
     assert any("max_rate" in e for e in errors)
+
+
+def test_schema_covers_every_default_option():
+    """The Settings screen is built from CONFIG_FIELDS, so a knob added to
+    DEFAULTS without a Field would be invisible in the GUI again — exactly
+    F1's failure mode, which this pins shut. A Field whose kind disagrees with
+    the default value would render the wrong widget, and a default outside its
+    own bounds would mean a fresh install fails `check`."""
+    from alx_fancontrol.config import BY_KEY, DEFAULTS
+    d = DEFAULTS["config"]
+    assert set(d) == set(BY_KEY), set(d) ^ set(BY_KEY)
+    for key, f in BY_KEY.items():
+        v = d[key]
+        want = ("bool" if isinstance(v, bool)
+                else "str" if isinstance(v, str) else "number")
+        assert f.kind == want, key
+        if f.lo is not None:
+            assert v >= f.lo, key
+        if f.hi is not None:
+            assert v <= f.hi, key
+
+
+def test_schema_documents_every_option():
+    """An option the GUI can show but not explain is half an option: the
+    point of the Settings screen is that nobody has to read config.py (or the
+    daemon) to find out what a knob does."""
+    from alx_fancontrol.config import CONFIG_FIELDS
+    for f in CONFIG_FIELDS:
+        assert f.label and f.label != f.key, f.key
+        assert len(f.help) > 30, f.key
+        assert f.group, f.key
+
+
+# ------------------------------------------------- defaults vs file (F14) --
+
+def _write(tmp_path, doc):
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(doc))
+    return p
+
+
+def test_deleted_builtin_curve_stays_deleted(tmp_path):
+    """F14: load() merged DEFAULTS over the whole document, so removing a
+    built-in curve from the file removed nothing — the daemon hot-reloaded and
+    still saw `default`, and the TUI showed it again. A curve the operator
+    deleted is gone."""
+    p = _write(tmp_path, {"version": 2, "config": {},
+                          "curves": {"mine": {"label": "Mine",
+                                              "points": [[40, 30]]}},
+                          "assignments": {}})
+    cfg = C.load(p)
+    assert set(cfg.curves) == {"mine"}
+
+
+def test_file_without_curves_key_still_gets_the_stock_pair(tmp_path):
+    """A minimal or freshly migrated file is not a decision to have no
+    curves: absence of the section seeds the stock pair, presence of it means
+    whatever it says — including an empty set."""
+    p = _write(tmp_path, {"version": 2})
+    assert set(C.load(p).curves) == set(C.DEFAULTS["curves"])
+    p2 = _write(tmp_path, {"version": 2, "curves": {}})
+    assert C.load(p2).curves == {}
+
+
+def test_config_keys_still_merge_one_by_one(tmp_path):
+    """The other half of the rule: a file that predates a knob must still get
+    that knob's default, and deleting a key means 'use the built-in'."""
+    p = _write(tmp_path, {"version": 2, "config": {"poll_seconds": 3.0}})
+    cfg = C.load(p)
+    assert cfg.config["poll_seconds"] == 3.0
+    for key in ("max_rate", "failsafe_duty", "stall_kick_run_s"):
+        assert cfg.config[key] == C.DEFAULTS["config"][key], key
+
+
+def test_curve_fields_are_not_filled_from_the_builtin(tmp_path):
+    """Entry-level merging also invented a label for a curve that had none —
+    the built-in 'Default' appearing on a curve the user named themselves."""
+    p = _write(tmp_path, {"version": 2,
+                          "curves": {"default": {
+                              "points": [[30, 40], [80, 90]]}},
+                          "assignments": {}})
+    cfg = C.load(p)
+    assert cfg.curves["default"].get("label") is None
+    assert cfg.curves["default"]["points"] == [[30, 40], [80, 90]]

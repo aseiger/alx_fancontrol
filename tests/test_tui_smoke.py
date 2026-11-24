@@ -18,6 +18,7 @@ from alx_fancontrol.tui.screens.assign import AssignScreen
 from alx_fancontrol.tui.screens.curves import CurveEditorScreen, \
     render_curve_plot
 from alx_fancontrol.tui.screens.overview import OverviewScreen
+from alx_fancontrol.tui.screens.settings import SettingsScreen
 from alx_fancontrol.tui.screens.sources import SourcesScreen
 
 
@@ -52,7 +53,8 @@ def test_all_screens_mount_and_nav(temp_config):
             app = pilot.app
             assert isinstance(app.screen, OverviewScreen)
             for key, cls in [("2", AssignScreen), ("3", CurveEditorScreen),
-                             ("4", SourcesScreen), ("1", OverviewScreen)]:
+                             ("4", SourcesScreen), ("5", SettingsScreen),
+                             ("1", OverviewScreen)]:
                 await pilot.press(key)
                 await pilot.pause()
                 assert isinstance(app.screen, cls), \
@@ -61,6 +63,9 @@ def test_all_screens_mount_and_nav(temp_config):
             await pilot.click("#nav-3")
             await pilot.pause()
             assert isinstance(app.screen, CurveEditorScreen)
+            await pilot.click("#nav-5")
+            await pilot.pause()
+            assert isinstance(app.screen, SettingsScreen)
 
     asyncio.run(run())
 

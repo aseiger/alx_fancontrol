@@ -944,6 +944,11 @@ replace-semantics that assignment would start failing validation and be
 skipped at runtime — fans holding their last duty is not a regression to take
 for the sake of a tidier curve list.
 
+**Fixed in §25**, and that concern is answered rather than ignored: the fix
+seeds per *section*, so a file with no `curves` key at all still gets the
+stock pair (the case above keeps working); only a file that does write a
+`curves` section is taken as complete.
+
 ### Deliberate choices
 
 - **Create writes immediately.** The alternative (a pending curve that only
@@ -1074,3 +1079,111 @@ note and is still mappable. Daemon: no tach → warning + `status.json`
 but reading nothing → its own warning.
 
 Suite: **223 passed** (213 + 10).
+
+## 25. Config↔GUI audit, step 4: the global options get a screen, and defaults stop overruling the file (2026-11-25)
+
+F1 and F14 — the last two of the "you have to edit JSON" findings.
+
+F1 was the largest one in the audit by count: 22 options under `config`
+(poll interval, `max_rate`, floor, the fail-safe trio, GPU/watchdog
+timeouts, the whole stall-kick sequence, the alert command) that the daemon
+reads, that README describes, and that no screen could show or change. The
+reason it stayed that way was structural: the ranges lived inside
+`validate()` as a tuple of tuples, so a GUI form would have had to restate
+them — and a form that restates them drifts.
+
+### `CONFIG_FIELDS` — one description per option
+
+`config.py` now defines `CONFIG_FIELDS: tuple[Field, ...]` (key, label, kind,
+group, `lo`, `hi`, unit, help) plus `BY_KEY`. `validate()`'s numeric loop is
+generated from it — same order, same messages, same bounds — and the Settings
+screen builds its rows and its edit modal from the same objects. Two guards
+in `tests/test_config.py` pin it: every key in `DEFAULTS["config"]` must have
+a Field (so a knob cannot be added to the daemon and forgotten in the GUI,
+which *is* F1), with a kind matching the default's type and a default inside
+its own bounds; and every Field must carry a label, a group and a help line
+longer than 30 characters (an option the GUI can display but not explain is
+half an option).
+
+The bespoke checks stayed hand-written where they are genuinely bespoke: the
+string type of `stall_alert_command`, the bool type of `stall_kick`, and the
+pairing rule that `stall_full_duty >= stall_min_duty` (pinning a stalled fan
+under the alarm threshold would disarm the detector that pinned it).
+
+### F14: defaults fill in what the file does not say, they do not overrule it
+
+`load()` used to `_deep_merge(DEFAULTS, doc)` over the whole document. For
+`config.*` that is right: a release adding a knob must not require editing
+every existing file, and deleting a key means "use the built-in". For
+`curves`/`assignments` it was wrong — it made a curve un-deletable (§23),
+and it also invented labels: a curve written as `{"points": […]}` with no
+`label` silently inherited `"Default"` from the built-in entry of the same id.
+
+Now `_merge_defaults()` merges `config` per key and takes `curves` and
+`assignments` **as written when present**, seeding DEFAULTS only when the
+section is absent entirely. Consequences, checked:
+
+- a file with no `curves` key still gets `default` + `gpu_v100`, so the §23
+  worry (a hand-written config referencing `default` without defining it)
+  keeps working;
+- a file that writes `curves` but omits `default` no longer has it injected —
+  an assignment pointing at it gets the existing *warning* ("unknown curve …
+  skipped at runtime"), not a phantom curve;
+- deleting a built-in curve in the TUI now sticks, so step 2's refusal was
+  removed and its test inverted (delete `default` → gone from the file, gone
+  from a fresh `load()`, picker lands on `gpu_v100`).
+
+### Screen 5 · Settings
+
+Rows are generated from `CONFIG_FIELDS`, grouped (loop / fail-safe /
+liveness / stalled fan / escalation) with the group name in the first column
+of each group's first row — a DataTable has no section headers and five
+tables would each want a border, a cursor and their own scroll. Value and
+unit share one cell (`6 % per poll`); a value differing from the built-in is
+marked `*`; a pending edit shows `→ save`.
+
+Enter (or click) opens `SettingModal`: the option's help text, its bounds,
+its built-in default, what it is now, and an input — plus **Use default**,
+which removes the key. Out-of-range numbers are refused *in the modal*, with
+the reason inline, because those bounds are validate()'s own.
+
+**Edits stay on this screen until Save.** They are held in
+`app.settings_edits`, not written into `app.cfg` as they are typed: the
+shared config object is what every other screen saves, so typing a poll
+interval and then saving an assignment on screen 2 would otherwise publish a
+global change nobody saved. Living on the app rather than on the screen means
+a screen switch (which builds a new instance) does not silently drop them;
+Save applies, validates through `app.save_config`, and keeps them if the
+save is refused so they can be corrected. Save confirms first with the list
+of `key: old → new` — these are defaults for every fan at once.
+
+### Layout traps found (both real, both now pinned by tests or probes)
+
+- **textual's containers default to `height: 1fr`.** The modal's button row
+  swallowed every remaining line, so a 8-line form came out as a 27-row box
+  of empty air. Measured with widget regions (`box.children[*].region`), not
+  by eye — a pty screenshot had already shown the symptom without naming it.
+- **This screen takes table focus** (`AUTO_FOCUS = "#settings"`), unlike the
+  other four. They deliberately keep focus off tables so digits reach the
+  nav bindings; here the screen is one list and nothing else, so arrows move
+  the row cursor and Enter edits — without it a keyboard user could not reach
+  a row at all. Digits still switch screens (a DataTable binds no digits).
+- Width: the group column is paid for by every row, so group names are
+  shortened (`fail-safe`, `liveness`) and the default/unit columns folded
+  into the value cell — at 80 columns the values were previously clipped off
+  the right edge.
+
+### Tests
+
+14 new. Schema: coverage against `DEFAULTS` and documentation guards (2).
+F14 merge semantics: a deleted built-in stays deleted; no `curves` key still
+seeds the stock pair; an empty `curves` section means none; `config.*` still
+merges per key; curve fields are not filled from the built-in (4). Settings
+screen: every option listed with value and unit; edit → confirm → file; blank
+removes the key; an out-of-range number refused inside the modal; a
+self-contradictory pair refused by validation with the file untouched; no
+leak into another screen's save; Discard; the modal's help text (8). §23's
+built-in-refusal test was inverted into a deletion-sticks test rather than
+counted twice. Smoke nav now covers screen 5 by key and by sidebar button.
+
+Suite: **237 passed** (223 + 14).

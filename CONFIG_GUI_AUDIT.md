@@ -9,8 +9,8 @@ the real TUI against the synthetic machine (`tests/fake_machine.py`) and
 asserted on the file written to disk. Probes were deleted after running;
 the findings below cite the evidence each one produced.
 **Tree:** `6209746` (2026-11-23).
-**Status:** steps 1–3 landed — **F2, F3, F4, F7, F8, F9 fixed** (see §D,
-`IMPLEMENTATION_NOTES.md` §22–§24). F5–F6, F10–F13 still open.
+**Status:** steps 1–4 landed — **F1, F2, F3, F4, F7, F8, F9, F14 fixed** (see §D,
+`IMPLEMENTATION_NOTES.md` §22–§25). F5–F6, F10–F13 still open.
 
 ---
 
@@ -35,41 +35,41 @@ tuning any of them today means `sudo $EDITOR /etc/alx_fancontrol/config.json`
 — no validation, no defaults shown, no units, no idea whether the running
 daemon accepted it.
 
-Four findings are **bugs** (proven, not stylistic): F2, F3, F7, F9.
+Four findings are **bugs** (proven, not stylistic): F2, F3, F4, F7, F9.
 
 ---
 
 ## A. Coverage matrix
 
-### `config.*` — 22 globals, all JSON-only
+### `config.*` — 22 globals (JSON-only at audit time; now screen 5, §25)
 
 | key | default | GUI |
 |---|---|---|
-| `poll_seconds` | 1.0 | ✗ |
-| `max_rate` | 6 | ✗ (per-assignment only) |
-| `floor_duty` | 5 | ✗ (per-assignment only) |
-| `dead_temp_c` | −10 | ✗ |
-| `failsafe_duty` | 100 | ✗ |
-| `failsafe_after` | 5 | ✗ |
-| `failsafe_max_rate` | 25 | ✗ |
-| `gpu_temp_min_valid_c` | 15 | ✗ |
-| `smi_timeout_s` | 3.0 | ✗ |
-| `watchdog_seconds` | 30 | ✗ |
-| `stall_min_duty` | 20 | ✗ |
-| `stall_after` | 10 | ✗ |
-| `stall_full_duty` | 100 | ✗ |
-| `stall_kick` | true | ✗ |
-| `stall_kick_attempts` | 3 | ✗ |
-| `stall_kick_stop_s` | 0.5 | ✗ |
-| `stall_kick_run_s` | 3.0 | ✗ |
-| `stall_kick_backoff_s` | 30 | ✗ |
-| `stall_kick_cooldown_s` | 60 | ✗ |
-| `stall_alert_command` | `""` | ✗ |
-| `stall_alert_timeout_s` | 5.0 | ✗ |
-| `stall_alert_repeat_s` | 300 | ✗ |
+| `poll_seconds` | 1.0 | ✅ Settings |
+| `max_rate` | 6 | ✅ Settings + per-assignment override |
+| `floor_duty` | 5 | ✅ Settings + per-assignment override |
+| `dead_temp_c` | −10 | ✅ Settings |
+| `failsafe_duty` | 100 | ✅ Settings |
+| `failsafe_after` | 5 | ✅ Settings |
+| `failsafe_max_rate` | 25 | ✅ Settings |
+| `gpu_temp_min_valid_c` | 15 | ✅ Settings |
+| `smi_timeout_s` | 3.0 | ✅ Settings |
+| `watchdog_seconds` | 30 | ✅ Settings |
+| `stall_min_duty` | 20 | ✅ Settings |
+| `stall_after` | 10 | ✅ Settings |
+| `stall_full_duty` | 100 | ✅ Settings |
+| `stall_kick` | true | ✅ Settings |
+| `stall_kick_attempts` | 3 | ✅ Settings |
+| `stall_kick_stop_s` | 0.5 | ✅ Settings |
+| `stall_kick_run_s` | 3.0 | ✅ Settings |
+| `stall_kick_backoff_s` | 30 | ✅ Settings |
+| `stall_kick_cooldown_s` | 60 | ✅ Settings |
+| `stall_alert_command` | `""` | ✅ Settings |
+| `stall_alert_timeout_s` | 5.0 | ✅ Settings |
+| `stall_alert_repeat_s` | 300 | ✅ Settings |
 
-(Verified two ways: zero references to any of these names anywhere in
-`alx_fancontrol/tui/`, and a probe that set `poll_seconds=7.0` +
+(Verified two ways **at audit time**: zero references to any of these names
+anywhere in `alx_fancontrol/tui/`, and a probe that set `poll_seconds=7.0` +
 `stall_alert_command="notify-send 'fan trouble'"` and found neither string
 rendered on any of the four screens.)
 
@@ -106,7 +106,7 @@ rendered on any of the four screens.)
 
 ## B. Findings
 
-### F1 · High — there is no Settings screen (22/22 globals unreachable)
+### F1 · High (**fixed** §25) — there is no Settings screen (22/22 globals unreachable)
 
 `base.py:107-110` defines exactly four nav items. `app.py:69-74` binds
 exactly four keys. There is no command palette, no "raw JSON" view, no
@@ -120,6 +120,12 @@ edit-the-file-by-hand. The daemon hot-reloads, so a typo is *silent*: the
 daemon keeps the old config, sets `errors.config`
 (`daemon.py:1143-1148, 1236`) and the TUI shows it as one fragment of the
 Overview status line (`overview.py:133-147`).
+
+**Fixed (§25):** screen 5 · Settings, generated from `config.CONFIG_FIELDS` —
+one description per option driving validation *and* the form (bounds, unit,
+group, help), plus a test that every `DEFAULTS["config"]` key has a Field so a
+new knob cannot quietly be invisible. Edits are held on the screen until Save,
+blank removes the key, an out-of-range value is refused where it is typed.
 
 ### F2 · High (bug, **fixed**) — blanking floor / ceiling / rate cannot clear an override
 
@@ -298,7 +304,7 @@ all of the excellent explanation lives in the README.
 reading the table to learn what to edit will look for a screen that cannot
 exist.
 
-### F14 · Medium — `config.load()` re-injects the built-in curves, so some edits cannot stick *(found in step 2)*
+### F14 · Medium (**fixed** §25) — `config.load()` re-injects the built-in curves, so some edits cannot stick *(found in step 2)*
 
 `load()` returns `_deep_merge(DEFAULTS, doc)`. For `config.*` that is the
 feature (a key added in §21 has a value even in a v1 file), but it applies to
@@ -320,6 +326,15 @@ as additive. Not done in step 2 on purpose — a hand-written config that
 references `default` without defining it works today, and replace-semantics
 would turn that into a validation error whose runtime consequence is a skipped
 assignment (fans holding their last duty).
+
+**Fixed (§25):** `_merge_defaults()` merges `config` per key (still additive,
+so a release can add a knob) and takes `curves`/`assignments` **as written
+when present**, seeding DEFAULTS only when the section is absent entirely. The
+step-2 worry therefore does not arise: a file with no `curves` key still gets
+the stock pair, while a file that writes one is taken as complete — and it
+also stops built-in labels being invented for curves that have none. Step 2's
+Delete refusal was removed and its test inverted (delete `default` → gone from
+the file and from a fresh `load()`).
 
 ---
 
@@ -433,7 +448,7 @@ F1 from coming back next time a knob is added — which, given §18→§21 added
 | 1 ✅ | F2 clear-override, F3 enable toggle, F9 rename-confirm, F8 validate-before-save | `assign.py`, `app.save_config` | small, local |
 | 2 ✅ | F7 curve new/duplicate/delete/label + first point | `curves.py`, `base.py` (`ConfirmScreen`) | small |
 | 3 ✅ | F4 tach editor + no-tach warning + stale-entry cleanup | `assign.py`, `hwmon.py`, `daemon.py`, `overview.py` | medium (safety-relevant) |
-| 4 | F1 Settings screen + `SCHEMA` refactor of `validate()` **+ F14 (seed defaults once, don't re-merge on load)** | `config.py`, new `tui/screens/settings.py`, `base.py`, `app.py` | medium, mostly mechanical |
+| 4 ✅ | F1 Settings screen + `SCHEMA` refactor of `validate()` **+ F14 (seed defaults once, don't re-merge on load)** | `config.py`, new `tui/screens/settings.py`, `base.py`, `app.py` | medium, mostly mechanical |
 | 5 | F5 ownership column + `force_takeover` control | `assign.py`, `hwmon.py` (read enable per channel) | medium |
 | 6 | F10 Overview upgrades, F11 config path, F12 input polish, F13 README | `overview.py`, screens, README | low |
 

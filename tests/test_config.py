@@ -471,3 +471,19 @@ def test_curve_fields_are_not_filled_from_the_builtin(tmp_path):
     cfg = C.load(p)
     assert cfg.curves["default"].get("label") is None
     assert cfg.curves["default"]["points"] == [[30, 40], [80, 90]]
+
+
+def test_per_assignment_failsafe_max_rate_is_validated():
+    """daemon._failsafe() reads failsafe_max_rate per assignment with the
+    global as fallback, so a bad value there used to reach the hardware path
+    unchecked (it is the ramp a fan takes when a sensor dies)."""
+    cfg = _cfg_with(assignments={"CPU": {
+        "source": "k10temp:temp1", "curve": "default",
+        "fans": ["it8686:pwm1"], "failsafe_max_rate": -5}})
+    errors, _w = C.validate(cfg)
+    assert any("failsafe_max_rate" in e for e in errors), errors
+    cfg2 = _cfg_with(assignments={"CPU": {
+        "source": "k10temp:temp1", "curve": "default",
+        "fans": ["it8686:pwm1"], "failsafe_max_rate": 40}})
+    errors2, _w2 = C.validate(cfg2)
+    assert not any("failsafe_max_rate" in e for e in errors2), errors2

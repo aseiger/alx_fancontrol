@@ -1822,6 +1822,12 @@ def test_blank_fields_keep_unmanaged_keys(temp_config, machine):
             scr.query_one("#floor", Input).value = ""
             scr.save_assignment()
             await pilot.pause()
+            # the assignment has `failsafe: false` — saving it asks first,
+            # because that switch is one flip away from removing a safety net
+            confirm = await wait_modal(pilot, ConfirmScreen)
+            assert "fail-safe" in confirm.title_text
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
             saved = read_cfg(temp_config)["assignments"]["CPU"]
             assert "floor_duty" not in saved
             assert saved["failsafe"] is False
@@ -2811,5 +2817,157 @@ def test_overview_says_why_a_fan_is_not_being_controlled(temp_config, machine):
                      for c in range(ncols)]
             assert any("refused: held by another controller" in c
                        for c in cells), cells
+
+    asyncio.run(run())
+
+
+# ------------------------------------------- per-assignment fail-safe (F6) --
+
+def test_failsafe_overrides_are_shown_and_edited(temp_config, machine):
+    """F6: `failsafe`, `failsafe_duty`, `failsafe_after` were read by the
+    daemon and validated, but no screen could show them — so 'what happens if
+    this source dies' could not be read on screen for a single fan, including
+    the answer 'nothing, it holds its last duty'."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True,
+                           "failsafe_duty": 80, "failsafe_after": 2})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, scr)
+            assert scr.query_one("#fs-duty", Input).value == "80"
+            assert scr.query_one("#fs-after", Input).value == "2"
+            assert scr.query_one("#fs-rate", Input).value == ""   # global 25
+            assert scr.query_one("#failsafe", Switch).value is True
+            scr.query_one("#fs-duty", Input).value = "70"
+            scr.query_one("#fs-rate", Input).value = "40"
+            scr.save_assignment()
+            await pilot.pause()
+            saved = read_cfg(temp_config)["assignments"]["CPU"]
+            assert saved["failsafe_duty"] == 70
+            assert saved["failsafe_after"] == 2
+            assert saved["failsafe_max_rate"] == 40
+
+    asyncio.run(run())
+
+
+def test_blank_failsafe_fields_inherit_the_global(temp_config, machine):
+    """Blank = no override, same rule as floor/ceiling/rate: the key leaves
+    the file so the global (editable on screen 5) applies again."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True,
+                           "failsafe_duty": 80})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, scr)
+            scr.query_one("#fs-duty", Input).value = ""
+            scr.save_assignment()
+            await pilot.pause()
+            assert "failsafe_duty" not in \
+                read_cfg(temp_config)["assignments"]["CPU"]
+
+    asyncio.run(run())
+
+
+def test_turning_the_failsafe_off_asks_then_writes_false(temp_config, machine):
+    """The opt-out is a one-switch way to remove a safety net from one fan
+    (§18 is what that looks like on this board), so it is confirmed and stored
+    explicitly as false rather than as an absent key."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await _pick_fan(pilot, scr, "it8686:pwm3")
+            scr.query_one("#failsafe", Switch).value = False
+            await _save_named_assignment(pilot, scr, "no-net")
+            confirm = await wait_modal(pilot, ConfirmScreen)
+            assert "HOLD their last duty" in " ".join(confirm.lines)
+            await pilot.click("#confirm-ok")
+            await wait_not_modal(pilot)
+            assert read_cfg(temp_config)["assignments"]["no-net"][
+                "failsafe"] is False
+
+    asyncio.run(run())
+
+
+def test_cancelling_keeps_the_failsafe_alone(temp_config, machine):
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await _pick_fan(pilot, scr, "it8686:pwm3")
+            scr.query_one("#failsafe", Switch).value = False
+            await _save_named_assignment(pilot, scr, "no-net")
+            await wait_modal(pilot, ConfirmScreen)
+            await pilot.click("#confirm-cancel")
+            await wait_not_modal(pilot)
+            assert "no-net" not in read_cfg(temp_config)["assignments"]
+
+    asyncio.run(run())
+
+
+def test_turning_it_back_on_removes_the_key(temp_config, machine):
+    """On means inherit: the explicit false must not linger in the file."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True,
+                           "failsafe": False})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, scr)
+            assert scr.query_one("#failsafe", Switch).value is False
+            scr.query_one("#failsafe", Switch).value = True
+            scr.save_assignment()
+            await pilot.pause()
+            assert "failsafe" not in \
+                read_cfg(temp_config)["assignments"]["CPU"]
+
+    asyncio.run(run())
+
+
+def test_fractional_duty_survives_the_form(temp_config, machine):
+    """F12: the fields used to be int-only with max_length=3, so a config
+    containing 59.5 (which the live one does) could not even be displayed
+    without rounding it away."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True,
+                           "floor_duty": 59.5})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(120, 45)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, scr)
+            assert scr.query_one("#floor", Input).value == "59.5"
+            scr.query_one("#maxduty", Input).value = "97.5"
+            scr.save_assignment()
+            await pilot.pause()
+            saved = read_cfg(temp_config)["assignments"]["CPU"]
+            assert saved["floor_duty"] == 59.5
+            assert saved["max_duty"] == 97.5
 
     asyncio.run(run())

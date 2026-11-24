@@ -1290,3 +1290,70 @@ is classified and listed by `needs_force_takeover`; the Overview renders
 `refused: held by another controller` from a `manual-conflict` status.
 
 Suite: **243 passed** (237 + 6).
+
+## 27. Config↔GUI audit, step 6a: "what happens if this source dies", per fan (2026-11-27)
+
+F6 and F12, both on the Assign form.
+
+F6 was the asymmetry that mattered: the global fail-safe had no screen either
+(F1, fixed in §25), so before this there was **no place at all** where "what
+happens when this source goes unreadable" could be read — while a hand-set
+`"failsafe": false` on one assignment is a one-character way to remove that
+safety net from one fan. `daemon._failsafe()` reads `failsafe`,
+`failsafe_duty`, `failsafe_after` **and** `failsafe_max_rate` per assignment,
+with the globals as fallback; the TUI showed none of them.
+
+### What changed
+
+- Three inputs — fail-safe duty %, after (polls), ramp %/poll — with the
+  **global value currently in effect** in each placeholder and blank meaning
+  "inherit" (key removed), which is the same rule step 1 established for
+  floor/ceiling/rate. The placeholders read `cfg.config`, so they cannot lie
+  after someone edits screen 5.
+- A **fail-safe on** switch. Off writes explicit `"failsafe": false`; on
+  removes the key. An absent key and `false` must not be ambiguous in a file
+  that decides whether fans ramp or hold.
+- **Turning it off is confirmed**, with the consequence spelled out ("these
+  fans HOLD their last duty … a source that dies while the fans are idling
+  leaves them idling — which is how a card cooked (§18)"). `validate()` already
+  warns about the state, but a warning in a modal nobody reads is not a
+  decision; asking at the switch is. Cancel writes nothing.
+- `failsafe_max_rate` was being read per assignment by the daemon but **not
+  validated** there — added to `config.validate()`, so a typo in the ramp a fan
+  takes when a sensor dies is caught before it reaches the hardware path.
+
+F12, the input polish: the numeric fields were `restrict="[0-9]" max_length=3`,
+so an int-only field was editing a float model — the live `/etc` config contains
+`floor_duty: 59.5`, which the form could not display without rounding it away.
+Now `[0-9.]`, max 5, parsed by one `_parse_num()` that keeps whole numbers as
+`int` (so the file stays free of `30.0`) and accepts fractions; a bad value is
+reported per field ("ceiling %: '1o0' is not a number") instead of being
+silently dropped.
+
+### The layout war, again — and a trap worth naming
+
+Adding a group pushed Save below the fold at 45 rows (`pilot.click("#save")`
+started raising `OutOfBound`, which is how the tests caught it). Reclaimed by
+putting all three switches on one row with short labels, dropping the group's
+own hint line (the placeholders already name each knob), trimming the closing
+hint to one line, and `#form-title` margin 2→1. Save bottom is now 44 of 45 at
+120 columns and independent of how many fans are picked.
+
+The trap: the new inputs rendered as **one full-width box** in a real terminal
+and the other two vanished off the right edge. Inputs default to `width: 100%`,
+and the existing CSS shared the row by id (`#floor, #maxduty, #rate`) — so the
+new ids silently got no rule. Tests passed; only the pty render showed it. The
+rule is now a class (`.num`), which a new field picks up by construction. Same
+class of bug as the two `id="switch-row"` collisions textual rejected at mount:
+anything addressed by id has to be remembered, and this screen has grown twice.
+
+### Tests
+
+8 new (7 TUI, 1 config): overrides load into the fields and save back; blank
+inherits (key removed); flipping the net off confirms and writes `false`;
+cancel writes nothing; switching it back on removes the key; fractional duty
+round-trips through the form (`59.5` in, `59.5` out — and `97.5` typed fresh);
+one existing test now asserts the confirmation appears for an assignment that
+already has `"failsafe": false`; `failsafe_max_rate` validated per assignment.
+
+Suite: **250 passed** (243 + 7, plus the config guard).

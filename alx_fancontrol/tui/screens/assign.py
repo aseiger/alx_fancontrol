@@ -47,6 +47,31 @@ from alx_fancontrol.tui.screens.base import (BaseScreen, ConfirmScreen,
                                              table_cursor_key, table_hover_key)
 
 
+def _fmt_num(v) -> str:
+    """A stored number as it should appear in an input: 59.5 stays 59.5,
+    30 does not become '30.0'."""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _parse_num(text: str):
+    """(value, error) for a numeric field.
+
+    Floats are accepted — the model is float and the live config on this box
+    contains `59.5`, which the old int-only field could not even display —
+    while a whole number is stored as an int so the file stays free of 30.0
+    noise."""
+    text = text.strip()
+    if not text:
+        return None, None
+    try:
+        v = float(text)
+    except ValueError:
+        return None, f"{text!r} is not a number"
+    return (int(v) if v.is_integer() else v), None
+
+
 class ConfirmDeleteScreen(ConfirmScreen):
     """Delete-assignment confirmation — destructive: the daemon restores
     firmware (BIOS) control of the fans once the assignment is gone."""
@@ -157,7 +182,7 @@ class AssignScreen(BaseScreen):
         margin-right: 1;
     }
     #form-title {
-        margin-top: 2;
+        margin-top: 1;
     }
     #assign-form {
         height: auto;
@@ -165,15 +190,17 @@ class AssignScreen(BaseScreen):
     #assign-form Horizontal {
         height: auto;
     }
-    /* Inputs default to width: 100% — side-by-side they'd push the
-       second one off-screen; share the row instead. */
-    #floor, #maxduty, #rate {
+    /* Inputs default to width: 100% — side by side they push each other
+       off-screen; a shared class makes them split the row (id rules here
+       would have silently dropped the fail-safe trio, which is exactly
+       what happened before this was a class). */
+    .num {
         width: 1fr;
     }
-    #floor, #maxduty {
+    .num {
         margin-right: 1;
     }
-    #enabled-row, #switch-row {
+    .switch-row {
         height: auto;
     }
     #pickers {
@@ -182,10 +209,10 @@ class AssignScreen(BaseScreen):
     #fan-pick, #tach-pick {
         width: 1fr;
     }
-    #enabled-row Switch, #switch-row Switch {
+    .switch-row Switch {
         margin: 0 1 0 0;
     }
-    #switch-row Static {
+    .switch-row Static {
         margin-right: 2;
     }
     /* Both lists grow with their content but stay bounded: an unbounded list
@@ -248,23 +275,38 @@ class AssignScreen(BaseScreen):
                     placeholder=f"floor % (global "
                                 f"{self._global_default('floor_duty')}, "
                                 f"blank = use it)",
-                    id="floor", restrict=r"[0-9]", max_length=3)
+                    id="floor", classes="num", restrict=r"[0-9.]", max_length=5)
                 yield Input(
                     placeholder="ceiling % (global 100, blank = use it)",
-                    id="maxduty", restrict=r"[0-9]", max_length=3)
+                    id="maxduty", classes="num", restrict=r"[0-9.]", max_length=5)
                 yield Input(
                     placeholder=f"rate %/poll (global "
                                 f"{self._global_default('max_rate')}, "
                                 f"blank = use it)",
-                    id="rate", restrict=r"[0-9]", max_length=3)
-            with Horizontal(id="switch-row"):
+                    id="rate", classes="num", restrict=r"[0-9.]", max_length=5)
+            with Horizontal():
+                yield Input(
+                    placeholder=f"fail-safe duty % (global "
+                                f"{self._global_default('failsafe_duty')})",
+                    id="fs-duty", classes="num", restrict=r"[0-9.]", max_length=5)
+                yield Input(
+                    placeholder=f"after (global "
+                                f"{self._global_default('failsafe_after')} "
+                                f"polls)",
+                    id="fs-after", classes="num", restrict=r"[0-9.]", max_length=5)
+                yield Input(
+                    placeholder=f"ramp %/poll (global "
+                                f"{self._global_default('failsafe_max_rate')})",
+                    id="fs-rate", classes="num", restrict=r"[0-9.]", max_length=5)
+            with Horizontal(classes="switch-row"):
                 yield Switch(value=True, id="enabled")
                 yield Static("enabled", classes="hint")
                 yield Switch(value=False, id="force-takeover")
                 yield Static("Force takeover", classes="hint")
-            yield Static("off hands these fans back to the firmware · Force"
-                         " takeover takes a header another process holds, or"
-                         " one parked at enable 0 (§18/§20)",
+                yield Switch(value=True, id="failsafe")
+                yield Static("fail-safe on", classes="hint")
+            yield Static("off → firmware · force takeover → take a held or"
+                         " parked header · fail-safe off → hold last duty",
                          classes="hint")
             yield Button("Save assignment", id="save", variant="primary")
 
@@ -416,15 +458,19 @@ class AssignScreen(BaseScreen):
         # (None where the config has none) — the table shows and edits these
         saved_tach = a.get("tach") or {}
         self._tach_map = {f: saved_tach.get(f) for f in self._picked}
-        self.query_one("#floor", Input).value = (
-            str(a["floor_duty"]) if a.get("floor_duty") is not None else "")
-        self.query_one("#maxduty", Input).value = (
-            str(a["max_duty"]) if a.get("max_duty") is not None else "")
-        self.query_one("#rate", Input).value = (
-            str(a["max_rate"]) if a.get("max_rate") is not None else "")
+        for wid, key in (("#floor", "floor_duty"),
+                         ("#maxduty", "max_duty"),
+                         ("#rate", "max_rate"),
+                         ("#fs-duty", "failsafe_duty"),
+                         ("#fs-after", "failsafe_after"),
+                         ("#fs-rate", "failsafe_max_rate")):
+            self.query_one(wid, Input).value = (
+                _fmt_num(a[key]) if a.get(key) is not None else "")
         self.query_one("#enabled", Switch).value = bool(a.get("enabled", True))
         self.query_one("#force-takeover", Switch).value = \
             bool(a.get("force_takeover", False))
+        self.query_one("#failsafe", Switch).value = \
+            bool(a.get("failsafe", True))
         self._refresh_fans()
         self._refresh_tachs()
         self.query_one("#form-title", Static).update(
@@ -439,8 +485,12 @@ class AssignScreen(BaseScreen):
         self.query_one("#floor", Input).value = ""
         self.query_one("#maxduty", Input).value = ""
         self.query_one("#rate", Input).value = ""
+        self.query_one("#fs-duty", Input).value = ""
+        self.query_one("#fs-after", Input).value = ""
+        self.query_one("#fs-rate", Input).value = ""
         self.query_one("#enabled", Switch).value = True
         self.query_one("#force-takeover", Switch).value = False
+        self.query_one("#failsafe", Switch).value = True
         self._refresh_fans()
         self._refresh_tachs()
         self.query_one("#form-title", Static).update("New assignment")
@@ -699,12 +749,25 @@ class AssignScreen(BaseScreen):
         if not self._picked:
             self.notify("Pick at least one fan", severity="warning")
             return
-        floor_txt = self.query_one("#floor", Input).value.strip()
-        max_txt = self.query_one("#maxduty", Input).value.strip()
-        rate_txt = self.query_one("#rate", Input).value.strip()
-        floor = int(floor_txt) if floor_txt else None
-        maxd = int(max_txt) if max_txt else None
-        rate = int(rate_txt) if rate_txt else None
+        floor_txt = self.query_one("#floor", Input).value
+        max_txt = self.query_one("#maxduty", Input).value
+        rate_txt = self.query_one("#rate", Input).value
+        fs_duty_txt = self.query_one("#fs-duty", Input).value
+        fs_after_txt = self.query_one("#fs-after", Input).value
+        fs_rate_txt = self.query_one("#fs-rate", Input).value
+        parsed = []
+        for label, txt in (("floor %", floor_txt),
+                           ("ceiling %", max_txt),
+                           ("rate %/poll", rate_txt),
+                           ("fail-safe duty %", fs_duty_txt),
+                           ("fail-safe after (polls)", fs_after_txt),
+                           ("fail-safe ramp %/poll", fs_rate_txt)):
+            v, err = _parse_num(txt)
+            if err:
+                self.notify(f"{label}: {err}", severity="warning")
+                return
+            parsed.append(v)
+        floor, maxd, rate, fs_duty, fs_after, fs_rate = parsed
         if floor is not None and maxd is not None and floor > maxd:
             self.notify("floor % must be <= ceiling %", severity="warning")
             return
@@ -713,8 +776,19 @@ class AssignScreen(BaseScreen):
                 "enabled": bool(self.query_one("#enabled", Switch).value),
                 "force_takeover": bool(
                     self.query_one("#force-takeover", Switch).value),
-                "floor_duty": floor, "max_duty": maxd, "max_rate": rate}
+                "failsafe": bool(self.query_one("#failsafe", Switch).value),
+                "floor_duty": floor, "max_duty": maxd, "max_rate": rate,
+                "failsafe_duty": fs_duty, "failsafe_after": fs_after,
+                "failsafe_max_rate": fs_rate}
         editing = self._editing
+        if not form["failsafe"]:
+            # turning the net off is the dangerous direction of a setting, and
+            # it is one switch away on a screen that has several: confirm, with
+            # what it means spelled out (validate() also warns about it, but a
+            # warning in a modal nobody reads is not a decision)
+            self.run_worker(self._no_failsafe_flow(name, form, editing),
+                            exclusive=False)
+            return
         if editing and name != editing:
             # The name field doubles as the rename path. Writing the form
             # under the new key alone would leave the OLD assignment in the
@@ -725,6 +799,21 @@ class AssignScreen(BaseScreen):
                             exclusive=False)
             return
         self._commit(name, form)
+
+    async def _no_failsafe_flow(self, name: str, form: dict,
+                                editing: str | None):
+        ok = await self.app.push_screen_wait(ConfirmScreen(
+            f"Turn the fail-safe OFF for '{name}'?",
+            ("If its source stops answering, these fans HOLD their last duty",
+             "instead of ramping up. A source that dies while the fans are",
+             "idling leaves them idling — which is how a card cooked (§18)."),
+            ok_label="Save without fail-safe", ok_variant="error"))
+        if not ok:
+            return
+        if editing and name != editing:
+            await self._rename_flow(editing, name, form)
+        else:
+            self._commit(name, form)
 
     async def _rename_flow(self, old: str, new: str, form: dict):
         exists = new in self.app.cfg.assignments
@@ -782,11 +871,20 @@ class AssignScreen(BaseScreen):
             assignment["force_takeover"] = True
         else:
             assignment.pop("force_takeover", None)
-        for key in ("floor_duty", "max_duty", "max_rate"):
+        for key in ("floor_duty", "max_duty", "max_rate",
+                    "failsafe_duty", "failsafe_after", "failsafe_max_rate"):
             if form[key] is None:
                 assignment.pop(key, None)   # blank = use the global default
             else:
                 assignment[key] = form[key]
+        # `failsafe` off removes a safety net, so it is written explicitly
+        # rather than as an absent key: `false` is the statement, and leaving
+        # a stale true behind after someone flipped the switch off would be
+        # the dangerous reading of an ambiguous file.
+        if form.get("failsafe", True):
+            assignment.pop("failsafe", None)
+        else:
+            assignment["failsafe"] = False
         fans = form["fans"]
         tach = {f: t for f, t in self._tach_map.items() if f in fans and t}
         if tach:

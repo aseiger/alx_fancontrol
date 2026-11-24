@@ -9,8 +9,8 @@ the real TUI against the synthetic machine (`tests/fake_machine.py`) and
 asserted on the file written to disk. Probes were deleted after running;
 the findings below cite the evidence each one produced.
 **Tree:** `6209746` (2026-11-23).
-**Status:** steps 1–5 landed — **F1, F2, F3, F4, F5, F7, F8, F9, F14 fixed**
-(see §D, `IMPLEMENTATION_NOTES.md` §22–§26). F6, F10–F13 still open.
+**Status:** steps 1–5 + 6a landed — **F1–F6, F8, F9, F12, F14 fixed** (see §D,
+`IMPLEMENTATION_NOTES.md` §22–§27). F7 fixed in step 2; F10, F11, F13 open.
 
 ---
 
@@ -85,9 +85,9 @@ rendered on any of the four screens.)
 | `max_rate` | ⚠️ edit | same |
 | `enabled` | 👁 view | list shows `on`/`off`; **no control at all** (F3) |
 | `tach` | ✅ editor | tach table per picked fan (`#tach-pick`) + `TachPickerModal`; guess is a pre-fill, "(no tach)" selectable; unmapped warns — §24 |
-| `failsafe` | ✗ | silently preserved on save |
-| `failsafe_duty` | ✗ | silently preserved |
-| `failsafe_after` | ✗ | silently preserved |
+| `failsafe` | ✅ edit | switch; off = explicit `false`, confirmed (§18 shape) — §27 |
+| `failsafe_duty` | ✅ edit | blank inherits the global — §27 |
+| `failsafe_after` | ✅ edit | blank inherits the global — §27 |
 | `force_takeover` | ✅ edit | switch on the Assign form; owner column shows who holds each header — §26 |
 
 ### `curves.*`
@@ -210,7 +210,7 @@ the GUI and `_takeover()` cannot disagree about who owns a header. The
 Overview's state cell also says what happened ("refused: held by another
 controller") instead of the daemon's internal word.
 
-### F6 · Medium-high — per-assignment fail-safe overrides are invisible
+### F6 · Medium-high (**fixed** §27) — per-assignment fail-safe overrides are invisible
 
 `failsafe`, `failsafe_duty`, `failsafe_after` (`daemon._failsafe()`,
 `:360-372`) are read per assignment, validated (`config.py:341-359`), and
@@ -300,7 +300,7 @@ but not "and your saves are going to the home file, which the running daemon
 will never read". A `sudo`-less session can produce a perfectly valid config
 that changes nothing.
 
-### F12 · Low — input affordances are thin
+### F12 · Low (**fixed** §27) — input affordances are thin
 
 `#floor`, `#maxduty`, `#rate` are `restrict="[0-9]" max_length=3`
 (`assign.py:134-139`): integers only (the model accepts floats — the live
@@ -462,6 +462,7 @@ F1 from coming back next time a knob is added — which, given §18→§21 added
 | 2 ✅ | F7 curve new/duplicate/delete/label + first point | `curves.py`, `base.py` (`ConfirmScreen`) | small |
 | 3 ✅ | F4 tach editor + no-tach warning + stale-entry cleanup | `assign.py`, `hwmon.py`, `daemon.py`, `overview.py` | medium (safety-relevant) |
 | 4 ✅ | F1 Settings screen + `SCHEMA` refactor of `validate()` **+ F14 (seed defaults once, don't re-merge on load)** | `config.py`, new `tui/screens/settings.py`, `base.py`, `app.py` | medium, mostly mechanical |
+| 6a ✅ | F6 per-assignment fail-safe (show/edit/confirm) + F12 float inputs and class-based field CSS | `assign.py`, `config.py` | small |
 | 5 ✅ | F5 ownership column + `force_takeover` control + human state words | `assign.py`, `app.py`, `status.py`, `reader.py`, `overview.py` | medium |
 | 6 | F10 Overview upgrades, F11 config path, F12 input polish, F13 README | `overview.py`, screens, README | low |
 

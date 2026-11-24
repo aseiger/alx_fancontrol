@@ -523,11 +523,15 @@ top item), so: **keys navigate, clicks focus** fields/tables.
    the stall detector (§20/§21) can never fire for that fan), floor % /
    ceiling % / rate %/poll — **blank means "no override": the
    global `config` value applies and the per-assignment key is removed**, and
-   the placeholders show the global values currently in effect — and
-   **enabled** / **Force takeover** switches. Keys this form does not manage
-   (`failsafe`,
-   `failsafe_duty`, `failsafe_after`) are carried through
-   untouched.
+   the placeholders show the global values currently in effect (values may be
+   fractional — the model is float and the live config contains `59.5`),
+   **fail-safe overrides** for the same three globals (`fail-safe duty %`,
+   `after … polls`, `ramp %/poll` — blank inherits the global) plus a
+   **fail-safe on** switch, and **enabled** / **Force takeover** switches.
+   Turning the fail-safe **off** is confirmed — with what it means said out
+   loud: those fans then *hold their last duty* when the source dies instead
+   of ramping up, which is §18's failure shape. Off is stored as explicit
+   `"failsafe": false`; turning it back on removes the key.
 3. **Curves** — points table (cursor-selectable) + live text plot
    (curve as `█` columns, `◄` marker at the current temp of the
    selected preview source, every point marked `●` and the selected one

@@ -483,8 +483,12 @@ def validate(cfg: Config) -> tuple[list[str], list[str]]:
         fs = a.get("failsafe")
         if fs is not None and not isinstance(fs, bool):
             errors.append(f"assignment {aid}: 'failsafe' must be true/false")
+        # `failsafe_max_rate` is read per assignment too (daemon._failsafe
+        # falls back to the global), so it is validated here as well — a
+        # typo in it used to reach the daemon unchecked.
         for name, lo, hi in (("failsafe_duty", 0, 100),
-                             ("failsafe_after", 0, None)):
+                             ("failsafe_after", 0, None),
+                             ("failsafe_max_rate", 0, None)):
             v = a.get(name)
             if v is not None and (not isinstance(v, (int, float))
                                   or isinstance(v, bool)):

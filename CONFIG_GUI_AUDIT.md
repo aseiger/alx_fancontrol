@@ -9,8 +9,9 @@ the real TUI against the synthetic machine (`tests/fake_machine.py`) and
 asserted on the file written to disk. Probes were deleted after running;
 the findings below cite the evidence each one produced.
 **Tree:** `6209746` (2026-11-23).
-**Status:** steps 1–5 + 6a landed — **F1–F6, F8, F9, F12, F14 fixed** (see §D,
-`IMPLEMENTATION_NOTES.md` §22–§27). F7 fixed in step 2; F10, F11, F13 open.
+**Status: all 14 findings fixed.** Steps 1–6b, `IMPLEMENTATION_NOTES.md`
+§22–§28. Every option in the matrix above is viewable and editable through a
+screen, and every value the daemon publishes about a fan is visible on one.
 
 ---
 
@@ -26,6 +27,10 @@ when something fails) not at all.
 | `assignments.*` | 12 | 6 (+`tach` auto) | `enabled` | `failsafe`, `failsafe_duty`, `failsafe_after`, `force_takeover`, `tach` (manual) |
 | `curves.*` | 3 fields | `points`, `label` (step 2) | `id` | delete of an **in-use** curve (refused by design); id rename (out of scope) |
 
+*(That table is the audit's starting point, tree `6209746`. After steps 1–6b:
+`config.*` 22/22 editable on screen 5, `assignments.*` 12/12 on screen 2,
+`curves.*` create/copy/delete/label on screen 3.)*
+
 The GUI surface has not moved since the v2 redesign, while the config
 surface has grown from 4 globals (`poll_seconds`, `max_rate`, `floor_duty`,
 `dead_temp_c` at commit `ededbdb`) to 22: §18–§21 of
@@ -35,7 +40,7 @@ tuning any of them today means `sudo $EDITOR /etc/alx_fancontrol/config.json`
 — no validation, no defaults shown, no units, no idea whether the running
 daemon accepted it.
 
-Four findings are **bugs** (proven, not stylistic): F2, F3, F4, F7, F9.
+Five findings are **bugs** (proven, not stylistic): F2, F3, F4, F7, F9 — plus F14, found while fixing F7.
 
 ---
 
@@ -267,7 +272,7 @@ Click `CPU`, change the name to `CPU-box`, Save → **both** exist, both drive
 driven to the HIGHEST requested duty" notice; nothing says *the old one is
 still there*, and the user now has two assignments whose floors disagree.
 
-### F10 · Medium — the Overview shows less than `status.json` already contains
+### F10 · Medium (**fixed** §28) — the Overview shows less than `status.json` already contains
 
 The daemon publishes (`daemon.py:1185-1262`) and the TUI drops:
 
@@ -290,7 +295,7 @@ when you want to see "this header is now firmware's".
 Small thing spotted while reading: `overview.py:74-85` is dead code (a
 duplicate of the loop above it that computes values and discards them).
 
-### F11 · Low-medium — you are never told *which* config you are editing
+### F11 · Low-medium (**fixed** §28) — you are never told *which* config you are editing
 
 `cfg_path` is used for load/save and shown nowhere. Root edits
 `/etc/alx_fancontrol/config.json`, non-root edits
@@ -309,7 +314,7 @@ hard-coded in placeholder text (`"floor % (default 5)"`) which will lie the
 moment a global default changes. There is no help text anywhere in the GUI;
 all of the excellent explanation lives in the README.
 
-### F13 · Low — doc drift found on the way
+### F13 · Low (**fixed** §28) — doc drift found on the way
 
 `README.md` config table still documents `sources.*.kind` / `.chip` /
 `.temp` / `.chip_index` / `.pci_bus`, which §14 removed from the model

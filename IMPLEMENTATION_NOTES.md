@@ -1187,3 +1187,106 @@ built-in-refusal test was inverted into a deletion-sticks test rather than
 counted twice. Smoke nav now covers screen 5 by key and by sidebar button.
 
 Suite: **237 passed** (223 + 14).
+
+## 26. Config↔GUI audit, step 5: who holds this header, and how to take it anyway (2026-11-26)
+
+F5. The finding with the most history behind it: §18 and §20 are both about
+headers that somebody else was driving — the BIOS parking one at `enable 0`,
+`fancontrol`/EC holding another in manual mode. `daemon._takeover()` refuses
+exactly those two cases unless the assignment sets `force_takeover`. The TUI
+documented that in its own docstring and then offered no way to set it, and
+the fan picker's columns were `✓ / fan / label / rpm` — a foreign header looked
+identical to a free one. You found out afterwards, as the word
+`manual-conflict` in the Overview's state cell, while a card was hot.
+
+### What changed
+
+**Owner column on the fan picker** (`✓ / fan / label / owner / rpm`),
+refreshed with every live sweep because takeover flips `pwmN_enable` while the
+screen is open:
+
+| word | meaning | daemon behaviour |
+|---|---|---|
+| `firmware` | `enable=2`, nobody drives it | takes it, restores `2` on exit |
+| `ours` | `enable=1`, the running daemon holds it | already ours |
+| `left by us` | `enable=1`, marker says a run of ours died holding it | reclaims (§20) |
+| `other` | `enable=1`, someone else: fancontrol, EC, BIOS | **refused** without force |
+| `parked` | `enable=0` — cools nothing | **refused** without force |
+
+**Force takeover switch** on the form. Off **removes** the key rather than
+writing `false` — absent is how this file says no, matching step 1's rule for
+the numeric overrides.
+
+**Saving says which way it went.** Without the switch: *"The daemon will NOT
+control it8686:pwm3: held in manual mode by another process, or disabled. Turn
+on Force takeover to take them anyway, or free them first (systemctl stop
+fancontrol)."* With it on a foreign header: *"…expect the duty to be fought
+over until the other controller is stopped."* Neither blocks the save — the
+operator may know the other controller is gone for good, which is exactly when
+`force_takeover` exists.
+
+**The Overview says what happened** instead of echoing the daemon's internal
+state word: `refused: held by another controller`, `refused: header disabled
+(enable 0)`, `FAIL-SAFE: source unreadable, ramping up`, `STALLED: high duty,
+~0 RPM — pinned to full`, `write failed (pwm/pwmN_enable)`, `OWNERSHIP LOST
+(firmware took it back)`. Unknown states still pass through verbatim, so a
+state added later is never hidden.
+
+### Where the answer lives, and why not in the screen
+
+`status.claimed_channels()` (+ `boot_id`, `pid_alive`, moved out of
+`daemon.py`) reconciles the two ownership sources: `status.json` (what the
+running daemon holds) and `owned.json` (what a run of ours claimed and may not
+have restored, valid only for the same boot and only while no other
+alx_fancontrol is alive). `App.fan_owner()` reads that plus the live
+`enable`.
+
+It had to be one implementation. The GUI's owner column is not decoration — it
+is the promise *"the daemon will/won't take this header"*; a second
+implementation in the TUI would drift from `_takeover()` and the column would
+lie at exactly the moment someone relies on it. `Daemon._load_marker()` now
+calls the same function, and the test that patches liveness ("pretend that pid
+is one of ours") patches it where the decision is made.
+
+`fan_owner(fan, data)` takes the snapshot to read: a screen refreshing from a
+`LiveUpdate` message must render *that* message, not whatever the app stored
+last. Same reason `OverviewScreen._refresh()` now accepts the payload instead
+of re-reading `app.live` — in the running app they are the same object, but a
+screen that ignores the message it was sent cannot be tested with one.
+
+### Layout: the form stopped fitting
+
+Adding a switch row pushed Save below the fold on a 50-row terminal (measured:
+`#save` bottom 52 of 50), and this screen cannot scroll — `#content` is a plain
+`Vertical`. The fix buys height with width:
+
+- the fan picker and the tach table now sit **side by side** (`#pickers`), so
+  picking more fans no longer lengthens the form at all — Save's row became
+  independent of fan count (bottom 41 whether 0 or 8 headers are picked);
+- the tach table lost its label column (`sensors.d` names live in the picker
+  modal) and gained a `⚠` marker for "no tach: no RPM, no stall watch";
+- both switches share one row with short labels and a single hint line under
+  them; `#assign-list` is capped at 8 rows like the other tables.
+
+Verified with widget regions at 40/50/60 rows and with 0 and 8 fans picked,
+and in a real pty at 140×50 (owner column showing `ours` for the headers the
+live daemon holds, `firmware` for the free ones) and 80×30. Below ~42 rows the
+last line still falls off; `s` saves and the footer says so. Making this
+screen genuinely scrollable is still open (tried in §24, reverted: it changes
+all five screens' `1fr` tables at once).
+
+Tests now look columns up **by key** (`_col(table, "fown")`) rather than by
+index — these tables have each gained a column twice, and positional asserts
+break on every gain.
+
+### Tests
+
+6 new: the picker shows firmware/other/parked for a synthetic machine with
+`enable` overridden; the Force takeover switch writes `true` and then removes
+the key when switched back off (including through a load-edit-save round
+trip); saving a foreign header warns it will be refused and names the way
+out; force-on-a-foreign-header warns about the fight instead; a parked header
+is classified and listed by `needs_force_takeover`; the Overview renders
+`refused: held by another controller` from a `manual-conflict` status.
+
+Suite: **243 passed** (237 + 6).

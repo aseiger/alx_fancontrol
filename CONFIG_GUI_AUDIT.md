@@ -9,8 +9,8 @@ the real TUI against the synthetic machine (`tests/fake_machine.py`) and
 asserted on the file written to disk. Probes were deleted after running;
 the findings below cite the evidence each one produced.
 **Tree:** `6209746` (2026-11-23).
-**Status:** steps 1–4 landed — **F1, F2, F3, F4, F7, F8, F9, F14 fixed** (see §D,
-`IMPLEMENTATION_NOTES.md` §22–§25). F5–F6, F10–F13 still open.
+**Status:** steps 1–5 landed — **F1, F2, F3, F4, F5, F7, F8, F9, F14 fixed**
+(see §D, `IMPLEMENTATION_NOTES.md` §22–§26). F6, F10–F13 still open.
 
 ---
 
@@ -88,7 +88,7 @@ rendered on any of the four screens.)
 | `failsafe` | ✗ | silently preserved on save |
 | `failsafe_duty` | ✗ | silently preserved |
 | `failsafe_after` | ✗ | silently preserved |
-| `force_takeover` | ✗ | referenced in the screen's own docstring, no control (F5) |
+| `force_takeover` | ✅ edit | switch on the Assign form; owner column shows who holds each header — §26 |
 
 ### `curves.*`
 
@@ -182,7 +182,7 @@ save, and the fact made visible in three places — save notification, daemon
 warning, and `no tach` in the Overview RPM column (`status.json` now carries
 `tach` per fan).
 
-### F5 · High — takeover refused → `force_takeover` is unreachable, and the picker hides ownership
+### F5 · High (**fixed** §26) — takeover refused → `force_takeover` is unreachable, and the picker hides ownership
 
 `daemon._takeover()` refuses a channel that reads `enable=1` held by someone
 else (`manual-conflict`, `daemon.py:972-979`) or `enable=0`
@@ -196,6 +196,19 @@ screen later as the bare word `manual-conflict` in the Overview state cell.
 This is the failure mode with real history on this board (§18, §20: BIOS
 parking headers at 0 %). The GUI currently turns it into a JSON editing
 exercise *while a card is hot*.
+
+**Fixed (§26):** the picker has an **owner** column — `firmware` (free),
+`ours`, `left by us` (manual mode a dead run of ours left behind, which the
+daemon reclaims), `other` (another controller: fancontrol/EC/BIOS), `parked`
+(enable 0) — refreshed from the live sweep, and a **Force takeover** switch
+writes the key (off removes it). Saving refuses-and-explains instead of
+leaving it to be discovered: without the switch, "the daemon will NOT
+control X … Turn on Force takeover, or free them first"; with it on a foreign
+header, "expect the duty to be fought over". The classification lives in
+`status.claimed_channels` + `App.fan_owner`, next to the marker it judges, so
+the GUI and `_takeover()` cannot disagree about who owns a header. The
+Overview's state cell also says what happened ("refused: held by another
+controller") instead of the daemon's internal word.
 
 ### F6 · Medium-high — per-assignment fail-safe overrides are invisible
 
@@ -449,7 +462,7 @@ F1 from coming back next time a knob is added — which, given §18→§21 added
 | 2 ✅ | F7 curve new/duplicate/delete/label + first point | `curves.py`, `base.py` (`ConfirmScreen`) | small |
 | 3 ✅ | F4 tach editor + no-tach warning + stale-entry cleanup | `assign.py`, `hwmon.py`, `daemon.py`, `overview.py` | medium (safety-relevant) |
 | 4 ✅ | F1 Settings screen + `SCHEMA` refactor of `validate()` **+ F14 (seed defaults once, don't re-merge on load)** | `config.py`, new `tui/screens/settings.py`, `base.py`, `app.py` | medium, mostly mechanical |
-| 5 | F5 ownership column + `force_takeover` control | `assign.py`, `hwmon.py` (read enable per channel) | medium |
+| 5 ✅ | F5 ownership column + `force_takeover` control + human state words | `assign.py`, `app.py`, `status.py`, `reader.py`, `overview.py` | medium |
 | 6 | F10 Overview upgrades, F11 config path, F12 input polish, F13 README | `overview.py`, screens, README | low |
 
 Each step should land with UX tests in `tests/test_tui_ux.py` (that file's

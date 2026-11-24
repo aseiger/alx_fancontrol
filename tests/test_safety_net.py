@@ -17,6 +17,7 @@ import threading
 import time
 
 import alx_fancontrol.daemon as dm
+import alx_fancontrol.status as status_mod
 import pytest
 from alx_fancontrol import hwmon
 from alx_fancontrol.daemon import Daemon
@@ -283,15 +284,18 @@ def test_marker_of_a_live_other_instance_is_not_reclaimed(tmp_path, caplog):
     proc = subprocess.Popen(["sleep", "30"])
     try:
         _write_marker(tmp_path, {"it8792:pwm1": 2}, pid=proc.pid)
-        orig = Daemon._pid_alive
+        # the "is that pid one of ours?" check lives in status.py next to
+        # the marker it judges (the TUI asks the same question), so patch it
+        # there: a live `sleep` would otherwise read as foreign, not ours.
+        orig = status_mod.pid_alive
 
         def alive(pid):
             return pid == proc.pid or orig(pid)
-        Daemon._pid_alive = staticmethod(alive)
+        status_mod.pid_alive = alive
         d = Daemon(cfg, root=root, gpu_runner=lambda *f: HOT)
         run_polls(d, polls=2)
     finally:
-        Daemon._pid_alive = orig
+        status_mod.pid_alive = orig
         proc.kill()
         proc.wait()
     assert "another alx_fancontrol daemon" in caplog.text

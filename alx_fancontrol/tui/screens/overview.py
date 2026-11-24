@@ -39,14 +39,17 @@ class OverviewScreen(BaseScreen):
         self._refresh()
 
     def on_live_update(self, msg: LiveUpdate):
-        self._refresh()
+        # render the payload we were handed rather than re-reading app.live:
+        # in the running app they are the same snapshot, but a screen that
+        # ignores the message it was sent cannot be tested with one
+        self._refresh(msg.data)
 
     # ------------------------------------------------------------ render
-    def _refresh(self):
+    def _refresh(self, data: dict | None = None):
         app = self.app
         if app.cfg is None:
             return
-        data = app.live
+        data = data if data is not None else app.live
         st = (data.get("status") or {})
         self._refresh_sources(data)
         self._refresh_fans(data)
@@ -123,6 +126,22 @@ class OverviewScreen(BaseScreen):
             )
         restore_table_cursor(fan, prev_key, prev_hover)
 
+    #: the daemon's own state strings, said in words a person can act on.
+    # `manual-conflict` alone (F5) tells you nothing about who to go argue
+    # with, and it arrives one screen after the decision was made.
+    STATE_WORDS = {
+        "ok": "ok",
+        "manual-conflict": "refused: held by another controller",
+        "disabled": "refused: header disabled (enable 0)",
+        "unresolved": "refused: no such channel",
+        "curve-missing": "skipped: curve missing",
+        "source-missing": "skipped: source missing",
+        "failsafe": "FAIL-SAFE: source unreadable, ramping up",
+        "stalled": "STALLED: high duty, ~0 RPM — pinned to full",
+        "write-error": "write failed (pwm/pwmN_enable)",
+        "ownership-lost": "OWNERSHIP LOST (firmware took it back)",
+    }
+
     def _fan_state(self, fan: str, aid: str | None, data: dict) -> str:
         app = self.app
         if aid is None:
@@ -130,13 +149,22 @@ class OverviewScreen(BaseScreen):
         st = (data.get("status") or {}).get("fans", {}).get(fan, {})
         state = st.get("state")
         if state:
+            words = self.STATE_WORDS.get(state)
+            if words:
+                return words
             return state
         d = data.get("fans", {}).get(fan, {})
         en = d.get("enable")
         if en == 2:
             return "firmware (not taken over)"
         if en == 1:
-            return "manual"
+            # no fresh daemon state for this fan: manual mode means someone
+            # is driving it — us (daemon stopped reporting) or somebody else
+            if app.fan_owner(fan) == app.OWNER_MINE:
+                return "manual (daemon not reporting)"
+            return "manual — held by someone else"
+        if en == 0:
+            return "disabled (enable 0) — cools nothing"
         return "—"
 
     def _refresh_status_line(self, st: dict):

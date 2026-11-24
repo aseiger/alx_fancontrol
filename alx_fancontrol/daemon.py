@@ -1315,30 +1315,11 @@ class Daemon:
                           a.get("curve"), ", ".join(a.get("fans", [])), on)
 
     # ------------------------------------------------- ownership marker --
-
-    @staticmethod
-    def _boot_id() -> str:
-        try:
-            return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        except OSError:
-            return "unknown"
-
-    @staticmethod
-    def _pid_alive(pid: int) -> bool:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        try:          # pid reuse: only another alx_fancontrol counts as us
-            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8",
-                                                                   "ignore")
-        except OSError:
-            return False
-        return "alx_fancontrol" in cmd
+    # boot_id / pid liveness live in status.py, next to the marker they
+    # describe: the TUI has to answer the same "is this channel ours or
+    # someone else's" question to tell the truth on the Assign screen, and two
+    # implementations of that rule would drift apart.
+    _boot_id = staticmethod(status_mod.boot_id)
 
     def _load_marker(self):
         """Read which channels the previous alx_fancontrol run held.
@@ -1349,31 +1330,18 @@ class Daemon:
         them back instead of refusing them forever — which is how a killed
         daemon used to leave a GPU fan pinned at its last raw duty (possibly
         0) with the service reporting itself healthy."""
-        self._marker_orig = {}
-        self._reclaimable = set()
-        try:
-            doc = json.loads(self._marker_path.read_text())
-        except (OSError, ValueError):
-            return
-        if not isinstance(doc, dict) or doc.get("boot_id") != self._boot_id():
-            return                       # different boot: nothing of ours left
-        other = doc.get("pid")
-        if isinstance(other, int) and other != os.getpid() \
-                and self._pid_alive(other):
+        claim = status_mod.claimed_channels(self._marker_path,
+                                            self._boot_id())
+        self._marker_orig = dict(claim["channels"])
+        if claim["live_pid"]:
             self.log.error(
                 "another alx_fancontrol daemon (pid %d) owns %s — refusing to "
-                "take those channels over", other,
-                ", ".join(sorted((doc.get("channels") or {}).keys()))
-                or "nothing")
+                "take those channels over", claim["live_pid"],
+                ", ".join(sorted(claim["channels"])) or "nothing")
+            self._marker_orig = {}
+            self._reclaimable = set()
             return
-        chans = doc.get("channels")
-        if not isinstance(chans, dict):
-            return
-        for fan, orig in chans.items():
-            if isinstance(fan, str) and isinstance(orig, int) \
-                    and not isinstance(orig, bool):
-                self._marker_orig[fan] = orig
-                self._reclaimable.add(fan)
+        self._reclaimable = set(claim["stale"])
         if self._reclaimable:
             self.log.info("ownership marker from this boot: %d channel(s) "
                           "held by the previous run (%s)",

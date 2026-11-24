@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import time
 import os
 import traceback
 
@@ -501,9 +502,17 @@ def test_live_update_fills_rpm_and_source_labels(temp_config, machine):
             await pilot.pause()
             fans = machine.fan_ids()
             table = scr.query_one("#fan-pick", DataTable)
-            assert table.get_cell_at((fans.index("it8686:pwm1"), 3)) == "1650"
-            assert table.get_cell_at((fans.index("it8686:pwm3"), 3)) == "4680"
-            assert table.get_cell_at((fans.index("it8686:pwm2"), 3)) == "—"
+            # by column id, not index: this table has gained columns twice
+            # now and a positional assert breaks silently each time
+            rpm = _col(table, "frpm")
+            own = _col(table, "fown")
+            assert table.get_cell_at((fans.index("it8686:pwm1"), rpm)) == "1650"
+            assert table.get_cell_at((fans.index("it8686:pwm3"), rpm)) == "4680"
+            assert table.get_cell_at((fans.index("it8686:pwm2"), rpm)) == "—"
+            # owner column (F5): the fake machine leaves headers in firmware
+            # mode, which is what a free header reads as
+            assert table.get_cell_at((fans.index("it8686:pwm1"), own)) \
+                == "firmware"
             opts = {v: l for l, v in select_options(
                 scr.query_one("#source", Select))}
             assert "55.0 °C" in str(opts["k10temp:temp1"])
@@ -2176,6 +2185,15 @@ def _pick_fan(pilot, scr, fan):
     return post_row_selected(pilot, table, rows[fan])
 
 
+def _col(table: DataTable, key: str) -> int:
+    """Index of a column by the key given to add_columns — positional
+    asserts on these tables rot every time one is added."""
+    try:
+        return table.get_column_index(key)
+    except Exception:
+        raise AssertionError(f"no column {key!r} in {table.id}")
+
+
 def _cell(table: DataTable, row_key, col: int):
     """Cell of the row whose key is `row_key` (keys are RowKey wrappers that
     compare equal to the plain str we passed to add_row)."""
@@ -2219,7 +2237,7 @@ def test_unmapped_header_saves_without_tach_and_warns(temp_config, machine,
             await _pick_fan(pilot, scr, "it8686:pwm5")
             tachs = scr.query_one("#tach-pick", DataTable)
             assert _cell(tachs, "it8686:pwm5", 1) == "(none)"
-            assert "stall" in _cell(tachs, "it8686:pwm5", 2)
+            assert _cell(tachs, "it8686:pwm5", 3) == "⚠"
             scr.query_one("#name", Input).value = "unwatched"
             scr.query_one("#source", Select).value = "k10temp:temp1"
             scr.query_one("#curve", Select).value = "default"
@@ -2620,5 +2638,178 @@ def test_settings_modal_explains_the_option(temp_config, machine):
             assert "rounds" in help_text and "heat" in help_text.lower()
             labels = [str(l.render()) for l in modal.query(Label)]
             assert any("built-in default: 30" in t for t in labels), labels
+
+    asyncio.run(run())
+
+
+# ------------------------------------------------------- ownership (F5) ----
+
+def _live_with_owners(machine, **owners):
+    """A live payload where named headers read a given pwmN_enable:
+    `pwm1=1` etc. — how a test says 'another process holds this header'."""
+    data = machine.live_payload()
+    for fan, en in owners.items():
+        data["fans"][fan]["enable"] = en
+    return data
+
+
+def test_fan_picker_shows_who_holds_each_header(temp_config, machine):
+    """F5: the picker used to be ✓/fan/label/rpm, so a header held by
+    fancontrol or parked at enable 0 looked exactly like a free one — and the
+    refusal only appeared later, as the bare word `manual-conflict`."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            app = pilot.app
+            app.live = _live_with_owners(machine, **{"it8686:pwm3": 1,
+                                                     "it8686:pwm4": 0})
+            scr._refresh_fans()
+            table = scr.query_one("#fan-pick", DataTable)
+            own = _col(table, "fown")
+            fans = machine.fan_ids()
+
+            def owner_of(fan):
+                return table.get_cell_at((fans.index(fan), own))
+
+            assert owner_of("it8686:pwm1") == "firmware"
+            assert owner_of("it8686:pwm3") == "other"
+            assert owner_of("it8686:pwm4") == "parked"
+
+    asyncio.run(run())
+
+
+async def _save_named_assignment(pilot, scr, name):
+    scr.query_one("#name", Input).value = name
+    scr.query_one("#source", Select).value = "k10temp:temp1"
+    scr.query_one("#curve", Select).value = "default"
+    scr.save_assignment()
+    await pilot.pause()
+
+
+def test_force_takeover_switch_writes_and_clears_the_key(temp_config, machine):
+    """Off REMOVES the key rather than writing `false`: absent is how this file
+    says no, and a saved false is noise that makes the entry harder to read."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            await _pick_fan(pilot, scr, "it8686:pwm3")
+            scr.query_one("#force-takeover", Switch).value = True
+            await _save_named_assignment(pilot, scr, "hot")
+            saved = read_cfg(temp_config)["assignments"]["hot"]
+            assert saved["force_takeover"] is True
+
+            # edit it back off: the key must disappear, not become false
+            assign = await _goto_assign(pilot)
+            await edit_assignment_row(pilot, assign)
+            assert assign.query_one("#force-takeover", Switch).value is True
+            assign.query_one("#force-takeover", Switch).value = False
+            assign.save_assignment()
+            await pilot.pause()
+            assert "force_takeover" not in \
+                read_cfg(temp_config)["assignments"]["hot"]
+
+    asyncio.run(run())
+
+
+def test_saving_a_foreign_header_warns_it_will_be_refused(temp_config, machine,
+                                                          notices):
+    """The refusal is a daemon decision the GUI cannot prevent — but it can
+    say so at the moment of saving, with the way out."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            pilot.app.live = _live_with_owners(machine, **{"it8686:pwm3": 1})
+            await _pick_fan(pilot, scr, "it8686:pwm3")
+            await _save_named_assignment(pilot, scr, "fight")
+            assert read_cfg(temp_config)["assignments"]["fight"]["fans"] == \
+                ["it8686:pwm3"]
+            assert any("will NOT control" in m and "it8686:pwm3" in m
+                       and "Force takeover" in m for _s, m in notices), notices
+
+    asyncio.run(run())
+
+
+def test_force_takeover_on_a_foreign_header_warns_about_the_fight(
+        temp_config, machine, notices):
+    """Taking a header someone else holds is allowed and sometimes right (a
+    fancontrol that is gone for good) — but two controllers then write the same
+    register, and the duty the Overview shows stops being explainable."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            pilot.app.live = _live_with_owners(machine, **{"it8686:pwm3": 1})
+            await _pick_fan(pilot, scr, "it8686:pwm3")
+            scr.query_one("#force-takeover", Switch).value = True
+            await _save_named_assignment(pilot, scr, "insist")
+            msgs = [m for _s, m in notices]
+            assert not any("will NOT control" in m for m in msgs), msgs
+            assert any("fought" in m and "it8686:pwm3" in m
+                       for m in msgs), msgs
+
+    asyncio.run(run())
+
+
+def test_parked_header_is_flagged_as_refused(temp_config, machine):
+    """enable=0 is §18/§20's shape: a header nobody drives, cooling nothing.
+    The daemon refuses it without force_takeover, so the picker says 'parked'
+    and the save says it will be refused."""
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = await _goto_assign(pilot)
+            pilot.app.live = _live_with_owners(machine, **{"it8686:pwm4": 0})
+            assert pilot.app.fan_owner("it8686:pwm4") == "parked"
+            assert pilot.app.needs_force_takeover(["it8686:pwm4"]) == \
+                ["it8686:pwm4"]
+            assert pilot.app.needs_force_takeover(["it8686:pwm1"]) == []
+
+    asyncio.run(run())
+
+
+def test_overview_says_why_a_fan_is_not_being_controlled(temp_config, machine):
+    """The state cell used to show the daemon's internal word verbatim. Same
+    information, but phrased as what happened and what to do about it."""
+    _seed_assignments(temp_config,
+                      CPU={"source": "k10temp:temp1", "curve": "default",
+                           "fans": ["it8686:pwm1"], "enabled": True})
+
+    async def run():
+        async with FanControlApp(config_path=temp_config,
+                                 live=False).run_test(size=(140, 50)) \
+                as pilot:
+            await pilot.pause()
+            scr = pilot.app.screen
+            data = _live_with_owners(machine, **{"it8686:pwm1": 1})
+            data["status"] = {"ts": time.time(),
+                              "fans": {"it8686:pwm1": {"state":
+                                                       "manual-conflict"}}}
+            scr.post_message(LiveUpdate(data))
+            await pilot.pause()
+            table = scr.query_one("#fan-table", DataTable)
+            ncols = len(table.columns)
+            cells = [str(table.get_cell_at((r, c)))
+                     for r in range(table.row_count)
+                     for c in range(ncols)]
+            assert any("refused: held by another controller" in c
+                       for c in cells), cells
 
     asyncio.run(run())
